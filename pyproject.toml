@@ -1,0 +1,51 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nanoforge"
+version = "0.1.0"
+description = "A compact, production-structured transformer training and inference framework for local hardware."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Nanoforge" }]
+dependencies = [
+  "torch>=2.2",
+  "numpy>=1.24",
+  "pyyaml>=6.0",
+  "tqdm>=4.66",
+]
+
+[project.optional-dependencies]
+tokenizers = ["tokenizers>=0.15", "sentencepiece>=0.1.99"]
+data = ["pyarrow>=15.0", "datasets>=2.18", "webdataset>=0.2.86"]
+serve = ["fastapi>=0.110", "uvicorn>=0.27"]
+logging = ["tensorboard>=2.14", "wandb>=0.16"]
+export = ["onnx>=1.15", "onnxruntime>=1.16"]
+dev = ["pytest>=7.4", "ruff>=0.3"]
+all = [
+  "tokenizers>=0.15",
+  "sentencepiece>=0.1.99",
+  "pyarrow>=15.0",
+  "datasets>=2.18",
+  "webdataset>=0.2.86",
+  "fastapi>=0.110",
+  "uvicorn>=0.27",
+  "tensorboard>=2.14",
+  "wandb>=0.16",
+  "onnx>=1.15",
+  "onnxruntime>=1.16",
+  "pytest>=7.4",
+  "ruff>=0.3",
+]
+
+[project.scripts]
+nanoforge = "nanoforge.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"

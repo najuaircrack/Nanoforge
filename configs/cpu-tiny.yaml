@@ -1,0 +1,63 @@
+model:
+  vocab_size: 260
+  max_seq_len: 256
+  d_model: 192
+  n_layers: 6
+  n_heads: 6
+  n_kv_heads: 1
+  ffn_hidden_mult: 3.0
+  dropout: 0.05
+  rope_theta: 10000.0
+  norm_eps: 1.0e-5
+  tie_embeddings: true
+  use_flash: false
+  attention_backend: sdpa
+  position_embedding: rope
+  activation: swiglu
+  moe: null
+
+training:
+  run_name: cpu-tiny
+  output_dir: runs/cpu-tiny
+  seed: 1337
+  max_steps: 5000
+  batch_size: 4
+  micro_batch_size: 1
+  grad_accum_steps: 4
+  learning_rate: 4.0e-4
+  min_learning_rate: 8.0e-5
+  warmup_steps: 100
+  optimizer: adamw
+  weight_decay: 0.05
+  betas: [0.9, 0.95]
+  grad_clip: 1.0
+  precision: fp32
+  gradient_checkpointing: false
+  eval_interval: 250
+  eval_steps: 10
+  save_interval: 1000
+  early_stopping_patience: 12
+  ema_decay: 0.0
+  log_interval: 10
+  tensorboard: true
+  wandb: false
+  compile: false
+  device: cpu
+
+data:
+  train_path: data/packed/cpu-tiny/train.bin
+  val_path: data/packed/cpu-tiny/val.bin
+  tokenizer_type: byte
+  tokenizer_path: null
+  seq_len: 256
+  num_workers: 0
+  prefetch_factor: 2
+  pin_memory: false
+
+inference:
+  max_new_tokens: 128
+  temperature: 0.75
+  top_k: 40
+  top_p: 0.92
+  repetition_penalty: 1.15
+
