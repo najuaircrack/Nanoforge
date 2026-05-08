@@ -263,7 +263,20 @@ def _extract_text_from_row(
     if isinstance(row, dict):
         configured = [key for key in text_columns or () if key in row and row.get(key) is not None]
         if configured:
-            return "\n".join(_coerce_cell(row[key]) for key in configured if _coerce_cell(row[key]).strip())
+            parts = []
+            for key in configured:
+                val = row[key]
+                if val is None:
+                    continue
+                if key in {"messages", "conversations"} and isinstance(val, list):
+                    formatted = _format_messages(val)
+                    if formatted.strip():
+                        parts.append(formatted)
+                else:
+                    cell = _coerce_cell(val)
+                    if cell.strip():
+                        parts.append(cell)
+            return "\n".join(parts) if parts else None
         if text_key in row:
             return _coerce_cell(row[text_key])
         if "messages" in row:

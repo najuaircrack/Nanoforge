@@ -68,7 +68,7 @@ class PackedMemmapDataset:
         if self.labels is None:
             y = np.stack([self.tokens[shard][i + 1 : i + 1 + self.seq_len] for shard, i in zip(shard_ids, starts)])
         else:
-            y = np.stack([self.labels[shard][i + 1 : i + 1 + self.seq_len] for shard, i in zip(shard_ids, starts)])
+            y = np.stack([self.labels[shard][i : i + self.seq_len] for shard, i in zip(shard_ids, starts)])
         return torch.from_numpy(x.astype(np.int64)), torch.from_numpy(y.astype(np.int64))
 
 
@@ -87,6 +87,7 @@ def build_packed_dataset(
     loss_masking: str = "auto",
     tokenizer_batch_size: int = 256,
     progress_callback=None,
+    text_columns: tuple = (),   
 ) -> None:
     _ = jsonl, shuffle_docs
     build_packed_dataset_streaming(
@@ -96,6 +97,7 @@ def build_packed_dataset(
         val_fraction=val_fraction,
         text_key=jsonl_text_key,
         code_only=code_only,
+        text_columns=text_columns, 
         seed=seed,
         cleaning=CleaningConfig(min_chars=min_chars, deduplicate=True),
         mode=mode,

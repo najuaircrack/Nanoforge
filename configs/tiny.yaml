@@ -1,20 +1,20 @@
-
 model:
-  vocab_size: 32000
+  vocab_size: 8000
 
-  max_seq_len: 512
+  max_seq_len: 256
 
-  d_model: 512
-  n_layers: 8
+  d_model: 384
+  n_layers: 6
 
-  n_heads: 8
+  n_heads: 6
   n_kv_heads: 2
 
-  ffn_hidden_mult: 4.0
+  ffn_hidden_mult: 2.67          # was 4.0 — saves ~20% FFN memory, still quality
 
-  dropout: 0.1
+  dropout: 0.0
 
-  rope_theta: 10000.0
+  rope_theta: 500000.0
+
   norm_eps: 1.0e-5
 
   tie_embeddings: true
@@ -23,75 +23,113 @@ model:
 
   activation: swiglu
 
+  block_type: transformer
+  attention_backend: sdpa
+  ffn_type: swiglu
+  normalization: rmsnorm
+  position_embedding: rope
+
+  quantization_backend: none
+
+  sliding_window: null
+  gradient_checkpointing: false
+  lora_rank: 0
+
   moe: null
 
 training:
-  run_name: tiny-bpe
+  mode: chat                     # tells the trainer this is a chat SFT run
 
-  output_dir: runs/tiny-bpe
+  run_name: tiny-bpe-chat
+  output_dir: runs/tiny-bpe-chat
 
   seed: 1337
 
-  max_steps: 50000
+  max_steps: 100000
 
-  batch_size: 4
+  batch_size: 8
   micro_batch_size: 1
-  grad_accum_steps: 4
+  grad_accum_steps: 8
 
   learning_rate: 3.0e-4
   min_learning_rate: 3.0e-5
 
-  warmup_steps: 1000
+  warmup_ratio: 0.03             # preferred over warmup_steps for changing run lengths
 
   optimizer: adamw
+  scheduler: cosine
 
   weight_decay: 0.1
-
   betas: [0.9, 0.95]
   eps: 1.0e-8
 
   grad_clip: 1.0
 
-  precision: auto
-  resume_from_checkpoint: runs/tiny-bpe/best.pt
+  precision: fp32
+
+
 
   gradient_checkpointing: false
 
-  eval_interval: 500
+  eval_interval: 250
   eval_steps: 20
 
-  save_interval: 100
+  save_interval: 500
 
-  early_stopping_patience: 99999
+  early_stopping_patience: 10
 
   ema_decay: 0.0
 
   log_interval: 10
 
+  health_interval: 10
+
+  low_memory: false
+
   tensorboard: true
   wandb: false
+
+  distributed_backend: none
 
 data:
   train_path: data/packed/tiny/train.bin
   val_path: data/packed/tiny/val.bin
 
-  tokenizer_type: bpe
+  tokenizer_type: native-bpe
   tokenizer_path: data/tokenizers/tiny-bpe.json
 
-  seq_len:   128
+  seq_len: 256
+
+  mode: chat                     # auto-detects chat rows, formats with role tokens
+ 
+  loss_masking: none
+  assistant_only_loss: false
+
+  tokenizer_batch_size: 128      # lower than default 256 — safer on 8GB RAM
 
   num_workers: 0
-
   pin_memory: false
 
 inference:
+  mode: chat
+
   max_new_tokens: 128
 
-  temperature: 0.7
-
+  temperature: 0.75
   top_k: 40
+  top_p: 0.92
 
-  top_p: 0.95
+  min_p: 0.05                    # stabilizes tiny model outputs
 
   repetition_penalty: 1.1
+  frequency_penalty: 0.1         # reduces token loops
+  presence_penalty: 0.0
 
+  no_repeat_ngram_size: 4        # blocks repeated phrases in chat responses
+
+  stop_on_repetition: true
+  repetition_window: 64
+  repetition_threshold: 0.85
+
+  deterministic: false
+  mirostat: false

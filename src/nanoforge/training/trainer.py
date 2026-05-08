@@ -288,7 +288,7 @@ class Trainer:
             if skip_step:
                 self.optimizer.zero_grad(set_to_none=True)
                 if self.scaler.is_enabled():
-                    self.scaler.update(max(float(self.scaler.get_scale()) * 0.5, 1.0))
+                    self.scaler.update(new_scale=max(float(self.scaler.get_scale()) * 0.5, 1.0))
             else:
                 self.scaler.step(self.optimizer)
                 self.scaler.update()

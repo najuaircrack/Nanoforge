@@ -180,7 +180,7 @@ nanoforge generate --checkpoint runs/tiny/best.pt --prompt "def quicksort(xs):" 
 nanoforge chat --checkpoint runs/tiny/best.pt
 ```
 
-Beam search:
+Beam search
 
 ```powershell
 nanoforge generate --checkpoint runs/tiny/best.pt --prompt "Write a Python function" --beams 4

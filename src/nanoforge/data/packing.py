@@ -131,11 +131,11 @@ def _encode_plain_batch(
     add_eos: bool,
 ) -> Iterator[tuple[DatasetRecord, list[int], list[int]]]:
     for record, ids in zip(records, encode_batch(tokenizer, texts, add_bos=add_bos, add_eos=add_eos)):
-        if ids:
-            labels = list(ids)
-            labels[0] = -100
-            yield record, ids, labels
-
+        if not ids:
+            continue
+        labels = list(ids)
+        labels[0] = -100
+        yield record, ids, labels
 
 def build_packed_dataset_streaming(
     input_paths: Iterable[str | Path],
@@ -144,6 +144,7 @@ def build_packed_dataset_streaming(
     *,
     val_fraction: float = 0.01,
     text_key: str = "text",
+    text_columns: tuple = (),
     code_only: bool = False,
     seed: int = 1337,
     shard_tokens: int = 50_000_000,
@@ -157,7 +158,7 @@ def build_packed_dataset_streaming(
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     data_stats = DatasetStats()
-    records = iter_dataset_records(input_paths, text_key=text_key, code_only=code_only, stats=data_stats)
+    records = iter_dataset_records(input_paths, text_key=text_key, text_columns=text_columns, code_only=code_only, stats=data_stats)
     records = clean_records(records, cleaning or CleaningConfig())
     train = TokenShardWriter(out_dir, "train", tokenizer.vocab_size, shard_tokens)
     val = TokenShardWriter(out_dir, "val", tokenizer.vocab_size, shard_tokens)

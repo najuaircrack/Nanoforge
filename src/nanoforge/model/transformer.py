@@ -178,7 +178,13 @@ class NanoforgeForCausalLM(nn.Module):
         logits = self.lm_head(x)
         loss = None
         if labels is not None:
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), labels.reshape(-1))
+            flat_logits = logits.view(-1, logits.size(-1))
+            flat_labels = labels.reshape(-1)
+            n_tokens = (flat_labels != -100).sum()
+            if n_tokens == 0:
+                loss = flat_logits.sum() * 0.0  # zero loss, preserves gradient graph
+            else:
+                loss = F.cross_entropy(flat_logits, flat_labels, ignore_index=-100, reduction="sum") / n_tokens
         aux_loss = torch.stack(aux_losses).mean() if aux_losses else None
         if loss is not None and aux_loss is not None and self.config.moe is not None:
             loss = loss + self.config.moe.router_aux_loss_coef * aux_loss

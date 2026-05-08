@@ -152,6 +152,7 @@ def cmd_prepare(args: argparse.Namespace) -> None:
         loss_masking=args.loss_masking,
         tokenizer_batch_size=args.tokenizer_batch_size,
         progress_callback=update_bar,
+        text_columns=tuple(args.text_column or ()),
     )
     if progress is not None:
         progress.close()
@@ -499,6 +500,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--tokenizer-batch-size", type=int, default=256)
     p.add_argument("--min-chars", type=int, default=16)
     p.add_argument("--no-progress", action="store_true")
+    p.add_argument("--text-column", action="append", help="Structured text column(s) to use. Can be repeated.")
     p.set_defaults(func=cmd_prepare)
 
     p = sub.add_parser("inspect-dataset", help="Inspect formats, fields, and warnings for input data.")
