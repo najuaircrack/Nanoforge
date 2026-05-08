@@ -655,19 +655,6 @@ Nanoforge is still an experimental local framework. Important limitations:
 - MoE is available but should be treated as experimental.
 - No full benchmark harness for HumanEval, MMLU, or GSM8K yet.
 
-## Best Next Improvements
-
-Highest-impact next work:
-
-- Add resume training from checkpoint.
-- Add checkpoint metadata page to dashboard.
-- Add dataset split by repository instead of random record split.
-- Add sample-generation callback during validation.
-- Add HumanEval-style code evaluation harness.
-- Add true speculative decoding.
-- Add FSDP wrapper for multi-GPU training.
-- Add better BPE tokenizer presets for code.
-- Add config validation warnings before training starts.
 
 ## Quick Context Prompt For Another AI
 

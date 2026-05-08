@@ -24,7 +24,7 @@ dist/
 # OS files
 .DS_Store
 Thumbs.db
-
+native/**/target/
 # Logs
 *.log
 

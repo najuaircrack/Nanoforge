@@ -68,10 +68,11 @@ Instead, the goal is:
 - Gradient accumulation
 - Gradient checkpointing
 - AdamW optimizer
-- Cosine LR scheduler
+- Cosine / linear / constant LR schedulers
 - Warmup support
 - EMA support
 - Early stopping
+- NaN/Inf and gradient health checks
 - TensorBoard logging
 - Lightweight training dashboard
 
@@ -79,7 +80,8 @@ Instead, the goal is:
 
 - Byte tokenizer
 - Optional native Rust byte tokenizer backend
-- BPE tokenizer
+- HuggingFace BPE tokenizer
+- Built-in pure-Python byte-level BPE fallback
 - SentencePiece support
 - Special token support
 - Packed memmap datasets
@@ -87,6 +89,8 @@ Instead, the goal is:
 - JSONL and conversation dataset paths
 - Schema-aware parquet/Arrow/csv/sqlite/json ingestion paths
 - Dataset inspection, validation, cleaning, conversion, and deduplication CLIs
+- Automatic datasource mode detection for chat, instruct, completion, code, and generative rows
+- Assistant-only and completion-only packed label masks for responder-style training
 
 ### Inference
 
@@ -98,6 +102,10 @@ Instead, the goal is:
 - Temperature sampling
 - Repetition penalty
 - Mirostat sampling hooks
+- Frequency and presence penalties
+- N-gram repetition blocking
+- Deterministic, chat, creative, coding, low-memory, and high-quality inference modes
+- Role-boundary stop detection, EOS-aware stopping, and repetition/runaway interruption
 
 ### Export
 
@@ -190,10 +198,14 @@ nanoforge chat --checkpoint runs/tiny/best.pt
 ```powershell
 nanoforge train-tokenizer ^
   --input data/raw ^
-  --type bpe ^
+  --type python-bpe ^
   --vocab-size 4000 ^
-  --out data/tokenizers/tiny-bpe.json
+  --out data/tokenizers/tiny-python-bpe.json
 ```
+
+Use `--type bpe` for the HuggingFace `tokenizers` Rust implementation. Use `--type python-bpe`
+when you want a dependency-free Nanoforge tokenizer artifact that can be loaded with
+`tokenizer_type: python-bpe` or `native-bpe`.
 
 Check tokenizer acceleration:
 
@@ -220,8 +232,27 @@ maturin develop --release
 ```
 
 If the native extension is not installed, `byte-native` automatically falls back to the compatible
-Python byte tokenizer. BPE and WordPiece training use HuggingFace `tokenizers`, which is already
-implemented in Rust and is fed by Nanoforge's streaming structured-data readers.
+Python byte tokenizer. BPE can use either HuggingFace `tokenizers` or Nanoforge's built-in
+byte-level Python BPE fallback; both are fed by streaming structured-data readers.
+
+`native-bpe` uses the Rust `ByteLevelBpeTokenizer` when the extension is built, and falls back to
+the same Nanoforge BPE artifact loader in Python when it is not installed:
+
+```powershell
+nanoforge train-tokenizer ^
+  --input data/raw ^
+  --type native-bpe ^
+  --vocab-size 32000 ^
+  --out data/tokenizers/native-bpe.json
+
+nanoforge prepare ^
+  --input data/raw ^
+  --tokenizer native-bpe ^
+  --tokenizer-path data/tokenizers/native-bpe.json ^
+  --mode auto ^
+  --loss-masking auto ^
+  --out data/packed/native
+```
 
 Structured datasets are read through Nanoforge's dataset adapters before tokenizer fitting, so
 parquet/Arrow files are streamed by text columns rather than treated as raw bytes. You can dry-run
@@ -244,6 +275,159 @@ nanoforge prepare ^
   --tokenizer bpe ^
   --tokenizer-path data/tokenizers/tiny-bpe.json ^
   --out data/packed/tiny
+```
+
+For the built-in tokenizer, switch to:
+
+```powershell
+nanoforge prepare ^
+  --input data/raw ^
+  --tokenizer python-bpe ^
+  --tokenizer-path data/tokenizers/tiny-python-bpe.json ^
+  --out data/packed/tiny
+```
+
+---
+
+# Configuration Reference
+
+Nanoforge configs are split into `model`, `training`, `data`, and `inference`. Start from
+`configs/tiny.yaml`, then adjust only the fields you need.
+
+## Model Options
+
+| Option | Default | Use | Practical values |
+| --- | ---: | --- | --- |
+| `vocab_size` | `32000` | Tokenizer vocabulary size. | Match your tokenizer exactly. Byte tokenizer uses `260`. |
+| `max_seq_len` | `2048` | Maximum training context. | `128-512` CPU smoke, `1024-2048` small GPU, `4096+` high VRAM. |
+| `d_model` | `512` | Hidden width. | Must divide by `n_heads`; raise for quality, lower for memory. |
+| `n_layers` | `8` | Transformer depth. | `2-6` smoke, `6-12` local, `18+` experimental. |
+| `n_heads` | `8` | Attention heads. | Keep `d_model / n_heads` near `64` when possible. |
+| `n_kv_heads` | `n_heads` | GQA KV heads. | Use `1`, `2`, or `4` to reduce KV cache memory. |
+| `ffn_hidden_mult` | `2.67` | FFN expansion. | `2.0` low memory, `2.67-4.0` quality. |
+| `dropout` | `0.0` | Regularization. | `0.0` small clean data, `0.05-0.1` noisy data. |
+| `rope_theta` | `10000` | RoPE frequency base. | Larger values help longer context experiments. |
+| `block_type` | `transformer` | Block implementation. | `transformer`, `parallel_residual`. |
+| `attention_backend` | `sdpa` | Attention implementation. | `sdpa` best default, `manual` for debugging, `sliding_window` with `sliding_window`. |
+| `ffn_type` | auto | FFN backend. | `swiglu`, `geglu`, `moe`. |
+| `normalization` | `rmsnorm` | Norm layer. | `rmsnorm` default, `layernorm` compatibility. |
+| `position_embedding` | `rope` | Position system. | `rope`, `alibi`, `none`. |
+| `quantization_backend` | `none` | Inference quantization hook. | `none`, `int8`, `int4`, `gptq`, `awq`, `gguf`. |
+| `sliding_window` | `null` | KV cache/window length. | `512-4096` for low-memory long generation. |
+| `gradient_checkpointing` | `false` | Save activation memory. | Enable for limited VRAM training. |
+| `moe` | `null` | Mixture-of-experts config. | Use only for experiments; start with dense FFN first. |
+| `lora_rank` | `0` | LoRA adapter rank. | `0` off, `4-16` efficient fine-tuning. |
+
+## Training Options
+
+| Option | Default | Use | Practical values |
+| --- | ---: | --- | --- |
+| `mode` | `generative` | Training intent. | `generative`, `chat`, `instruct`, `completion`, `code`, `reasoning`, `hybrid`. |
+| `max_steps` | `1000` | Total optimizer steps. | Use small smoke tests first, then scale by tokens seen. |
+| `batch_size` | `8` | Logical batch size target. | Keep consistent with `micro_batch_size * grad_accum_steps`. |
+| `micro_batch_size` | `2` | Per-step batch on device. | Lower until it fits memory. |
+| `grad_accum_steps` | `4` | Gradient accumulation. | Raise to simulate larger batches. |
+| `learning_rate` | `3e-4` | Peak LR. | `1e-4-3e-4` AdamW small models. |
+| `min_learning_rate` | `3e-5` | Final LR for decay. | Usually `0.05-0.1x` peak LR. |
+| `warmup_steps` / `warmup_ratio` | `100` / `0.03` | LR warmup. | Prefer ratio for changing run lengths. |
+| `optimizer` | `adamw` | Optimizer registry key. | `adamw` stable, `lion` experimental. |
+| `scheduler` | `cosine` | LR schedule. | `cosine`, `linear`, `constant`. |
+| `grad_clip` | `1.0` | Gradient clipping. | `0.5-1.0` for tiny/local models. |
+| `precision` | `auto` | Autocast dtype. | `auto`, `bf16`, `fp16`, `fp32`. |
+| `low_memory` | `false` | CUDA allocator tuning. | Enable on fragmented/low-VRAM machines. |
+| `ema_decay` | `0.0` | EMA weights. | `0.999-0.9999` for smoother checkpoints. |
+| `health_interval` | `10` | Diagnostics cadence. | Lower while debugging unstable runs. |
+| `distributed_backend` | `none` | Future distributed hook. | `none` today; keep single-process unless you add an external launcher. |
+
+## Data Options
+
+| Option | Default | Use | Practical values |
+| --- | ---: | --- | --- |
+| `train_path` / `val_path` | packed `.bin` | Packed token files. | Use `nanoforge prepare` outputs. |
+| `tokenizer_type` | `byte` | Tokenizer loader. | `byte`, `byte-native`, `bpe`, `python-bpe`, `wordpiece`, `sentencepiece`. |
+| `tokenizer_path` | `null` | Tokenizer artifact. | Required for BPE/WordPiece/SentencePiece. |
+| `seq_len` | `2048` | Packed training sequence length. | Match or stay below `model.max_seq_len`. |
+| `mode` | `auto` | Data formatting intent. | `auto` detects chat/instruct/completion/code/generative rows. |
+| `loss_masking` | `auto` | Label masking policy. | `auto`, `none`, `assistant_only`, `completion_only`, `partial`. |
+| `assistant_only_loss` | `false` | Chat SFT target masking. | Enable for assistant response training. |
+| `dataset_weights` | `null` | Hybrid data mixing weights. | Example: `{chat: 0.7, text: 0.2, code: 0.1}`. |
+| `streaming` | `false` | Streaming dataset intent. | Use preprocessing CLIs today; native training streaming is evolving. |
+| `tokenizer_batch_size` | `256` | Batched tokenizer throughput during packing. | Raise for fast native tokenizers; lower for memory constrained machines. |
+
+## Inference Options
+
+| Option | Default | Use | Practical values |
+| --- | ---: | --- | --- |
+| `mode` | `balanced` | Sampling preset. | `chat`, `creative`, `coding`, `deterministic`, `low_memory`, `high_quality`. |
+| `max_new_tokens` | `256` | Generation limit. | Lower for chat, higher for creative/code. |
+| `temperature` | `0.8` | Randomness. | `0-0.3` deterministic/code, `0.6-0.8` chat, `0.9+` creative. |
+| `top_k` | `50` | Candidate cap. | `20-80`; use `1` for deterministic. |
+| `top_p` | `0.95` | Nucleus probability. | `0.85-0.92` chat/code, `0.95` creative. |
+| `min_p` | `null` | Relative probability floor. | `0.03-0.08` can stabilize tiny models. |
+| `repetition_penalty` | `1.0` | Penalize repeated tokens. | `1.05-1.15` chat/tiny models. |
+| `frequency_penalty` | `0.0` | Penalize repeated counts. | `0.1-0.5` for loop reduction. |
+| `presence_penalty` | `0.0` | Penalize seen tokens. | `0.1-0.3` for diversity. |
+| `no_repeat_ngram_size` | `0` | Block repeated n-grams. | `3-5` for chat/code stability. |
+| `deterministic` | `false` | Greedy decoding. | Enable for reproducible tests and coding. |
+| `stop_on_repetition` | `true` | End repetitive tails. | Keep enabled for tiny/chat models. |
+| `repetition_window` | `64` | Repetition detector window. | `32-128` depending on output length. |
+| `repetition_threshold` | `0.85` | Tail repetition cutoff. | Lower to stop loops sooner. |
+| `mirostat` | `false` | Entropy-targeted sampling. | Useful for long creative outputs. |
+| `stop_tokens` | role/EOS tokens | Stop boundaries. | Include `<|user|>` for chat models. |
+
+## Starter Presets
+
+Tiny CPU smoke:
+
+```yaml
+model:
+  vocab_size: 260
+  max_seq_len: 128
+  d_model: 128
+  n_layers: 2
+  n_heads: 4
+training:
+  max_steps: 50
+  micro_batch_size: 1
+  grad_accum_steps: 1
+  precision: fp32
+data:
+  tokenizer_type: byte
+  seq_len: 128
+inference:
+  mode: deterministic
+```
+
+Small chat SFT:
+
+```yaml
+training:
+  mode: chat
+  learning_rate: 2e-4
+  scheduler: cosine
+data:
+  mode: chat
+  tokenizer_type: python-bpe
+  tokenizer_path: data/tokenizers/tiny-python-bpe.json
+  loss_masking: assistant_only
+  assistant_only_loss: true
+inference:
+  mode: chat
+  repetition_penalty: 1.1
+  no_repeat_ngram_size: 4
+```
+
+Low-memory long-context inference:
+
+```yaml
+model:
+  n_kv_heads: 2
+  sliding_window: 1024
+  quantization_backend: int8
+inference:
+  mode: low_memory
+  top_k: 40
+  min_p: 0.05
 ```
 
 ## Train Model

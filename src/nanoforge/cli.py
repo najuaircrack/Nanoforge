@@ -48,6 +48,8 @@ def cmd_train_tokenizer(args: argparse.Namespace) -> None:
 
     from nanoforge.data.tokenizer import (
         train_bpe_tokenizer,
+        train_native_bpe_tokenizer,
+        train_python_bpe_tokenizer,
         train_sentencepiece_tokenizer,
         train_wordpiece_tokenizer,
     )
@@ -58,6 +60,28 @@ def cmd_train_tokenizer(args: argparse.Namespace) -> None:
     columns = tuple(args.text_column or ())
     if args.type == "bpe":
         report = train_bpe_tokenizer(
+            files,
+            args.out,
+            args.vocab_size,
+            args.min_frequency,
+            text_key=args.text_key,
+            text_columns=columns,
+            dry_run=args.dry_run,
+            max_records=args.max_records,
+        )
+    elif args.type == "python-bpe":
+        report = train_python_bpe_tokenizer(
+            files,
+            args.out,
+            args.vocab_size,
+            args.min_frequency,
+            text_key=args.text_key,
+            text_columns=columns,
+            dry_run=args.dry_run,
+            max_records=args.max_records,
+        )
+    elif args.type == "native-bpe":
+        report = train_native_bpe_tokenizer(
             files,
             args.out,
             args.vocab_size,
@@ -123,6 +147,9 @@ def cmd_prepare(args: argparse.Namespace) -> None:
         jsonl=args.jsonl,
         jsonl_text_key=args.jsonl_text_key,
         min_chars=args.min_chars,
+        mode=args.mode,
+        loss_masking=args.loss_masking,
+        tokenizer_batch_size=args.tokenizer_batch_size,
         progress_callback=update_bar,
     )
     if progress is not None:
@@ -303,10 +330,19 @@ def _sampling_from_args(args: argparse.Namespace):
     from nanoforge.generation.sampling import SamplingConfig
 
     return SamplingConfig(
+        mode=args.mode,
         temperature=args.temperature,
         top_k=args.top_k,
         top_p=args.top_p,
+        min_p=args.min_p,
         repetition_penalty=args.repetition_penalty,
+        frequency_penalty=args.frequency_penalty,
+        presence_penalty=args.presence_penalty,
+        no_repeat_ngram_size=args.no_repeat_ngram_size,
+        deterministic=args.deterministic,
+        stop_on_repetition=not args.no_repetition_stop,
+        repetition_window=args.repetition_window,
+        repetition_threshold=args.repetition_threshold,
         mirostat=args.mirostat,
     )
 
@@ -318,7 +354,7 @@ def cmd_generate(args: argparse.Namespace) -> None:
     if args.beams > 1:
         print(engine.beam_search(args.prompt, args.max_new_tokens, args.beams))
     else:
-        print(engine.complete(args.prompt, args.max_new_tokens, _sampling_from_args(args)))
+        print(engine.complete(args.prompt, args.max_new_tokens, _sampling_from_args(args), args.stop_token))
 
 
 def cmd_chat(args: argparse.Namespace) -> None:
@@ -332,7 +368,7 @@ def cmd_chat(args: argparse.Namespace) -> None:
             if not prompt:
                 return
             print("assistant> ", end="", flush=True)
-            for chunk in engine.stream(prompt, args.max_new_tokens, _sampling_from_args(args)):
+            for chunk in engine.stream(prompt, args.max_new_tokens, _sampling_from_args(args), args.stop_token):
                 print(chunk, end="", flush=True)
             print()
     except KeyboardInterrupt:
@@ -426,7 +462,7 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("train-tokenizer", help="Train a BPE, WordPiece, or SentencePiece tokenizer.")
     p.add_argument("--input", nargs="+", required=True)
     p.add_argument("--out", required=True)
-    p.add_argument("--type", choices=["bpe", "wordpiece", "sentencepiece", "unigram"], default="bpe")
+    p.add_argument("--type", choices=["bpe", "native-bpe", "python-bpe", "wordpiece", "sentencepiece", "unigram"], default="bpe")
     p.add_argument("--vocab-size", type=int, default=32000)
     p.add_argument("--min-frequency", type=int, default=2)
     p.add_argument("--text-key", default="text")
@@ -440,7 +476,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--out", required=True)
     p.add_argument(
         "--tokenizer",
-        choices=["byte", "byte-native", "bpe", "wordpiece", "sentencepiece"],
+        choices=["byte", "byte-native", "bpe", "python-bpe", "native-bpe", "wordpiece", "sentencepiece"],
         default="byte",
     )
     p.add_argument("--tokenizer-path")
@@ -448,6 +484,17 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--code-only", action="store_true")
     p.add_argument("--jsonl", action="store_true")
     p.add_argument("--jsonl-text-key", default="text")
+    p.add_argument(
+        "--mode",
+        choices=["auto", "generative", "chat", "instruct", "completion", "code", "reasoning", "hybrid"],
+        default="auto",
+    )
+    p.add_argument(
+        "--loss-masking",
+        choices=["auto", "none", "assistant-only", "assistant_only", "completion-only", "completion_only", "partial"],
+        default="auto",
+    )
+    p.add_argument("--tokenizer-batch-size", type=int, default=256)
     p.add_argument("--min-chars", type=int, default=16)
     p.add_argument("--no-progress", action="store_true")
     p.set_defaults(func=cmd_prepare)
@@ -505,7 +552,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--input", nargs="+", required=True)
     p.add_argument(
         "--tokenizer",
-        choices=["byte", "byte-native", "bpe", "wordpiece", "sentencepiece"],
+        choices=["byte", "byte-native", "bpe", "python-bpe", "native-bpe", "wordpiece", "sentencepiece"],
         default="byte",
     )
     p.add_argument("--tokenizer-path")
@@ -518,7 +565,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--input", nargs="+", required=True)
     p.add_argument(
         "--tokenizer",
-        choices=["byte", "byte-native", "bpe", "wordpiece", "sentencepiece"],
+        choices=["byte", "byte-native", "bpe", "python-bpe", "native-bpe", "wordpiece", "sentencepiece"],
         default="byte-native",
     )
     p.add_argument("--tokenizer-path")
@@ -552,10 +599,24 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--prompt", default="")
         p.add_argument("--device", default="auto")
         p.add_argument("--max-new-tokens", type=int, default=256)
+        p.add_argument(
+            "--mode",
+            choices=["balanced", "chat", "creative", "coding", "deterministic", "low_memory", "high_quality"],
+            default="balanced",
+        )
         p.add_argument("--temperature", type=float, default=0.8)
         p.add_argument("--top-k", type=int, default=50)
         p.add_argument("--top-p", type=float, default=0.95)
+        p.add_argument("--min-p", type=float)
         p.add_argument("--repetition-penalty", type=float, default=1.0)
+        p.add_argument("--frequency-penalty", type=float, default=0.0)
+        p.add_argument("--presence-penalty", type=float, default=0.0)
+        p.add_argument("--no-repeat-ngram-size", type=int, default=0)
+        p.add_argument("--deterministic", action="store_true")
+        p.add_argument("--no-repetition-stop", action="store_true")
+        p.add_argument("--repetition-window", type=int, default=64)
+        p.add_argument("--repetition-threshold", type=float, default=0.85)
+        p.add_argument("--stop-token", action="append")
         p.add_argument("--mirostat", action="store_true")
         p.add_argument("--beams", type=int, default=1)
         p.set_defaults(func=func)

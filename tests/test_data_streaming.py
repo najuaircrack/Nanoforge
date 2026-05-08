@@ -5,6 +5,8 @@ import json
 import pytest
 
 from nanoforge.data.formats import detect_format, inspect_dataset, iter_dataset_records
+from nanoforge.data.modes import encode_training_record
+from nanoforge.data.packing import build_packed_dataset_streaming
 from nanoforge.data.tokenizer import ByteTokenizer
 from nanoforge.data.tokenizer import iter_tokenizer_training_texts, train_bpe_tokenizer
 from nanoforge.data.tokenizer_metrics import evaluate_tokenizer
@@ -79,3 +81,41 @@ def test_parquet_reader_extracts_text_column_without_binary_tokenization(tmp_pat
     assert detect_format(path) == "parquet"
     assert records[0].text.strip() == "alpha"
     assert stats.text_columns[str(path)] == ["text"]
+
+
+def test_chat_mode_masks_user_tokens_and_trains_assistant_tokens():
+    from nanoforge.data.formats import DatasetRecord
+
+    tokenizer = ByteTokenizer()
+    record = DatasetRecord("<|user|>\nName?\n<|assistant|>\nNajwan.\n", "memory.jsonl", {"mode": "chat"})
+    encoded = encode_training_record(record, tokenizer, mode="auto", loss_masking="auto")
+    assistant_ids = tokenizer.encode("Najwan.\n", add_bos=False, add_eos=False)
+    assert encoded.mode == "chat"
+    assert encoded.loss_masking == "assistant_only"
+    assert any(token in encoded.labels for token in assistant_ids)
+    user_ids = tokenizer.encode("Name?\n", add_bos=False, add_eos=False)
+    start = next(
+        idx
+        for idx in range(len(encoded.ids) - len(user_ids) + 1)
+        if encoded.ids[idx : idx + len(user_ids)] == user_ids
+    )
+    assert encoded.labels[start : start + len(user_ids)] == [-100] * len(user_ids)
+
+
+def test_packed_chat_dataset_writes_label_masks(tmp_path):
+    path = tmp_path / "chat.jsonl"
+    path.write_text(
+        json.dumps({"messages": [{"role": "user", "content": "Hi"}, {"role": "assistant", "content": "Hello"}]}) + "\n",
+        encoding="utf-8",
+    )
+    stats = build_packed_dataset_streaming(
+        [path],
+        tmp_path / "packed",
+        ByteTokenizer(),
+        val_fraction=0.0,
+        mode="auto",
+        loss_masking="auto",
+        cleaning=None,
+    )
+    assert stats.records_written == 1
+    assert (tmp_path / "packed" / "train.labels.manifest.json").exists()

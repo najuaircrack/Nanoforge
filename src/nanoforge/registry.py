@@ -167,46 +167,49 @@ def register_builtin_components() -> None:
             replace=True,
             status="available",
         )
-    for name in ["chunked", "sparse", "hybrid_local_global", "paged"]:
-        ATTENTION_BACKENDS.register(
-            name,
-            "nanoforge.model.attention:CausalSelfAttention",
-            version="0",
-            replace=True,
-            status="placeholder",
-        )
+    ATTENTION_BACKENDS.register("chunked", "nanoforge.model.attention:ChunkedCausalSelfAttention", version="1", replace=True)
+    ATTENTION_BACKENDS.register("sparse", "nanoforge.model.attention:SparseCausalSelfAttention", version="1", replace=True)
+    ATTENTION_BACKENDS.register(
+        "hybrid_local_global",
+        "nanoforge.model.attention:HybridLocalGlobalCausalAttention",
+        version="1",
+        replace=True,
+    )
+    ATTENTION_BACKENDS.register("paged", "nanoforge.model.attention:PagedCausalSelfAttention", version="1", replace=True)
 
     FFN_BACKENDS.register("swiglu", "nanoforge.model.moe:FeedForward", version="1", replace=True)
     FFN_BACKENDS.register("geglu", "nanoforge.model.moe:FeedForward", version="1", replace=True)
     FFN_BACKENDS.register("moe", "nanoforge.model.moe:MoEFeedForward", version="1", replace=True)
     FFN_BACKENDS.register(
         "mamba_selective_state",
-        "nanoforge.model.moe:FeedForward",
-        version="0",
+        "nanoforge.model.moe:MambaSelectiveStateFeedForward",
+        version="1",
         replace=True,
-        status="placeholder",
     )
     FFN_BACKENDS.register(
         "rwkv_mixing",
-        "nanoforge.model.moe:FeedForward",
-        version="0",
+        "nanoforge.model.moe:RWKVMixingFeedForward",
+        version="1",
         replace=True,
-        status="placeholder",
     )
 
     NORMALIZATIONS.register("rmsnorm", "nanoforge.model.norms:RMSNorm", version="1", replace=True)
     NORMALIZATIONS.register("layernorm", "torch.nn:LayerNorm", version="1", replace=True)
 
-    for name in ["silu", "gelu", "relu", "squared_relu", "swiglu", "geglu"]:
-        ACTIVATIONS.register(name, lambda *args, **kwargs: None, version="1", replace=True)
+    ACTIVATIONS.register("silu", "nanoforge.model.activations:silu", version="1", replace=True)
+    ACTIVATIONS.register("gelu", "nanoforge.model.activations:gelu", version="1", replace=True)
+    ACTIVATIONS.register("relu", "nanoforge.model.activations:relu", version="1", replace=True)
+    ACTIVATIONS.register("squared_relu", "nanoforge.model.activations:squared_relu", version="1", replace=True)
+    ACTIVATIONS.register("swiglu", "nanoforge.model.activations:swiglu", version="1", replace=True)
+    ACTIVATIONS.register("geglu", "nanoforge.model.activations:geglu", version="1", replace=True)
 
     POSITION_EMBEDDINGS.register("rope", "nanoforge.model.rope:RotaryEmbedding", version="1", replace=True)
     POSITION_EMBEDDINGS.register("alibi", "nanoforge.model.attention:_alibi_bias", version="1", replace=True)
-    POSITION_EMBEDDINGS.register("none", lambda *args, **kwargs: None, version="1", replace=True)
+    POSITION_EMBEDDINGS.register("none", "nanoforge.model.positions:no_position_embedding", version="1", replace=True)
 
     for name in ["byte", "byte_native", "native_byte"]:
         TOKENIZERS.register(name, "nanoforge.data.tokenizer:load_tokenizer", version="1", replace=True)
-    for name in ["bpe", "wordpiece", "sentencepiece", "unigram"]:
+    for name in ["bpe", "native_bpe", "python_bpe", "wordpiece", "sentencepiece", "unigram"]:
         TOKENIZERS.register(name, "nanoforge.data.tokenizer:load_tokenizer", version="1", replace=True)
 
     for name in ["top_k_top_p", "mirostat", "beam", "contrastive"]:
@@ -218,11 +221,12 @@ def register_builtin_components() -> None:
     OPTIMIZERS.register("sophia", "nanoforge.training.optimizers:SophiaG", version="1", replace=True)
     OPTIMIZERS.register("sophiag", "nanoforge.training.optimizers:SophiaG", version="1", replace=True)
 
-    for name in ["cosine", "linear", "constant"]:
-        SCHEDULERS.register(name, lambda *args, **kwargs: None, version="0", replace=True)
+    SCHEDULERS.register("cosine", "nanoforge.training.schedulers:create_cosine_scheduler", version="1", replace=True)
+    SCHEDULERS.register("linear", "nanoforge.training.schedulers:create_linear_scheduler", version="1", replace=True)
+    SCHEDULERS.register("constant", "nanoforge.training.schedulers:create_constant_scheduler", version="1", replace=True)
 
-    for name in ["none", "int8", "int4", "gguf"]:
-        QUANTIZATION_BACKENDS.register(name, lambda *args, **kwargs: None, version="0", replace=True)
+    for name in ["none", "int8", "int4", "gptq", "awq", "gguf"]:
+        QUANTIZATION_BACKENDS.register(name, "nanoforge.quantization:apply_quantization", version="1", replace=True)
 
     TRANSFORMER_BLOCKS.register(
         "transformer",
@@ -232,10 +236,9 @@ def register_builtin_components() -> None:
     )
     TRANSFORMER_BLOCKS.register(
         "parallel_residual",
-        "nanoforge.model.transformer:TransformerBlock",
-        version="0",
+        "nanoforge.model.transformer:ParallelResidualTransformerBlock",
+        version="1",
         replace=True,
-        status="placeholder",
     )
 
 

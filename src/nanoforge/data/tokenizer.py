@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import json
 import tracemalloc
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Protocol
 
 from nanoforge.data.formats import DatasetStats, iter_dataset_records
-from nanoforge.data.native_tokenizer import NativeByteTokenizer
+from nanoforge.data.native_tokenizer import NativeBPETokenizer, NativeByteTokenizer, train_native_bpe_from_texts
 
 class TokenizerLike(Protocol):
     bos_id: int
@@ -51,6 +52,16 @@ class ByteTokenizer:
 
 class TokenizersBPE:
     def __init__(self, path: str | Path):
+        if _looks_like_builtin_bpe(path):
+            self._fallback = PurePythonBPETokenizer(path)
+            self.path = Path(path)
+            self.pad_id = self._fallback.pad_id
+            self.bos_id = self._fallback.bos_id
+            self.eos_id = self._fallback.eos_id
+            self.unk_id = self._fallback.unk_id
+            self.vocab_size = self._fallback.vocab_size
+            return
+        self._fallback = None
         try:
             from tokenizers import Tokenizer
         except Exception as exc:
@@ -65,6 +76,8 @@ class TokenizersBPE:
         self.vocab_size = self.tokenizer.get_vocab_size()
 
     def encode(self, text: str, add_bos: bool = False, add_eos: bool = False) -> list[int]:
+        if self._fallback is not None:
+            return self._fallback.encode(text, add_bos=add_bos, add_eos=add_eos)
         ids = self.tokenizer.encode(text).ids
         if add_bos:
             ids.insert(0, self.bos_id)
@@ -73,7 +86,85 @@ class TokenizersBPE:
         return ids
 
     def decode(self, ids: list[int]) -> str:
+        if self._fallback is not None:
+            return self._fallback.decode(ids)
         return self.tokenizer.decode(ids)
+
+
+class PurePythonBPETokenizer:
+    """Small byte-level BPE fallback for local/native-free environments."""
+
+    special_tokens = [
+        "<pad>",
+        "<bos>",
+        "<eos>",
+        "<unk>",
+        "<fim_prefix>",
+        "<fim_middle>",
+        "<fim_suffix>",
+        "<|pad|>",
+        "<|bos|>",
+        "<|eos|>",
+        "<|user|>",
+        "<|assistant|>",
+        "<|system|>",
+        "<|endoftext|>",
+    ]
+
+    def __init__(self, path: str | Path | None = None, merges: list[tuple[int, int]] | None = None):
+        self.pad_id = 0
+        self.bos_id = 1
+        self.eos_id = 2
+        self.unk_id = 3
+        self.byte_offset = len(self.special_tokens)
+        self.merges = merges or []
+        if path is not None:
+            raw = json.loads(Path(path).read_text(encoding="utf-8"))
+            if raw.get("type") != "nanoforge_python_bpe":
+                raise ValueError(f"{path} is not a Nanoforge Python BPE tokenizer.")
+            self.merges = [tuple(pair) for pair in raw.get("merges", [])]
+        self.pair_to_id: dict[tuple[int, int], int] = {}
+        for idx, pair in enumerate(self.merges):
+            self.pair_to_id[pair] = self.byte_offset + 256 + idx
+        self.id_to_piece: dict[int, tuple[int, ...]] = {
+            self.byte_offset + byte: (byte,) for byte in range(256)
+        }
+        for idx, pair in enumerate(self.merges):
+            token_id = self.byte_offset + 256 + idx
+            left = self.id_to_piece.get(pair[0], ())
+            right = self.id_to_piece.get(pair[1], ())
+            self.id_to_piece[token_id] = left + right
+        self.vocab_size = self.byte_offset + 256 + len(self.merges)
+
+    def encode(self, text: str, add_bos: bool = False, add_eos: bool = False) -> list[int]:
+        ids = [self.byte_offset + byte for byte in text.encode("utf-8", errors="replace")]
+        for pair, merged_id in self.pair_to_id.items():
+            if len(ids) < 2:
+                break
+            ids = _merge_pair_once(ids, pair, merged_id)
+        if add_bos:
+            ids.insert(0, self.bos_id)
+        if add_eos:
+            ids.append(self.eos_id)
+        return ids
+
+    def decode(self, ids: list[int]) -> str:
+        data: list[int] = []
+        for token_id in ids:
+            if token_id in self.id_to_piece:
+                data.extend(self.id_to_piece[token_id])
+        return bytes(data).decode("utf-8", errors="replace")
+
+    def save(self, path: str | Path) -> None:
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "type": "nanoforge_python_bpe",
+            "version": 1,
+            "special_tokens": self.special_tokens,
+            "merges": [list(pair) for pair in self.merges],
+        }
+        path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
 
 
 class WordPieceTokenizer:
@@ -129,7 +220,7 @@ class SentencePieceTokenizer:
         return self.processor.decode(ids)
 
 
-TokenizerAdapter = ByteTokenizer | NativeByteTokenizer | TokenizersBPE | WordPieceTokenizer | SentencePieceTokenizer
+TokenizerAdapter = ByteTokenizer | NativeByteTokenizer | NativeBPETokenizer | TokenizersBPE | PurePythonBPETokenizer | WordPieceTokenizer | SentencePieceTokenizer
 
 
 @dataclass
@@ -159,17 +250,26 @@ def iter_tokenizer_training_texts(
 
 
 def load_tokenizer(tokenizer_type: str = "byte", path: str | Path | None = None) -> TokenizerAdapter:
+    tokenizer_type = tokenizer_type.strip().lower().replace("_", "-")
     if tokenizer_type in {"byte-native", "native-byte"}:
         return NativeByteTokenizer()
     if tokenizer_type in {"byte-native-required", "native-byte-required"}:
         return NativeByteTokenizer(require_native=True)
     if tokenizer_type == "byte" or path is None:
         return ByteTokenizer()
+    if tokenizer_type in {"native-bpe", "bpe-native"}:
+        return NativeBPETokenizer(path)
+    if tokenizer_type in {"native-bpe-required", "bpe-native-required"}:
+        return NativeBPETokenizer(path, require_native=True)
+    if tokenizer_type in {"python-bpe", "pure-python-bpe"}:
+        if path is None:
+            return PurePythonBPETokenizer()
+        return PurePythonBPETokenizer(path)
     if tokenizer_type == "bpe":
         return TokenizersBPE(path)
     if tokenizer_type == "wordpiece":
         return WordPieceTokenizer(path)
-    if tokenizer_type in {"sp", "sentencepiece"}:
+    if tokenizer_type in {"sp", "sentencepiece", "unigram"}:
         return SentencePieceTokenizer(path)
     raise ValueError(f"Unknown tokenizer_type={tokenizer_type}")
 
@@ -194,7 +294,17 @@ def train_bpe_tokenizer(
     try:
         from tokenizers import Tokenizer, decoders, models, pre_tokenizers, processors, trainers
     except Exception as exc:
-        raise RuntimeError("Install tokenizers to train BPE tokenizers: pip install tokenizers") from exc
+        return train_python_bpe_tokenizer(
+            files,
+            out_path,
+            vocab_size=vocab_size,
+            min_frequency=min_frequency,
+            text_key=text_key,
+            text_columns=text_columns,
+            dry_run=False,
+            max_records=max_records,
+            scanned_report=report,
+        )
 
     special = ["<pad>", "<bos>", "<eos>", "<unk>", "<fim_prefix>", "<fim_middle>", "<fim_suffix>", "<|pad|>", "<|bos|>", "<|eos|>", "<|user|>", "<|assistant|>", "<|system|>", "<|endoftext|>"]
     tokenizer = Tokenizer(models.BPE(unk_token="<unk>"))
@@ -222,6 +332,117 @@ def train_bpe_tokenizer(
     out_path.parent.mkdir(parents=True, exist_ok=True)
     tokenizer.save(str(out_path))
     return report
+
+
+def train_python_bpe_tokenizer(
+    files: Iterable[str | Path],
+    out_path: str | Path,
+    vocab_size: int = 32000,
+    min_frequency: int = 2,
+    *,
+    text_key: str = "text",
+    text_columns: Iterable[str] | None = None,
+    dry_run: bool = False,
+    max_records: int | None = None,
+    scanned_report: TokenizerTrainingReport | None = None,
+) -> TokenizerTrainingReport:
+    files = list(files)
+    stats = DatasetStats()
+    report = scanned_report or _scan_training_texts(files, text_key, text_columns, max_records, stats)
+    report.dry_run = dry_run
+    if dry_run:
+        return report
+    token_offset = len(PurePythonBPETokenizer.special_tokens)
+    words: list[list[int]] = []
+    for text in iter_tokenizer_training_texts(files, text_key=text_key, text_columns=text_columns, max_records=max_records):
+        encoded = [token_offset + byte for byte in text.encode("utf-8", errors="replace")]
+        if encoded:
+            words.append(encoded)
+    merges: list[tuple[int, int]] = []
+    next_id = token_offset + 256
+    target_merges = max(0, vocab_size - next_id)
+    for _ in range(target_merges):
+        counts: Counter[tuple[int, int]] = Counter()
+        for word in words:
+            counts.update(zip(word, word[1:]))
+        if not counts:
+            break
+        pair, count = counts.most_common(1)[0]
+        if count < min_frequency:
+            break
+        merges.append(pair)
+        words = [_merge_pair_once(word, pair, next_id) for word in words]
+        next_id += 1
+    PurePythonBPETokenizer(merges=merges).save(out_path)
+    return report
+
+
+def train_native_bpe_tokenizer(
+    files: Iterable[str | Path],
+    out_path: str | Path,
+    vocab_size: int = 32000,
+    min_frequency: int = 2,
+    *,
+    text_key: str = "text",
+    text_columns: Iterable[str] | None = None,
+    dry_run: bool = False,
+    max_records: int | None = None,
+    require_native: bool = False,
+) -> TokenizerTrainingReport:
+    files = list(files)
+    stats = DatasetStats()
+    report = _scan_training_texts(files, text_key, text_columns, max_records, stats)
+    report.dry_run = dry_run
+    if dry_run:
+        return report
+    texts = iter_tokenizer_training_texts(
+        files,
+        text_key=text_key,
+        text_columns=text_columns,
+        max_records=max_records,
+        stats=DatasetStats(),
+    )
+    if train_native_bpe_from_texts(
+        texts,
+        out_path,
+        vocab_size=vocab_size,
+        min_frequency=min_frequency,
+        require_native=require_native,
+    ):
+        return report
+    return train_python_bpe_tokenizer(
+        files,
+        out_path,
+        vocab_size=vocab_size,
+        min_frequency=min_frequency,
+        text_key=text_key,
+        text_columns=text_columns,
+        dry_run=False,
+        max_records=max_records,
+        scanned_report=report,
+    )
+
+
+def _merge_pair_once(ids: list[int], pair: tuple[int, int], merged_id: int) -> list[int]:
+    out: list[int] = []
+    idx = 0
+    while idx < len(ids):
+        if idx + 1 < len(ids) and ids[idx] == pair[0] and ids[idx + 1] == pair[1]:
+            out.append(merged_id)
+            idx += 2
+        else:
+            out.append(ids[idx])
+            idx += 1
+    return out
+
+
+def _looks_like_builtin_bpe(path: str | Path) -> bool:
+    try:
+        with Path(path).open("r", encoding="utf-8") as handle:
+            prefix = handle.read(128)
+        return '"type"' in prefix and "nanoforge_python_bpe" in prefix
+    except OSError:
+        return False
 
 
 def train_wordpiece_tokenizer(

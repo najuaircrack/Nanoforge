@@ -10,6 +10,8 @@ from typing import Callable, Iterable, Iterator
 
 from nanoforge.data.cleaning import CleaningConfig, clean_records
 from nanoforge.data.formats import DatasetRecord, DatasetStats, iter_dataset_records
+from nanoforge.data.modes import encode_training_record, infer_record_mode, resolve_loss_masking
+from nanoforge.data.native_tokenizer import encode_batch
 from nanoforge.data.tokenizer import TokenizerLike
 
 
@@ -23,13 +25,22 @@ class PackingStats:
 
 
 class TokenShardWriter:
-    def __init__(self, out_dir: str | Path, split: str, vocab_size: int, shard_tokens: int = 50_000_000):
+    def __init__(
+        self,
+        out_dir: str | Path,
+        split: str,
+        vocab_size: int,
+        shard_tokens: int = 50_000_000,
+        *,
+        dtype_code: str | None = None,
+        dtype_name: str | None = None,
+    ):
         self.out_dir = Path(out_dir)
         self.split = split
         self.vocab_size = vocab_size
         self.shard_tokens = shard_tokens
-        self.dtype_code = "H" if vocab_size <= 65535 else "I"
-        self.dtype_name = "uint16" if self.dtype_code == "H" else "uint32"
+        self.dtype_code = dtype_code or ("H" if vocab_size <= 65535 else "I")
+        self.dtype_name = dtype_name or ("uint16" if self.dtype_code == "H" else "uint32")
         self.buffer = array(self.dtype_code)
         self.shard_id = 0
         self.total_tokens = 0
@@ -74,11 +85,56 @@ def stream_tokenize_records(
     *,
     add_bos: bool = True,
     add_eos: bool = True,
-) -> Iterator[tuple[DatasetRecord, list[int]]]:
+    mode: str = "auto",
+    loss_masking: str = "none",
+    batch_size: int = 256,
+) -> Iterator[tuple[DatasetRecord, list[int], list[int]]]:
+    pending_records: list[DatasetRecord] = []
+    pending_texts: list[str] = []
+
+    def flush_pending() -> Iterator[tuple[DatasetRecord, list[int], list[int]]]:
+        nonlocal pending_records, pending_texts
+        if not pending_records:
+            return
+        yield from _encode_plain_batch(pending_records, pending_texts, tokenizer, add_bos, add_eos)
+        pending_records, pending_texts = [], []
+
     for record in records:
-        ids = tokenizer.encode(record.text, add_bos=add_bos, add_eos=add_eos)
+        actual_mode = infer_record_mode(record, mode)
+        policy = resolve_loss_masking(actual_mode, loss_masking)
+        can_batch = policy == "none" and actual_mode in {"generative", "code", "creative"} and batch_size > 1
+        if can_batch:
+            pending_records.append(record)
+            pending_texts.append(record.text)
+            if len(pending_records) >= batch_size:
+                yield from flush_pending()
+            continue
+        yield from flush_pending()
+        encoded = encode_training_record(
+            record,
+            tokenizer,
+            mode=actual_mode,
+            loss_masking=policy,
+            add_bos=add_bos,
+            add_eos=add_eos,
+        )
+        if encoded.ids:
+            yield record, encoded.ids, encoded.labels
+    yield from flush_pending()
+
+
+def _encode_plain_batch(
+    records: list[DatasetRecord],
+    texts: list[str],
+    tokenizer: TokenizerLike,
+    add_bos: bool,
+    add_eos: bool,
+) -> Iterator[tuple[DatasetRecord, list[int], list[int]]]:
+    for record, ids in zip(records, encode_batch(tokenizer, texts, add_bos=add_bos, add_eos=add_eos)):
         if ids:
-            yield record, ids
+            labels = list(ids)
+            labels[0] = -100
+            yield record, ids, labels
 
 
 def build_packed_dataset_streaming(
@@ -92,6 +148,9 @@ def build_packed_dataset_streaming(
     seed: int = 1337,
     shard_tokens: int = 50_000_000,
     cleaning: CleaningConfig | None = None,
+    mode: str = "auto",
+    loss_masking: str = "auto",
+    tokenizer_batch_size: int = 256,
     progress_callback: Callable[[PackingStats], None] | None = None,
 ) -> PackingStats:
     rng = random.Random(seed)
@@ -102,32 +161,71 @@ def build_packed_dataset_streaming(
     records = clean_records(records, cleaning or CleaningConfig())
     train = TokenShardWriter(out_dir, "train", tokenizer.vocab_size, shard_tokens)
     val = TokenShardWriter(out_dir, "val", tokenizer.vocab_size, shard_tokens)
+    write_labels = loss_masking != "none" or mode not in {"generative", "code", "creative"}
+    train_labels = (
+        TokenShardWriter(out_dir, "train.labels", tokenizer.vocab_size, shard_tokens, dtype_code="i", dtype_name="int32")
+        if write_labels
+        else None
+    )
+    val_labels = (
+        TokenShardWriter(out_dir, "val.labels", tokenizer.vocab_size, shard_tokens, dtype_code="i", dtype_name="int32")
+        if write_labels
+        else None
+    )
     stats = PackingStats()
     first_ids: list[int] | None = None
+    first_labels: list[int] | None = None
     try:
-        for record, ids in stream_tokenize_records(records, tokenizer):
+        for record, ids, labels in stream_tokenize_records(
+            records,
+            tokenizer,
+            mode=mode,
+            loss_masking=loss_masking,
+            batch_size=tokenizer_batch_size,
+        ):
             if first_ids is None:
                 first_ids = ids
+                first_labels = labels
             stats.records_seen += 1
             if rng.random() < val_fraction:
                 val.write(ids)
+                if val_labels is not None:
+                    val_labels.write(labels)
                 stats.val_tokens += len(ids)
             else:
                 train.write(ids)
+                if train_labels is not None:
+                    train_labels.write(labels)
                 stats.train_tokens += len(ids)
             stats.records_written += 1
             if progress_callback is not None:
                 progress_callback(stats)
         if first_ids is not None and stats.val_tokens == 0:
             val.write(first_ids)
+            if val_labels is not None and first_labels is not None:
+                val_labels.write(first_labels)
             stats.val_tokens += len(first_ids)
         if first_ids is not None and stats.train_tokens == 0:
             train.write(first_ids)
+            if train_labels is not None and first_labels is not None:
+                train_labels.write(first_labels)
             stats.train_tokens += len(first_ids)
     finally:
         train.close()
         val.close()
+        if train_labels is not None:
+            train_labels.close()
+        if val_labels is not None:
+            val_labels.close()
     stats.shards = train.shard_id + val.shard_id
-    manifest = {"packing": asdict(stats), "dataset": asdict(data_stats), "pid": os.getpid()}
+    manifest = {
+        "packing": asdict(stats),
+        "dataset": asdict(data_stats),
+        "mode": mode,
+        "loss_masking": loss_masking,
+        "label_files": write_labels,
+        "tokenizer_batch_size": tokenizer_batch_size,
+        "pid": os.getpid(),
+    }
     (out_dir / "packing.manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     return stats

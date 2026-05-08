@@ -16,11 +16,11 @@ from nanoforge.profiling import estimate_model_profile
 from nanoforge.progress import JsonlMetricLogger
 from nanoforge.training.checkpoint import AsyncCheckpointSaver, load_checkpoint, restore_rng_state
 from nanoforge.training.health import TrainingHealthMonitor
+from nanoforge.training.schedulers import create_scheduler
 from nanoforge.training.utils import (
     EMA,
     autocast_dtype,
     configure_named_optimizer,
-    cosine_lr,
     ensure_dir,
     grad_global_norm,
     grads_are_finite,
@@ -56,9 +56,11 @@ class Trainer:
         self.train_data = PackedMemmapDataset(self.data_cfg.train_path, self.data_cfg.seq_len)
         self.val_data = PackedMemmapDataset(self.data_cfg.val_path, self.data_cfg.seq_len)
         self.output_dir = ensure_dir(self.train_cfg.output_dir)
-        self.scaler = torch.cuda.amp.GradScaler(
-            enabled=self.device.type == "cuda" and autocast_dtype(self.train_cfg.precision, self.device) == torch.float16
-        )
+        scaler_enabled = self.device.type == "cuda" and autocast_dtype(self.train_cfg.precision, self.device) == torch.float16
+        try:
+            self.scaler = torch.amp.GradScaler("cuda", enabled=scaler_enabled)
+        except TypeError:
+            self.scaler = torch.amp.GradScaler(enabled=scaler_enabled)
         self.writer = self._make_writer()
         self.wandb_run = self._make_wandb()
         self.metric_logger = JsonlMetricLogger(self.output_dir / "metrics.jsonl", reset=True)
@@ -145,11 +147,21 @@ class Trainer:
         ids = torch.tensor([prompt_ids[-self.model_cfg.max_seq_len :]], dtype=torch.long, device=self.device)
         generated: list[int] = []
         sampling = SamplingConfig(
+            mode=self.config.inference.mode,
             temperature=self.config.inference.temperature,
             top_k=self.config.inference.top_k,
             top_p=self.config.inference.top_p,
+            min_p=self.config.inference.min_p,
             repetition_penalty=self.config.inference.repetition_penalty,
+            frequency_penalty=self.config.inference.frequency_penalty,
+            presence_penalty=self.config.inference.presence_penalty,
+            no_repeat_ngram_size=self.config.inference.no_repeat_ngram_size,
+            deterministic=self.config.inference.deterministic,
+            stop_on_repetition=self.config.inference.stop_on_repetition,
+            repetition_window=self.config.inference.repetition_window,
+            repetition_threshold=self.config.inference.repetition_threshold,
             mirostat=self.config.inference.mirostat,
+            mirostat_version=self.config.inference.mirostat_version,
             mirostat_tau=self.config.inference.mirostat_tau,
             mirostat_eta=self.config.inference.mirostat_eta,
         )
@@ -197,6 +209,13 @@ class Trainer:
         warmup_steps = self.train_cfg.warmup_steps
         if warmup_steps <= 0 and self.train_cfg.warmup_ratio > 0:
             warmup_steps = max(1, int(self.train_cfg.max_steps * self.train_cfg.warmup_ratio))
+        scheduler = create_scheduler(
+            self.train_cfg.scheduler,
+            max_steps=self.train_cfg.max_steps,
+            warmup_steps=warmup_steps,
+            learning_rate=self.train_cfg.learning_rate,
+            min_learning_rate=self.train_cfg.min_learning_rate,
+        )
         pbar = trange(
             self.start_step,
             self.train_cfg.max_steps,
@@ -225,13 +244,7 @@ class Trainer:
         )
         for step in pbar:
             step_t0 = time.time()
-            lr = cosine_lr(
-                step,
-                self.train_cfg.max_steps,
-                warmup_steps,
-                self.train_cfg.learning_rate,
-                self.train_cfg.min_learning_rate,
-            )
+            lr = scheduler(step)
             for group in self.optimizer.param_groups:
                 group["lr"] = lr
             self.optimizer.zero_grad(set_to_none=True)

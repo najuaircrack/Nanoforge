@@ -271,8 +271,9 @@ def _extract_text_from_row(
         if "conversations" in row:
             return _format_messages(row["conversations"])
         if "instruction" in row and any(key in row for key in ("input", "output", "response")):
-            parts = [row.get("instruction"), row.get("input"), row.get("output", row.get("response"))]
-            return "\n".join(_coerce_cell(part) for part in parts if part)
+            prompt = "\n".join(_coerce_cell(part) for part in (row.get("instruction"), row.get("input")) if part)
+            response = _coerce_cell(row.get("output", row.get("response")))
+            return f"<|user|>\n{prompt}\n<|assistant|>\n{response}" if response else prompt
         if "prompt" in row and any(key in row for key in ("completion", "response")):
             return "\n".join(_coerce_cell(row[key]) for key in ("prompt", "completion", "response") if row.get(key))
         key = _best_text_key(row, text_key)
@@ -313,6 +314,21 @@ def _best_text_key(row: dict[str, Any], text_key: str) -> str | None:
     return best[1] if best else None
 
 
+def _infer_row_mode(row: Any) -> str:
+    if not isinstance(row, dict):
+        return "generative"
+    keys = {str(key).lower() for key in row}
+    if "messages" in keys or "conversations" in keys:
+        return "chat"
+    if "instruction" in keys and ({"output", "response", "answer"} & keys):
+        return "instruct"
+    if "prompt" in keys and ({"completion", "response", "answer"} & keys):
+        return "completion"
+    if "code" in keys:
+        return "code"
+    return "generative"
+
+
 def _format_messages(messages: Any) -> str:
     parts = []
     if isinstance(messages, list):
@@ -351,7 +367,11 @@ def _iter_jsonl(
                         stats.add_field(key)
                 text = _extract_text_from_row(row, text_key, text_columns)
                 if text:
-                    yield DatasetRecord(sanitize_text(text), str(path), {"format": "jsonl", "line": line_no})
+                    yield DatasetRecord(
+                        sanitize_text(text),
+                        str(path),
+                        {"format": "jsonl", "line": line_no, "mode": _infer_row_mode(row)},
+                    )
                 else:
                     stats.skipped_records += 1
     except Exception as exc:
@@ -377,7 +397,11 @@ def _iter_json(
                 stats.add_field(key)
         text = _extract_text_from_row(row, text_key, text_columns)
         if text:
-            yield DatasetRecord(sanitize_text(text), str(path), {"format": "json", "index": idx})
+            yield DatasetRecord(
+                sanitize_text(text),
+                str(path),
+                {"format": "json", "index": idx, "mode": _infer_row_mode(row)},
+            )
         else:
             stats.skipped_records += 1
 
@@ -395,7 +419,11 @@ def _iter_csv(path: Path, text_key: str, text_columns: Iterable[str], stats: Dat
                 text = _extract_text_from_row(row, text_key, text_columns)
                 if text is None:
                     text = "\n".join(str(v) for v in row.values() if v)
-                yield DatasetRecord(sanitize_text(text), str(path), {"format": "csv", "row": idx})
+                yield DatasetRecord(
+                    sanitize_text(text),
+                    str(path),
+                    {"format": "csv", "row": idx, "mode": _infer_row_mode(row)},
+                )
     except Exception as exc:
         stats.issues.append(DatasetIssue(str(path), f"Could not read CSV/TSV: {exc}", "error"))
 
@@ -419,7 +447,11 @@ def _iter_yaml(path: Path, text_key: str, text_columns: Iterable[str], stats: Da
                 stats.add_field(key)
         text = _extract_text_from_row(row, text_key, text_columns)
         if text:
-            yield DatasetRecord(sanitize_text(text), str(path), {"format": "yaml", "index": idx})
+            yield DatasetRecord(
+                sanitize_text(text),
+                str(path),
+                {"format": "yaml", "index": idx, "mode": _infer_row_mode(row)},
+            )
 
 
 def _iter_xml(path: Path, stats: DatasetStats) -> Iterator[DatasetRecord]:
@@ -549,7 +581,7 @@ def _records_from_arrow_batch(
             yield DatasetRecord(
                 sanitize_text(text),
                 source,
-                {"format": fmt, "batch": batch_id, "row": row_id},
+                {"format": fmt, "batch": batch_id, "row": row_id, "mode": _infer_row_mode(row)},
             )
         else:
             stats.skipped_records += 1
@@ -609,7 +641,11 @@ def _records_from_archive_bytes(
                 continue
             value = _extract_text_from_row(row, text_key, text_columns)
             if value:
-                yield DatasetRecord(sanitize_text(value), source, {"format": "archive-jsonl", "line": line_no})
+                yield DatasetRecord(
+                    sanitize_text(value),
+                    source,
+                    {"format": "archive-jsonl", "line": line_no, "mode": _infer_row_mode(row)},
+                )
             else:
                 stats.skipped_records += 1
     else:
@@ -650,7 +686,11 @@ def _iter_huggingface(
                     stats.add_field(key)
             text = _extract_text_from_row(row, text_key, text_columns)
             if text:
-                yield DatasetRecord(sanitize_text(text), ref, {"format": "huggingface", "row": idx})
+                yield DatasetRecord(
+                    sanitize_text(text),
+                    ref,
+                    {"format": "huggingface", "row": idx, "mode": _infer_row_mode(row)},
+                )
             else:
                 stats.skipped_records += 1
     except Exception as exc:

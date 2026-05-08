@@ -66,6 +66,7 @@ class ModelConfig:
 
 @dataclass
 class TrainConfig:
+    mode: str = "auto"
     run_name: str = "nanoforge"
     output_dir: str = "runs/nanoforge"
     seed: int = 1337
@@ -99,6 +100,9 @@ class TrainConfig:
     sample_max_new_tokens: int = 128
     health_interval: int = 10
     grad_explosion_factor: float = 10.0
+    adaptive_grad_clip: bool = True
+    rollback_on_nonfinite: bool = True
+    distributed_backend: str = "none"
     log_interval: int = 10
     tensorboard: bool = True
     wandb: bool = False
@@ -118,6 +122,13 @@ class DataConfig:
     tokenizer_path: str | None = None
     tokenizer_type: str = "byte"
     seq_len: int = 2048
+    mode: str = "generative"
+    loss_masking: str = "auto"
+    assistant_only_loss: bool = False
+    prompt_template: str | None = None
+    dataset_weights: dict[str, float] | None = None
+    streaming: bool = False
+    tokenizer_batch_size: int = 256
     num_workers: int = 2
     prefetch_factor: int = 2
     pin_memory: bool = True
@@ -128,14 +139,25 @@ class DataConfig:
 
 @dataclass
 class InferenceConfig:
+    mode: str = "balanced"
     max_new_tokens: int = 256
     temperature: float = 0.8
     top_k: int | None = 50
     top_p: float | None = 0.95
+    min_p: float | None = None
     repetition_penalty: float = 1.0
+    frequency_penalty: float = 0.0
+    presence_penalty: float = 0.0
+    no_repeat_ngram_size: int = 0
+    deterministic: bool = False
+    stop_on_repetition: bool = True
+    repetition_window: int = 64
+    repetition_threshold: float = 0.85
     mirostat: bool = False
+    mirostat_version: int = 2
     mirostat_tau: float = 5.0
     mirostat_eta: float = 0.1
+    stop_tokens: list[str] = field(default_factory=lambda: ["<|endoftext|>", "<|user|>"])
     sampler: str = "top_k_top_p"
 
     def __post_init__(self) -> None:

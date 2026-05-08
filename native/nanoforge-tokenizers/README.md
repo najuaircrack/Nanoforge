@@ -24,11 +24,11 @@ nanoforge benchmark-tokenizer --input data/raw --tokenizer byte-native
 
 - Native byte tokenizer with Nanoforge-compatible token IDs.
 - Parallel batch byte tokenization through Rayon.
+- Native byte-level BPE tokenizer/trainer compatible with Nanoforge's JSON BPE artifacts.
 - UTF-8 recovery helper for future ingestion integration.
 
 ## Planned Scope
 
-- Native BPE trainer and tokenizer.
 - WordPiece and Unigram LM tokenizers.
 - Streaming mmap corpus readers.
 - SIMD UTF-8 validation and normalization.

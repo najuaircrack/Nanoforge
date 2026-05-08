@@ -69,6 +69,54 @@ class TransformerBlock(nn.Module):
         return x, cache, aux_loss
 
 
+class ParallelResidualTransformerBlock(nn.Module):
+    """GPT-NeoX style parallel attention/FFN residual block."""
+
+    def __init__(self, config: ModelConfig):
+        super().__init__()
+        norm_factory = NORMALIZATIONS.get(config.normalization)
+        self.norm = norm_factory(config.d_model, config.norm_eps)
+        self.attn = ATTENTION_BACKENDS.create(config.attention_backend, config)
+        hidden = int(config.d_model * config.ffn_hidden_mult)
+        hidden = int(256 * math.ceil(hidden / 256)) if hidden >= 256 else hidden
+        self.moe = config.moe is not None
+        if self.moe:
+            self.ffn = FFN_BACKENDS.create(
+                "moe",
+                config.d_model,
+                hidden,
+                config.moe,
+                config.activation,
+                config.dropout,
+            )
+        else:
+            ffn_type = config.ffn_type or config.activation
+            self.ffn = FFN_BACKENDS.create(
+                ffn_type,
+                config.d_model,
+                hidden,
+                ffn_type if ffn_type in {"swiglu", "geglu"} else config.activation,
+                config.dropout,
+            )
+        self.residual_scale = config.residual_scale or (1.0 / math.sqrt(2 * config.n_layers))
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        cache: KVCache | None = None,
+        use_cache: bool = False,
+    ) -> tuple[torch.Tensor, KVCache | None, torch.Tensor | None]:
+        hidden = self.norm(x)
+        attn_out, cache = self.attn(hidden, cache=cache, use_cache=use_cache)
+        aux_loss = None
+        if self.moe:
+            ffn_out, aux_loss = self.ffn(hidden)
+        else:
+            ffn_out = self.ffn(hidden)
+        x = x + (attn_out + ffn_out) * self.residual_scale
+        return x, cache, aux_loss
+
+
 class NanoforgeForCausalLM(nn.Module):
     def __init__(self, config: ModelConfig):
         super().__init__()

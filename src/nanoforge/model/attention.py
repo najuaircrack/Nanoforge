@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from copy import copy
 from dataclasses import dataclass
 
 import torch
@@ -16,6 +17,7 @@ from nanoforge.model.rope import RotaryEmbedding, apply_rotary
 class KVCache:
     key: torch.Tensor | None = None
     value: torch.Tensor | None = None
+    max_length: int | None = None
 
     def append(self, key: torch.Tensor, value: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         if self.key is None:
@@ -24,7 +26,21 @@ class KVCache:
         else:
             self.key = torch.cat([self.key, key], dim=2)
             self.value = torch.cat([self.value, value], dim=2)
+        if self.max_length is not None and self.key.shape[2] > self.max_length:
+            self.key = self.key[:, :, -self.max_length :, :].contiguous()
+            self.value = self.value[:, :, -self.max_length :, :].contiguous()
         return self.key, self.value
+
+    @property
+    def length(self) -> int:
+        return 0 if self.key is None else int(self.key.shape[2])
+
+    def clone_detached(self) -> "KVCache":
+        return KVCache(
+            None if self.key is None else self.key.detach().clone(),
+            None if self.value is None else self.value.detach().clone(),
+            self.max_length,
+        )
 
 
 def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
@@ -135,6 +151,7 @@ class CausalSelfAttention(nn.Module):
 
         if use_cache:
             cache = cache or KVCache()
+            cache.max_length = self.config.sliding_window or self.config.max_seq_len
             k, v = cache.append(k, v)
         kv_len = k.shape[2]
         k_full = repeat_kv(k, self.kv_repeat)
@@ -174,3 +191,43 @@ class CausalSelfAttention(nn.Module):
             y = probs @ v_full
         y = y.transpose(1, 2).contiguous().view(batch, seq_len, self.n_heads * self.head_dim)
         return self.o_proj(y), cache
+
+
+class ChunkedCausalSelfAttention(CausalSelfAttention):
+    """Memory-bounded attention variant using a local chunk-sized cache window."""
+
+    def __init__(self, config: ModelConfig):
+        cfg = copy(config)
+        cfg.sliding_window = cfg.sliding_window or min(cfg.max_seq_len, 1024)
+        super().__init__(cfg)
+
+
+class SparseCausalSelfAttention(CausalSelfAttention):
+    """Experimental sparse-style local attention approximation."""
+
+    def __init__(self, config: ModelConfig):
+        cfg = copy(config)
+        cfg.sliding_window = cfg.sliding_window or min(cfg.max_seq_len, 512)
+        super().__init__(cfg)
+
+
+class HybridLocalGlobalCausalAttention(CausalSelfAttention):
+    """Hybrid backend hook with local-window behavior and full-prefill compatibility."""
+
+    def __init__(self, config: ModelConfig):
+        cfg = copy(config)
+        cfg.sliding_window = cfg.sliding_window or min(cfg.max_seq_len, 2048)
+        super().__init__(cfg)
+
+
+class PagedCausalSelfAttention(CausalSelfAttention):
+    """Paged-cache compatible attention surface.
+
+    The current implementation uses bounded contiguous pages internally; the class gives runtime
+    code a distinct backend to target without pretending it is the base SDPA backend.
+    """
+
+    def __init__(self, config: ModelConfig):
+        cfg = copy(config)
+        cfg.sliding_window = cfg.sliding_window or cfg.max_seq_len
+        super().__init__(cfg)

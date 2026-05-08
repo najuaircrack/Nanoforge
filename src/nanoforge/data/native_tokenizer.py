@@ -108,6 +108,99 @@ class NativeByteTokenizer:
         )
 
 
+class NativeBPETokenizer:
+    """Byte-level BPE facade with Rust acceleration and Python fallback."""
+
+    def __init__(self, path: str | Path | None = None, *, require_native: bool = False):
+        self.path = Path(path) if path is not None else None
+        self._module = load_native_module()
+        self._native = None
+        self._fallback = None
+        if self._module is not None and hasattr(self._module, "ByteLevelBpeTokenizer"):
+            self._native = self._module.ByteLevelBpeTokenizer(str(self.path) if self.path is not None else None)
+        elif require_native:
+            raise RuntimeError(
+                "Native BPE tokenizer extension is not installed. Build native/nanoforge-tokenizers "
+                "or use tokenizer_type='python-bpe' for the Python fallback."
+            )
+        else:
+            from nanoforge.data.tokenizer import PurePythonBPETokenizer
+
+            self._fallback = PurePythonBPETokenizer(self.path)
+
+    @property
+    def backend(self) -> str:
+        return "rust" if self._native is not None else "python-fallback"
+
+    @property
+    def pad_id(self) -> int:
+        return int(self._native.pad_id if self._native is not None else self._fallback.pad_id)
+
+    @property
+    def bos_id(self) -> int:
+        return int(self._native.bos_id if self._native is not None else self._fallback.bos_id)
+
+    @property
+    def eos_id(self) -> int:
+        return int(self._native.eos_id if self._native is not None else self._fallback.eos_id)
+
+    @property
+    def unk_id(self) -> int:
+        return int(self._native.unk_id if self._native is not None else self._fallback.unk_id)
+
+    @property
+    def vocab_size(self) -> int:
+        return int(self._native.vocab_size if self._native is not None else self._fallback.vocab_size)
+
+    def encode(self, text: str, add_bos: bool = False, add_eos: bool = False) -> list[int]:
+        if self._native is not None:
+            return list(self._native.encode(text, add_bos, add_eos))
+        return self._fallback.encode(text, add_bos=add_bos, add_eos=add_eos)
+
+    def encode_batch(
+        self,
+        texts: Iterable[str],
+        add_bos: bool = False,
+        add_eos: bool = False,
+    ) -> list[list[int]]:
+        if self._native is not None and hasattr(self._native, "encode_batch"):
+            return [list(ids) for ids in self._native.encode_batch(list(texts), add_bos, add_eos)]
+        return [self.encode(text, add_bos=add_bos, add_eos=add_eos) for text in texts]
+
+    def decode(self, ids: list[int]) -> str:
+        if self._native is not None:
+            return str(self._native.decode(ids))
+        return self._fallback.decode(ids)
+
+    def save(self, path: str | Path) -> None:
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if self._native is not None:
+            self._native.save(str(path))
+        else:
+            self._fallback.save(path)
+
+
+def train_native_bpe_from_texts(
+    texts: Iterable[str],
+    out_path: str | Path,
+    *,
+    vocab_size: int = 32000,
+    min_frequency: int = 2,
+    require_native: bool = False,
+) -> bool:
+    module = load_native_module()
+    if module is None or not hasattr(module, "ByteLevelBpeTokenizer"):
+        if require_native:
+            raise RuntimeError("Native BPE tokenizer extension is not installed.")
+        return False
+    tokenizer = module.ByteLevelBpeTokenizer.train_from_texts(list(texts), vocab_size, min_frequency)
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    tokenizer.save(str(out_path))
+    return True
+
+
 def encode_batch(
     tokenizer: Any,
     texts: Iterable[str],

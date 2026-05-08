@@ -30,9 +30,24 @@ class PackedMemmapDataset:
                 if line.startswith("dtype="):
                     dtype = line.split("=", 1)[1].strip()
         self.tokens = [np.memmap(file, dtype=np.dtype(dtype), mode="r") for file in files if file.exists()]
+        label_manifest_path = self.path.with_name(f"{self.path.stem}.labels.manifest.json")
+        self.labels: list[np.memmap] | None = None
+        if label_manifest_path.exists():
+            label_manifest = json.loads(label_manifest_path.read_text(encoding="utf-8"))
+            label_dtype = label_manifest.get("dtype", "int32")
+            label_files = [self.path.parent / name for name in label_manifest.get("files", [])]
+            labels = [np.memmap(file, dtype=np.dtype(label_dtype), mode="r") for file in label_files if file.exists()]
+            if len(labels) == len(self.tokens):
+                self.labels = labels
         self.lengths = np.asarray([len(tokens) for tokens in self.tokens], dtype=np.int64)
-        valid = self.lengths > seq_len + 1
+        if self.labels is not None:
+            label_lengths = np.asarray([len(labels) for labels in self.labels], dtype=np.int64)
+            valid = (self.lengths > seq_len + 1) & (self.lengths == label_lengths)
+        else:
+            valid = self.lengths > seq_len + 1
         self.tokens = [tokens for tokens, is_valid in zip(self.tokens, valid) if is_valid]
+        if self.labels is not None:
+            self.labels = [labels for labels, is_valid in zip(self.labels, valid) if is_valid]
         self.lengths = self.lengths[valid]
         if not self.tokens:
             raise ValueError(f"Dataset {path} is too small for seq_len={seq_len}.")
@@ -50,7 +65,10 @@ class PackedMemmapDataset:
             for shard in shard_ids
         ]
         x = np.stack([self.tokens[shard][i : i + self.seq_len] for shard, i in zip(shard_ids, starts)])
-        y = np.stack([self.tokens[shard][i + 1 : i + 1 + self.seq_len] for shard, i in zip(shard_ids, starts)])
+        if self.labels is None:
+            y = np.stack([self.tokens[shard][i + 1 : i + 1 + self.seq_len] for shard, i in zip(shard_ids, starts)])
+        else:
+            y = np.stack([self.labels[shard][i + 1 : i + 1 + self.seq_len] for shard, i in zip(shard_ids, starts)])
         return torch.from_numpy(x.astype(np.int64)), torch.from_numpy(y.astype(np.int64))
 
 
@@ -65,6 +83,9 @@ def build_packed_dataset(
     min_chars: int = 16,
     shuffle_docs: bool = True,
     seed: int = 1337,
+    mode: str = "auto",
+    loss_masking: str = "auto",
+    tokenizer_batch_size: int = 256,
     progress_callback=None,
 ) -> None:
     _ = jsonl, shuffle_docs
@@ -77,6 +98,9 @@ def build_packed_dataset(
         code_only=code_only,
         seed=seed,
         cleaning=CleaningConfig(min_chars=min_chars, deduplicate=True),
+        mode=mode,
+        loss_masking=loss_masking,
+        tokenizer_batch_size=tokenizer_batch_size,
         progress_callback=progress_callback,
     )
 
@@ -94,4 +118,11 @@ def prepare_from_config(config_path: str | Path, input_paths: Iterable[str | Pat
 
     cfg = load_config(config_path)
     tokenizer = load_tokenizer(cfg.data.tokenizer_type, cfg.data.tokenizer_path)
-    build_packed_dataset(input_paths, out_dir, tokenizer)
+    build_packed_dataset(
+        input_paths,
+        out_dir,
+        tokenizer,
+        mode=cfg.data.mode,
+        loss_masking="assistant_only" if cfg.data.assistant_only_loss else cfg.data.loss_masking,
+        tokenizer_batch_size=cfg.data.tokenizer_batch_size,
+    )
