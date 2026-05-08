@@ -388,6 +388,7 @@ def train_native_bpe_tokenizer(
     dry_run: bool = False,
     max_records: int | None = None,
     require_native: bool = False,
+    show_progress: bool = True, 
 ) -> TokenizerTrainingReport:
     files = list(files)
     stats = DatasetStats()
@@ -408,6 +409,7 @@ def train_native_bpe_tokenizer(
         vocab_size=vocab_size,
         min_frequency=min_frequency,
         require_native=require_native,
+        show_progress=show_progress,
     ):
         return report
     return train_python_bpe_tokenizer(

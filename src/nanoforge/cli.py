@@ -90,6 +90,7 @@ def cmd_train_tokenizer(args: argparse.Namespace) -> None:
             text_columns=columns,
             dry_run=args.dry_run,
             max_records=args.max_records,
+            show_progress=not args.no_progress
         )
     elif args.type == "wordpiece":
         report = train_wordpiece_tokenizer(
@@ -469,6 +470,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--text-column", action="append", help="Structured text column to train on. Can be repeated.")
     p.add_argument("--max-records", type=int)
     p.add_argument("--dry-run", action="store_true", help="Scan and report training corpus health without fitting.")
+    p.add_argument("--no-progress", action="store_true", help="Disable the merge progress bar.")  # ← ADD THIS
     p.set_defaults(func=cmd_train_tokenizer)
 
     p = sub.add_parser("prepare", help="Pack raw text/code/JSONL into train.bin and val.bin.")

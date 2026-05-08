@@ -179,8 +179,7 @@ class NativeBPETokenizer:
             self._native.save(str(path))
         else:
             self._fallback.save(path)
-
-
+            
 def train_native_bpe_from_texts(
     texts: Iterable[str],
     out_path: str | Path,
@@ -188,26 +187,80 @@ def train_native_bpe_from_texts(
     vocab_size: int = 32000,
     min_frequency: int = 2,
     require_native: bool = False,
+    show_progress: bool = True,   # ← NEW
 ) -> bool:
     module = load_native_module()
     if module is None or not hasattr(module, "ByteLevelBpeTokenizer"):
         if require_native:
             raise RuntimeError("Native BPE tokenizer extension is not installed.")
         return False
-    tokenizer = module.ByteLevelBpeTokenizer.train_from_texts(list(texts), vocab_size, min_frequency)
+
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # ── tqdm progress bar ─────────────────────────────────────────────────────
+    progress_cb = None
+    bar = None
+    if show_progress:
+        try:
+            from tqdm import tqdm
+            max_merges = vocab_size - (14 + 256)   # mirrors BPE_BYTE_OFFSET + 256
+            bar = tqdm(total=max_merges, desc="BPE merges", unit="merge", dynamic_ncols=True)
+            last_step = [0]
+
+            def progress_cb(step: int, total: int) -> None:
+                delta = step - last_step[0]
+                if delta > 0:
+                    bar.update(delta)
+                last_step[0] = step
+
+        except ImportError:
+            pass  # tqdm not installed, train silently
+
+    try:
+        import tempfile, os
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", suffix=".txt", delete=False
+        ) as tmp:
+            tmp_path = tmp.name
+            for text in texts:
+                tmp.write(text.replace("\n", " "))
+                tmp.write("\n")
+        try:
+            tokenizer = module.ByteLevelBpeTokenizer.train_from_file(
+                tmp_path, vocab_size, min_frequency,
+                progress_cb=progress_cb,   # ← passed through
+            )
+        finally:
+            os.unlink(tmp_path)
+    finally:
+        if bar is not None:
+            bar.close()
+
     tokenizer.save(str(out_path))
     return True
 
-
 def encode_batch(
-    tokenizer: Any,
+    self,
     texts: Iterable[str],
-    *,
     add_bos: bool = False,
     add_eos: bool = False,
+    *,
+    chunk_size: int = 256,      # tune to your RAM budget
 ) -> list[list[int]]:
-    if hasattr(tokenizer, "encode_batch"):
-        return tokenizer.encode_batch(texts, add_bos=add_bos, add_eos=add_eos)
-    return [tokenizer.encode(text, add_bos=add_bos, add_eos=add_eos) for text in texts]
+    results: list[list[int]] = []
+    buf: list[str] = []
+    for text in texts:
+        buf.append(text)
+        if len(buf) >= chunk_size:
+            if self._native is not None:
+                results.extend(self._native.encode_batch(buf, add_bos, add_eos))
+            else:
+                results.extend(self.encode(t, add_bos=add_bos, add_eos=add_eos) for t in buf)
+            buf.clear()
+    if buf:
+        if self._native is not None:
+            results.extend(self._native.encode_batch(buf, add_bos, add_eos))
+        else:
+            results.extend(self.encode(t, add_bos=add_bos, add_eos=add_eos) for t in buf)
+    return results
