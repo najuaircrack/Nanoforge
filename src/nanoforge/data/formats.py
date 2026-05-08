@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import io
 import json
 import sqlite3
 import tarfile
+import unicodedata
 import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -19,6 +21,22 @@ TEXT_EXTENSIONS = {".txt", ".text", ".md", ".markdown", ".rst", ".log"}
 STRUCTURED_EXTENSIONS = {".json", ".jsonl", ".csv", ".tsv", ".yaml", ".yml", ".xml", ".sqlite", ".db"}
 ARCHIVE_EXTENSIONS = {".zip", ".tar", ".tgz", ".gz", ".tar.gz"}
 PRETOKENIZED_EXTENSIONS = {".bin", ".npy", ".npz"}
+TEXT_FIELD_HINTS = {
+    "text",
+    "content",
+    "body",
+    "prompt",
+    "completion",
+    "response",
+    "answer",
+    "instruction",
+    "input",
+    "output",
+    "code",
+    "story",
+    "messages",
+    "conversations",
+}
 
 
 @dataclass
@@ -39,15 +57,26 @@ class DatasetIssue:
 class DatasetStats:
     records: int = 0
     bytes_read: int = 0
+    skipped_records: int = 0
+    invalid_records: int = 0
     issues: list[DatasetIssue] = field(default_factory=list)
     fields: dict[str, int] = field(default_factory=dict)
     formats: dict[str, int] = field(default_factory=dict)
+    schemas: dict[str, list[str]] = field(default_factory=dict)
+    text_columns: dict[str, list[str]] = field(default_factory=dict)
+    fingerprints: dict[str, str] = field(default_factory=dict)
 
     def add_field(self, name: str) -> None:
         self.fields[name] = self.fields.get(name, 0) + 1
 
     def add_format(self, name: str) -> None:
         self.formats[name] = self.formats.get(name, 0) + 1
+
+    def add_schema(self, source: str, fields: Iterable[str]) -> None:
+        self.schemas[source] = list(fields)
+
+    def add_text_columns(self, source: str, columns: Iterable[str]) -> None:
+        self.text_columns[source] = list(columns)
 
 
 def detect_format(path_or_url: str | Path) -> str:
@@ -89,35 +118,57 @@ def iter_dataset_records(
     paths: Iterable[str | Path],
     *,
     text_key: str = "text",
+    text_columns: Iterable[str] | None = None,
     code_only: bool = False,
     stats: DatasetStats | None = None,
 ) -> Iterator[DatasetRecord]:
     stats = stats or DatasetStats()
+    configured_columns = tuple(text_columns or ())
     for raw in paths:
         fmt = detect_format(raw)
         stats.add_format(fmt)
+        if not str(raw).startswith(("http://", "https://", "hf://", "hf:")):
+            path = Path(raw)
+            if path.exists():
+                stats.fingerprints[str(path)] = dataset_fingerprint(path)
         if fmt == "directory":
-            yield from _iter_directory(Path(raw), text_key=text_key, code_only=code_only, stats=stats)
+            yield from _iter_directory(
+                Path(raw),
+                text_key=text_key,
+                text_columns=configured_columns,
+                code_only=code_only,
+                stats=stats,
+            )
         elif fmt == "archive":
-            yield from _iter_archive(Path(raw), text_key=text_key, code_only=code_only, stats=stats)
+            yield from _iter_archive(
+                Path(raw),
+                text_key=text_key,
+                text_columns=configured_columns,
+                code_only=code_only,
+                stats=stats,
+            )
         elif fmt == "jsonl":
-            yield from _iter_jsonl(Path(raw), text_key=text_key, stats=stats)
+            yield from _iter_jsonl(Path(raw), text_key=text_key, text_columns=configured_columns, stats=stats)
         elif fmt == "json":
-            yield from _iter_json(Path(raw), text_key=text_key, stats=stats)
+            yield from _iter_json(Path(raw), text_key=text_key, text_columns=configured_columns, stats=stats)
         elif fmt == "csv":
-            yield from _iter_csv(Path(raw), text_key=text_key, stats=stats)
+            yield from _iter_csv(Path(raw), text_key=text_key, text_columns=configured_columns, stats=stats)
         elif fmt == "yaml":
-            yield from _iter_yaml(Path(raw), text_key=text_key, stats=stats)
+            yield from _iter_yaml(Path(raw), text_key=text_key, text_columns=configured_columns, stats=stats)
         elif fmt == "xml":
             yield from _iter_xml(Path(raw), stats=stats)
         elif fmt == "sqlite":
-            yield from _iter_sqlite(Path(raw), text_key=text_key, stats=stats)
+            yield from _iter_sqlite(Path(raw), text_key=text_key, text_columns=configured_columns, stats=stats)
         elif fmt in {"parquet", "arrow"}:
-            yield from _iter_arrow_like(Path(raw), fmt=fmt, text_key=text_key, stats=stats)
+            yield from _iter_arrow_like(
+                Path(raw), fmt=fmt, text_key=text_key, text_columns=configured_columns, stats=stats
+            )
         elif fmt == "huggingface":
-            yield from _iter_huggingface(str(raw), text_key=text_key, stats=stats)
+            yield from _iter_huggingface(
+                str(raw), text_key=text_key, text_columns=configured_columns, stats=stats
+            )
         elif fmt.startswith("http"):
-            yield from _iter_http(str(raw), text_key=text_key, stats=stats)
+            yield from _iter_http(str(raw), text_key=text_key, text_columns=configured_columns, stats=stats)
         elif fmt == "pretokenized":
             stats.issues.append(DatasetIssue(str(raw), "Pretokenized files are consumed by training directly."))
         else:
@@ -136,18 +187,54 @@ def inspect_dataset(paths: Iterable[str | Path], text_key: str = "text", limit: 
     return stats
 
 
-def _iter_directory(path: Path, text_key: str, code_only: bool, stats: DatasetStats) -> Iterator[DatasetRecord]:
+def dataset_fingerprint(path: Path) -> str:
+    """Cheap, deterministic fingerprint for duplicate dataset detection.
+
+    This avoids hashing entire multi-GB corpora during inspection. Preprocessing manifests can
+    combine it with chunk-level hashes when a full content fingerprint is required.
+    """
+
+    stat = path.stat()
+    payload = f"{path.resolve()}:{stat.st_size}:{int(stat.st_mtime_ns)}"
+    return hashlib.blake2b(payload.encode("utf-8", errors="ignore"), digest_size=16).hexdigest()
+
+
+def sanitize_text(value: Any) -> str:
+    if isinstance(value, bytes):
+        text = value.decode("utf-8", errors="replace")
+    else:
+        text = str(value)
+    text = text.replace("\x00", "")
+    text = unicodedata.normalize("NFKC", text)
+    return normalize_text(text)
+
+
+def _iter_directory(
+    path: Path,
+    text_key: str,
+    text_columns: Iterable[str],
+    code_only: bool,
+    stats: DatasetStats,
+) -> Iterator[DatasetRecord]:
     for file in path.rglob("*"):
         if file.is_file():
             if code_only and file.suffix.lower() not in CODE_EXTENSIONS:
                 continue
-            yield from iter_dataset_records([file], text_key=text_key, code_only=code_only, stats=stats)
+            yield from iter_dataset_records(
+                [file], text_key=text_key, text_columns=text_columns, code_only=code_only, stats=stats
+            )
 
 
 def _decode_bytes(data: bytes, source: str, stats: DatasetStats) -> str | None:
+    if b"\x00" in data[:4096] and not source.lower().endswith((".utf16", ".utf-16")):
+        stats.issues.append(DatasetIssue(source, "Binary-looking file skipped.", "warning"))
+        stats.skipped_records += 1
+        return None
     try:
         return data.decode("utf-8")
     except UnicodeDecodeError:
+        stats.invalid_records += 1
+        stats.issues.append(DatasetIssue(source, "Invalid UTF-8 recovered with replacement characters."))
         try:
             return data.decode("utf-8", errors="replace")
         except Exception as exc:
@@ -166,18 +253,64 @@ def _iter_text_file(path: Path, stats: DatasetStats) -> Iterator[DatasetRecord]:
         yield DatasetRecord(normalize_text(text), str(path), {"format": "text", "suffix": path.suffix})
 
 
-def _extract_text_from_row(row: Any, text_key: str) -> str | None:
+def _extract_text_from_row(
+    row: Any,
+    text_key: str,
+    text_columns: Iterable[str] | None = None,
+) -> str | None:
     if isinstance(row, str):
         return row
     if isinstance(row, dict):
+        configured = [key for key in text_columns or () if key in row and row.get(key) is not None]
+        if configured:
+            return "\n".join(_coerce_cell(row[key]) for key in configured if _coerce_cell(row[key]).strip())
         if text_key in row:
-            return str(row[text_key])
+            return _coerce_cell(row[text_key])
         if "messages" in row:
             return _format_messages(row["messages"])
-        for key in ("content", "prompt", "completion", "instruction", "response", "code"):
-            if key in row:
-                return str(row[key])
+        if "conversations" in row:
+            return _format_messages(row["conversations"])
+        if "instruction" in row and any(key in row for key in ("input", "output", "response")):
+            parts = [row.get("instruction"), row.get("input"), row.get("output", row.get("response"))]
+            return "\n".join(_coerce_cell(part) for part in parts if part)
+        if "prompt" in row and any(key in row for key in ("completion", "response")):
+            return "\n".join(_coerce_cell(row[key]) for key in ("prompt", "completion", "response") if row.get(key))
+        key = _best_text_key(row, text_key)
+        if key is not None:
+            return _coerce_cell(row[key])
     return None
+
+
+def _coerce_cell(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, ensure_ascii=False)
+    return str(value)
+
+
+def _best_text_key(row: dict[str, Any], text_key: str) -> str | None:
+    best: tuple[int, str] | None = None
+    for key, value in row.items():
+        if value is None or isinstance(value, (int, float, bool)):
+            continue
+        text = _coerce_cell(value)
+        if not text.strip():
+            continue
+        score = min(len(text), 4096)
+        lowered = key.lower()
+        if lowered == text_key.lower():
+            score += 100_000
+        if lowered in TEXT_FIELD_HINTS:
+            score += 50_000
+        if any(hint in lowered for hint in TEXT_FIELD_HINTS):
+            score += 10_000
+        candidate = (score, key)
+        if best is None or candidate > best:
+            best = candidate
+    return best[1] if best else None
 
 
 def _format_messages(messages: Any) -> str:
@@ -185,11 +318,22 @@ def _format_messages(messages: Any) -> str:
     if isinstance(messages, list):
         for msg in messages:
             if isinstance(msg, dict):
-                parts.append(f"<|{msg.get('role', 'user')}|>\n{msg.get('content', '')}")
+                role = msg.get("role", msg.get("from", "user"))
+                if role == "human":
+                    role = "user"
+                if role == "gpt":
+                    role = "assistant"
+                content = msg.get("content", msg.get("value", ""))
+                parts.append(f"<|{role}|>\n{content}")
     return "\n".join(parts)
 
 
-def _iter_jsonl(path: Path, text_key: str, stats: DatasetStats) -> Iterator[DatasetRecord]:
+def _iter_jsonl(
+    path: Path,
+    text_key: str,
+    text_columns: Iterable[str],
+    stats: DatasetStats,
+) -> Iterator[DatasetRecord]:
     try:
         with path.open("r", encoding="utf-8", errors="replace") as fh:
             for line_no, line in enumerate(fh, 1):
@@ -199,15 +343,27 @@ def _iter_jsonl(path: Path, text_key: str, stats: DatasetStats) -> Iterator[Data
                     row = json.loads(line)
                 except json.JSONDecodeError as exc:
                     stats.issues.append(DatasetIssue(str(path), f"Bad JSONL line {line_no}: {exc}"))
+                    stats.invalid_records += 1
                     continue
-                text = _extract_text_from_row(row, text_key)
+                if isinstance(row, dict):
+                    stats.add_schema(str(path), row.keys())
+                    for key in row:
+                        stats.add_field(key)
+                text = _extract_text_from_row(row, text_key, text_columns)
                 if text:
-                    yield DatasetRecord(normalize_text(text), str(path), {"format": "jsonl", "line": line_no})
+                    yield DatasetRecord(sanitize_text(text), str(path), {"format": "jsonl", "line": line_no})
+                else:
+                    stats.skipped_records += 1
     except Exception as exc:
         stats.issues.append(DatasetIssue(str(path), f"Could not read JSONL: {exc}", "error"))
 
 
-def _iter_json(path: Path, text_key: str, stats: DatasetStats) -> Iterator[DatasetRecord]:
+def _iter_json(
+    path: Path,
+    text_key: str,
+    text_columns: Iterable[str],
+    stats: DatasetStats,
+) -> Iterator[DatasetRecord]:
     try:
         data = json.loads(path.read_text(encoding="utf-8", errors="replace"))
     except Exception as exc:
@@ -215,26 +371,36 @@ def _iter_json(path: Path, text_key: str, stats: DatasetStats) -> Iterator[Datas
         return
     rows = data if isinstance(data, list) else data.get("data", [data]) if isinstance(data, dict) else [data]
     for idx, row in enumerate(rows):
-        text = _extract_text_from_row(row, text_key)
+        if isinstance(row, dict):
+            stats.add_schema(str(path), row.keys())
+            for key in row:
+                stats.add_field(key)
+        text = _extract_text_from_row(row, text_key, text_columns)
         if text:
-            yield DatasetRecord(normalize_text(text), str(path), {"format": "json", "index": idx})
+            yield DatasetRecord(sanitize_text(text), str(path), {"format": "json", "index": idx})
+        else:
+            stats.skipped_records += 1
 
 
-def _iter_csv(path: Path, text_key: str, stats: DatasetStats) -> Iterator[DatasetRecord]:
+def _iter_csv(path: Path, text_key: str, text_columns: Iterable[str], stats: DatasetStats) -> Iterator[DatasetRecord]:
     dialect = "excel-tab" if path.suffix.lower() == ".tsv" else "excel"
     try:
         with path.open("r", encoding="utf-8", errors="replace", newline="") as fh:
             reader = csv.DictReader(fh, dialect=dialect)
+            if reader.fieldnames:
+                stats.add_schema(str(path), reader.fieldnames)
             for idx, row in enumerate(reader):
-                text = _extract_text_from_row(row, text_key)
+                for key in row:
+                    stats.add_field(key)
+                text = _extract_text_from_row(row, text_key, text_columns)
                 if text is None:
                     text = "\n".join(str(v) for v in row.values() if v)
-                yield DatasetRecord(normalize_text(text), str(path), {"format": "csv", "row": idx})
+                yield DatasetRecord(sanitize_text(text), str(path), {"format": "csv", "row": idx})
     except Exception as exc:
         stats.issues.append(DatasetIssue(str(path), f"Could not read CSV/TSV: {exc}", "error"))
 
 
-def _iter_yaml(path: Path, text_key: str, stats: DatasetStats) -> Iterator[DatasetRecord]:
+def _iter_yaml(path: Path, text_key: str, text_columns: Iterable[str], stats: DatasetStats) -> Iterator[DatasetRecord]:
     try:
         import yaml
     except Exception:
@@ -247,9 +413,13 @@ def _iter_yaml(path: Path, text_key: str, stats: DatasetStats) -> Iterator[Datas
         return
     rows = data if isinstance(data, list) else [data]
     for idx, row in enumerate(rows):
-        text = _extract_text_from_row(row, text_key)
+        if isinstance(row, dict):
+            stats.add_schema(str(path), row.keys())
+            for key in row:
+                stats.add_field(key)
+        text = _extract_text_from_row(row, text_key, text_columns)
         if text:
-            yield DatasetRecord(normalize_text(text), str(path), {"format": "yaml", "index": idx})
+            yield DatasetRecord(sanitize_text(text), str(path), {"format": "yaml", "index": idx})
 
 
 def _iter_xml(path: Path, stats: DatasetStats) -> Iterator[DatasetRecord]:
@@ -264,23 +434,59 @@ def _iter_xml(path: Path, stats: DatasetStats) -> Iterator[DatasetRecord]:
             yield DatasetRecord(normalize_text(text), str(path), {"format": "xml", "index": idx, "tag": node.tag})
 
 
-def _iter_sqlite(path: Path, text_key: str, stats: DatasetStats) -> Iterator[DatasetRecord]:
+def _iter_sqlite(
+    path: Path,
+    text_key: str,
+    text_columns: Iterable[str],
+    stats: DatasetStats,
+) -> Iterator[DatasetRecord]:
     try:
         con = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
         tables = con.execute("select name from sqlite_master where type='table'").fetchall()
         for (table,) in tables:
             cols = [r[1] for r in con.execute(f"pragma table_info({table})").fetchall()]
-            candidate = text_key if text_key in cols else next((c for c in cols if c in {"text", "content", "body"}), None)
-            if candidate is None:
+            stats.add_schema(f"{path}:{table}", cols)
+            selected = _select_columns(cols, text_key, text_columns)
+            if not selected:
                 continue
-            for idx, (text,) in enumerate(con.execute(f"select {candidate} from {table}")):
+            stats.add_text_columns(f"{path}:{table}", selected)
+            quoted = ", ".join(f'"{col}"' for col in selected)
+            for idx, values in enumerate(con.execute(f"select {quoted} from {table}")):
+                text = "\n".join(_coerce_cell(value) for value in values if value)
                 if text:
-                    yield DatasetRecord(normalize_text(str(text)), str(path), {"format": "sqlite", "table": table, "row": idx})
+                    yield DatasetRecord(sanitize_text(text), str(path), {"format": "sqlite", "table": table, "row": idx})
+                else:
+                    stats.skipped_records += 1
     except Exception as exc:
         stats.issues.append(DatasetIssue(str(path), f"Could not read SQLite: {exc}", "error"))
 
 
-def _iter_arrow_like(path: Path, fmt: str, text_key: str, stats: DatasetStats) -> Iterator[DatasetRecord]:
+def _select_columns(
+    names: Iterable[str],
+    text_key: str,
+    text_columns: Iterable[str] | None = None,
+) -> list[str]:
+    names = list(names)
+    configured = [name for name in text_columns or () if name in names]
+    if configured:
+        return configured
+    if text_key in names:
+        return [text_key]
+    hinted = [name for name in names if name.lower() in TEXT_FIELD_HINTS]
+    if hinted:
+        return hinted[:4]
+    fuzzy = [name for name in names if any(hint in name.lower() for hint in TEXT_FIELD_HINTS)]
+    return fuzzy[:4]
+
+
+def _iter_arrow_like(
+    path: Path,
+    fmt: str,
+    text_key: str,
+    text_columns: Iterable[str],
+    stats: DatasetStats,
+    batch_size: int = 1024,
+) -> Iterator[DatasetRecord]:
     try:
         import pyarrow.parquet as pq
         import pyarrow.ipc as ipc
@@ -288,20 +494,74 @@ def _iter_arrow_like(path: Path, fmt: str, text_key: str, stats: DatasetStats) -
         stats.issues.append(DatasetIssue(str(path), f"Install pyarrow to read {fmt} datasets."))
         return
     try:
-        table = pq.read_table(path) if fmt == "parquet" else ipc.open_file(path).read_all()
-        names = table.column_names
-        column = text_key if text_key in names else next((c for c in names if c in {"text", "content", "body"}), None)
-        if column is None:
-            stats.issues.append(DatasetIssue(str(path), "No usable text column found."))
+        if fmt == "parquet":
+            parquet = pq.ParquetFile(path)
+            names = parquet.schema_arrow.names
+            selected = _select_columns(names, text_key, text_columns)
+            stats.add_schema(str(path), names)
+            stats.add_text_columns(str(path), selected)
+            if not selected:
+                stats.issues.append(DatasetIssue(str(path), "No usable text column found."))
+                return
+            for batch_id, batch in enumerate(parquet.iter_batches(batch_size=batch_size, columns=selected)):
+                yield from _records_from_arrow_batch(batch, str(path), fmt, batch_id, text_key, text_columns, stats)
             return
-        for idx, value in enumerate(table[column].to_pylist()):
-            if value:
-                yield DatasetRecord(normalize_text(str(value)), str(path), {"format": fmt, "row": idx})
+        with path.open("rb") as fh:
+            try:
+                reader = ipc.open_file(fh)
+                schema = reader.schema
+                batches = (reader.get_batch(i) for i in range(reader.num_record_batches))
+            except Exception:
+                fh.seek(0)
+                reader = ipc.open_stream(fh)
+                schema = reader.schema
+                batches = iter(reader)
+            names = schema.names
+            selected = _select_columns(names, text_key, text_columns)
+            stats.add_schema(str(path), names)
+            stats.add_text_columns(str(path), selected)
+            if not selected:
+                stats.issues.append(DatasetIssue(str(path), "No usable text column found."))
+                return
+            for batch_id, batch in enumerate(batches):
+                yield from _records_from_arrow_batch(
+                    batch.select(selected), str(path), fmt, batch_id, text_key, text_columns, stats
+                )
     except Exception as exc:
         stats.issues.append(DatasetIssue(str(path), f"Could not read {fmt}: {exc}", "error"))
 
 
-def _iter_archive(path: Path, text_key: str, code_only: bool, stats: DatasetStats) -> Iterator[DatasetRecord]:
+def _records_from_arrow_batch(
+    batch: Any,
+    source: str,
+    fmt: str,
+    batch_id: int,
+    text_key: str,
+    text_columns: Iterable[str],
+    stats: DatasetStats,
+) -> Iterator[DatasetRecord]:
+    for row_id, row in enumerate(batch.to_pylist()):
+        if isinstance(row, dict):
+            for key in row:
+                stats.add_field(key)
+        text = _extract_text_from_row(row, text_key, text_columns)
+        if text:
+            yield DatasetRecord(
+                sanitize_text(text),
+                source,
+                {"format": fmt, "batch": batch_id, "row": row_id},
+            )
+        else:
+            stats.skipped_records += 1
+
+
+def _iter_archive(
+    path: Path,
+    text_key: str,
+    text_columns: Iterable[str],
+    code_only: bool,
+    stats: DatasetStats,
+) -> Iterator[DatasetRecord]:
     try:
         if path.suffix.lower() == ".zip":
             with zipfile.ZipFile(path) as zf:
@@ -312,7 +572,7 @@ def _iter_archive(path: Path, text_key: str, code_only: bool, stats: DatasetStat
                     if suffix not in TEXT_EXTENSIONS and suffix not in CODE_EXTENSIONS and suffix not in STRUCTURED_EXTENSIONS:
                         continue
                     data = zf.read(name)
-                    yield from _records_from_archive_bytes(data, f"{path}!{name}", text_key, stats)
+                    yield from _records_from_archive_bytes(data, f"{path}!{name}", text_key, text_columns, stats)
         else:
             with tarfile.open(path) as tf:
                 for member in tf:
@@ -324,12 +584,18 @@ def _iter_archive(path: Path, text_key: str, code_only: bool, stats: DatasetStat
                     fh = tf.extractfile(member)
                     if fh is None:
                         continue
-                    yield from _records_from_archive_bytes(fh.read(), f"{path}!{member.name}", text_key, stats)
+                    yield from _records_from_archive_bytes(fh.read(), f"{path}!{member.name}", text_key, text_columns, stats)
     except Exception as exc:
         stats.issues.append(DatasetIssue(str(path), f"Could not read archive: {exc}", "error"))
 
 
-def _records_from_archive_bytes(data: bytes, source: str, text_key: str, stats: DatasetStats) -> Iterator[DatasetRecord]:
+def _records_from_archive_bytes(
+    data: bytes,
+    source: str,
+    text_key: str,
+    text_columns: Iterable[str],
+    stats: DatasetStats,
+) -> Iterator[DatasetRecord]:
     text = _decode_bytes(data, source, stats)
     if not text:
         return
@@ -339,15 +605,18 @@ def _records_from_archive_bytes(data: bytes, source: str, text_key: str, stats: 
             try:
                 row = json.loads(line)
             except Exception:
+                stats.invalid_records += 1
                 continue
-            value = _extract_text_from_row(row, text_key)
+            value = _extract_text_from_row(row, text_key, text_columns)
             if value:
-                yield DatasetRecord(normalize_text(value), source, {"format": "archive-jsonl", "line": line_no})
+                yield DatasetRecord(sanitize_text(value), source, {"format": "archive-jsonl", "line": line_no})
+            else:
+                stats.skipped_records += 1
     else:
-        yield DatasetRecord(normalize_text(text), source, {"format": "archive-text"})
+        yield DatasetRecord(sanitize_text(text), source, {"format": "archive-text"})
 
 
-def _iter_http(url: str, text_key: str, stats: DatasetStats) -> Iterator[DatasetRecord]:
+def _iter_http(url: str, text_key: str, text_columns: Iterable[str], stats: DatasetStats) -> Iterator[DatasetRecord]:
     try:
         req = Request(url, headers={"User-Agent": "nanoforge/0.1"})
         with urlopen(req, timeout=30) as response:
@@ -355,10 +624,15 @@ def _iter_http(url: str, text_key: str, stats: DatasetStats) -> Iterator[Dataset
     except Exception as exc:
         stats.issues.append(DatasetIssue(url, f"Could not read HTTP dataset: {exc}", "error"))
         return
-    yield from _records_from_archive_bytes(data, url, text_key, stats)
+    yield from _records_from_archive_bytes(data, url, text_key, text_columns, stats)
 
 
-def _iter_huggingface(ref: str, text_key: str, stats: DatasetStats) -> Iterator[DatasetRecord]:
+def _iter_huggingface(
+    ref: str,
+    text_key: str,
+    text_columns: Iterable[str],
+    stats: DatasetStats,
+) -> Iterator[DatasetRecord]:
     try:
         from datasets import load_dataset
     except Exception:
@@ -371,8 +645,13 @@ def _iter_huggingface(ref: str, text_key: str, stats: DatasetStats) -> Iterator[
     try:
         dataset = load_dataset(name, split="train", streaming=True)
         for idx, row in enumerate(dataset):
-            text = _extract_text_from_row(row, text_key)
+            if isinstance(row, dict):
+                for key in row:
+                    stats.add_field(key)
+            text = _extract_text_from_row(row, text_key, text_columns)
             if text:
-                yield DatasetRecord(normalize_text(text), ref, {"format": "huggingface", "row": idx})
+                yield DatasetRecord(sanitize_text(text), ref, {"format": "huggingface", "row": idx})
+            else:
+                stats.skipped_records += 1
     except Exception as exc:
         stats.issues.append(DatasetIssue(ref, f"Could not stream Hugging Face dataset: {exc}", "error"))

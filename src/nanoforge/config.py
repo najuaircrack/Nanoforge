@@ -4,6 +4,8 @@ from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Any
 
+from nanoforge.registry import validate_registry_key
+
 
 @dataclass
 class MoEConfig:
@@ -28,9 +30,13 @@ class ModelConfig:
     norm_eps: float = 1e-5
     tie_embeddings: bool = True
     use_flash: bool = True
+    block_type: str = "transformer"
     attention_backend: str = "sdpa"
+    ffn_type: str | None = None
+    normalization: str = "rmsnorm"
     position_embedding: str = "rope"
     activation: str = "swiglu"
+    quantization_backend: str = "none"
     sliding_window: int | None = None
     residual_scale: float | None = None
     gradient_checkpointing: bool = False
@@ -48,6 +54,14 @@ class ModelConfig:
             raise ValueError("d_model must be divisible by n_heads.")
         if isinstance(self.moe, dict):
             self.moe = MoEConfig(**self.moe)
+        if self.ffn_type is None:
+            self.ffn_type = "moe" if self.moe is not None else self.activation
+        validate_registry_key("block", self.block_type)
+        validate_registry_key("attention", self.attention_backend)
+        validate_registry_key("ffn", self.ffn_type)
+        validate_registry_key("normalization", self.normalization)
+        validate_registry_key("position", self.position_embedding)
+        validate_registry_key("quantization", self.quantization_backend)
 
 
 @dataclass
@@ -64,6 +78,7 @@ class TrainConfig:
     warmup_steps: int = 100
     warmup_ratio: float = 0.03
     optimizer: str = "adamw"
+    scheduler: str = "cosine"
     weight_decay: float = 0.1
     betas: tuple[float, float] = (0.9, 0.95)
     eps: float = 1e-8
@@ -75,8 +90,15 @@ class TrainConfig:
     eval_interval: int = 100
     eval_steps: int = 20
     save_interval: int = 250
+    resume_from_checkpoint: str | None = None
+    async_checkpoint: bool = False
     early_stopping_patience: int = 10
     ema_decay: float = 0.0
+    sample_interval: int = 0
+    sample_prompt: str = "The model"
+    sample_max_new_tokens: int = 128
+    health_interval: int = 10
+    grad_explosion_factor: float = 10.0
     log_interval: int = 10
     tensorboard: bool = True
     wandb: bool = False
@@ -85,6 +107,8 @@ class TrainConfig:
 
     def __post_init__(self) -> None:
         self.betas = tuple(self.betas)  # type: ignore[assignment]
+        validate_registry_key("optimizer", self.optimizer)
+        validate_registry_key("scheduler", self.scheduler)
 
 
 @dataclass
@@ -98,6 +122,9 @@ class DataConfig:
     prefetch_factor: int = 2
     pin_memory: bool = True
 
+    def __post_init__(self) -> None:
+        validate_registry_key("tokenizer", self.tokenizer_type)
+
 
 @dataclass
 class InferenceConfig:
@@ -109,6 +136,12 @@ class InferenceConfig:
     mirostat: bool = False
     mirostat_tau: float = 5.0
     mirostat_eta: float = 0.1
+    sampler: str = "top_k_top_p"
+
+    def __post_init__(self) -> None:
+        if self.mirostat:
+            self.sampler = "mirostat"
+        validate_registry_key("sampler", self.sampler)
 
 
 @dataclass

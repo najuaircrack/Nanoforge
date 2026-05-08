@@ -7,6 +7,7 @@ import torch
 
 from nanoforge.config import load_config
 from nanoforge.model.transformer import NanoforgeForCausalLM
+from nanoforge.profiling import estimate_model_profile
 from nanoforge.training.utils import resolve_device
 
 
@@ -30,5 +31,9 @@ def benchmark_forward(config_path: str | Path, batch_size: int = 1, steps: int =
         "tokens_per_sec": batch_size * cfg.data.seq_len * steps / max(elapsed, 1e-9),
         "ms_per_step": elapsed * 1000 / steps,
         "params": model.estimate_num_params(),
+        **estimate_model_profile(
+            cfg.model,
+            batch_size=batch_size,
+            seq_len=cfg.data.seq_len,
+        ).to_dict(),
     }
-

@@ -1,9 +1,10 @@
 from __future__ import annotations
 
-import math
 from typing import Iterable
 
 import torch
+
+from nanoforge.registry import OPTIMIZERS, ensure_registry_ready
 
 
 class Lion(torch.optim.Optimizer):
@@ -121,6 +122,23 @@ class SophiaG(torch.optim.Optimizer):
         return loss
 
 
+def create_adamw_optimizer(
+    params,
+    lr: float,
+    weight_decay: float,
+    betas: tuple[float, float] = (0.9, 0.95),
+    eps: float = 1e-8,
+):
+    return torch.optim.AdamW(
+        params,
+        lr=lr,
+        betas=betas,
+        eps=eps,
+        weight_decay=weight_decay,
+        fused=torch.cuda.is_available(),
+    )
+
+
 def create_optimizer(
     name: str,
     params,
@@ -129,20 +147,11 @@ def create_optimizer(
     betas: tuple[float, float] = (0.9, 0.95),
     eps: float = 1e-8,
 ):
+    ensure_registry_ready()
     lowered = name.lower()
+    factory = OPTIMIZERS.get(lowered)
     if lowered == "adamw":
-        return torch.optim.AdamW(
-            params,
-            lr=lr,
-            betas=betas,
-            eps=eps,
-            weight_decay=weight_decay,
-            fused=torch.cuda.is_available(),
-        )
+        return factory(params, lr=lr, betas=betas, eps=eps, weight_decay=weight_decay)
     if lowered == "lion":
-        return Lion(params, lr=lr, betas=(betas[0], 0.99), weight_decay=weight_decay)
-    if lowered == "adafactor":
-        return Adafactor(params, lr=lr, weight_decay=weight_decay)
-    if lowered in {"sophia", "sophiag"}:
-        return SophiaG(params, lr=lr, weight_decay=weight_decay)
-    raise ValueError(f"Unknown optimizer: {name}")
+        return factory(params, lr=lr, betas=(betas[0], 0.99), weight_decay=weight_decay)
+    return factory(params, lr=lr, weight_decay=weight_decay)

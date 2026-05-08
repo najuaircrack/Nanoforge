@@ -20,6 +20,7 @@ dependencies = [
 [project.optional-dependencies]
 tokenizers = ["tokenizers>=0.15", "sentencepiece>=0.1.99"]
 data = ["pyarrow>=15.0", "datasets>=2.18", "webdataset>=0.2.86"]
+native = ["maturin>=1.5"]
 serve = ["fastapi>=0.110", "uvicorn>=0.27"]
 logging = ["tensorboard>=2.14", "wandb>=0.16"]
 export = ["onnx>=1.15", "onnxruntime>=1.16"]
@@ -30,6 +31,7 @@ all = [
   "pyarrow>=15.0",
   "datasets>=2.18",
   "webdataset>=0.2.86",
+  "maturin>=1.5",
   "fastapi>=0.110",
   "uvicorn>=0.27",
   "tensorboard>=2.14",
@@ -45,6 +47,9 @@ nanoforge = "nanoforge.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+nanoforge = ["py.typed"]
 
 [tool.ruff]
 line-length = 100

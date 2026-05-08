@@ -9,9 +9,13 @@ from tqdm import tqdm, trange
 
 from nanoforge.config import NanoforgeConfig, load_config
 from nanoforge.data.dataset import PackedMemmapDataset, make_torch_batch
+from nanoforge.data.tokenizer import load_tokenizer
+from nanoforge.generation.sampling import SamplingConfig
 from nanoforge.model.transformer import NanoforgeForCausalLM
+from nanoforge.profiling import estimate_model_profile
 from nanoforge.progress import JsonlMetricLogger
-from nanoforge.training.checkpoint import save_checkpoint
+from nanoforge.training.checkpoint import AsyncCheckpointSaver, load_checkpoint, restore_rng_state
+from nanoforge.training.health import TrainingHealthMonitor
 from nanoforge.training.utils import (
     EMA,
     autocast_dtype,
@@ -58,6 +62,11 @@ class Trainer:
         self.writer = self._make_writer()
         self.wandb_run = self._make_wandb()
         self.metric_logger = JsonlMetricLogger(self.output_dir / "metrics.jsonl", reset=True)
+        self.checkpoints = AsyncCheckpointSaver(self.train_cfg.async_checkpoint)
+        self.health = TrainingHealthMonitor(grad_explosion_factor=self.train_cfg.grad_explosion_factor)
+        self.start_step = 0
+        if self.train_cfg.resume_from_checkpoint:
+            self.start_step = self._resume(self.train_cfg.resume_from_checkpoint)
 
     def _make_writer(self):
         if not self.train_cfg.tensorboard:
@@ -88,6 +97,16 @@ class Trainer:
             self.wandb_run.log(metrics, step=step)
         self.metric_logger.log(event, step, metrics)
 
+    def _resume(self, checkpoint_path: str | Path) -> int:
+        payload = load_checkpoint(checkpoint_path, map_location=self.device)
+        self.model.load_state_dict(payload["model"], strict=True)
+        if payload.get("optimizer") is not None:
+            self.optimizer.load_state_dict(payload["optimizer"])
+        restore_rng_state(payload.get("rng"))
+        step = int(payload.get("step", 0)) + 1
+        self._log({"checkpoint/resumed_step": float(step)}, step, event="resume")
+        return step
+
     def _batch(self, split: str, batch_size: int):
         dataset = self.train_data if split == "train" else self.val_data
         return make_torch_batch(dataset, batch_size, str(self.device), self.data_cfg.pin_memory and self.device.type == "cuda")
@@ -117,6 +136,55 @@ class Trainer:
         val_loss = sum(losses) / len(losses)
         return val_loss, math.exp(min(20.0, val_loss))
 
+    @torch.no_grad()
+    def generate_sample(self, step: int) -> dict[str, float]:
+        tokenizer = load_tokenizer(self.data_cfg.tokenizer_type, self.data_cfg.tokenizer_path)
+        was_training = self.model.training
+        self.model.eval()
+        prompt_ids = tokenizer.encode(self.train_cfg.sample_prompt, add_bos=True, add_eos=False)
+        ids = torch.tensor([prompt_ids[-self.model_cfg.max_seq_len :]], dtype=torch.long, device=self.device)
+        generated: list[int] = []
+        sampling = SamplingConfig(
+            temperature=self.config.inference.temperature,
+            top_k=self.config.inference.top_k,
+            top_p=self.config.inference.top_p,
+            repetition_penalty=self.config.inference.repetition_penalty,
+            mirostat=self.config.inference.mirostat,
+            mirostat_tau=self.config.inference.mirostat_tau,
+            mirostat_eta=self.config.inference.mirostat_eta,
+        )
+        from nanoforge.generation.sampling import MirostatState, sample_next
+
+        caches = None
+        miro = MirostatState(sampling.mirostat_tau) if sampling.mirostat else None
+        for token_step in range(self.train_cfg.sample_max_new_tokens):
+            with self._autocast():
+                if token_step == 0:
+                    out = self.model(ids[:, -self.model_cfg.max_seq_len :], use_cache=True)
+                else:
+                    out = self.model(ids[:, -1:], caches=caches, use_cache=True)
+            caches = out.caches
+            token = sample_next(out.logits, ids[0], sampling, miro)
+            next_id = int(token.item())
+            if next_id == tokenizer.eos_id:
+                break
+            generated.append(next_id)
+            ids = torch.cat([ids, token], dim=1)
+        text = tokenizer.decode(generated)
+        sample_dir = self.output_dir / "samples"
+        sample_dir.mkdir(parents=True, exist_ok=True)
+        path = sample_dir / f"sample_{step}.txt"
+        path.write_text(self.train_cfg.sample_prompt + text, encoding="utf-8")
+        if was_training:
+            self.model.train()
+        repetition = _repetition_score(generated)
+        diversity = _distinct_ratio(generated)
+        return {
+            "sample/repetition": repetition,
+            "sample/distinct_token_ratio": diversity,
+            "sample/tokens": float(len(generated)),
+        }
+
     def train(self) -> None:
         self.model.train()
         best_val = float("inf")
@@ -130,6 +198,7 @@ class Trainer:
         if warmup_steps <= 0 and self.train_cfg.warmup_ratio > 0:
             warmup_steps = max(1, int(self.train_cfg.max_steps * self.train_cfg.warmup_ratio))
         pbar = trange(
+            self.start_step,
             self.train_cfg.max_steps,
             desc=f"train:{self.train_cfg.run_name}",
             unit="step",
@@ -140,6 +209,16 @@ class Trainer:
                 "run/max_steps": self.train_cfg.max_steps,
                 "run/total_tokens": total_tokens,
                 "run/parameters": self.model.estimate_num_params(),
+                **{
+                    f"profile/{key}": value
+                    for key, value in estimate_model_profile(
+                        self.model_cfg,
+                        batch_size=self.train_cfg.micro_batch_size,
+                        seq_len=self.data_cfg.seq_len,
+                    )
+                    .to_dict()
+                    .items()
+                },
             },
             0,
             event="start",
@@ -159,6 +238,7 @@ class Trainer:
             total_loss = 0.0
             skip_step = False
             skip_reason = ""
+            last_logits = None
             for _ in range(self.train_cfg.grad_accum_steps):
                 x, y = self._batch("train", self.train_cfg.micro_batch_size)
                 with self._autocast():
@@ -168,6 +248,7 @@ class Trainer:
                     skip_step = True
                     skip_reason = "nonfinite_loss"
                     break
+                last_logits = out.logits.detach()
                 self.scaler.scale(loss).backward()
                 total_loss += float(loss.detach().cpu()) * self.train_cfg.grad_accum_steps
             grad_norm_before = 0.0
@@ -200,6 +281,18 @@ class Trainer:
                 self.scaler.update()
             if self.ema and not skip_step:
                 self.ema.update(self.model)
+
+            if step % max(1, self.train_cfg.health_interval) == 0:
+                snapshot = self.health.observe(
+                    loss=total_loss,
+                    grad_norm=grad_norm_before,
+                    logits=last_logits,
+                    optimizer=self.optimizer,
+                    device=self.device,
+                )
+                self._log(snapshot.metrics, step, event="health")
+                for event in snapshot.events:
+                    self._log({**event.metrics, "health/event": event.kind}, step, event=event.severity)
 
             if step % self.train_cfg.log_interval == 0:
                 elapsed = max(time.time() - t0, 1e-6)
@@ -241,7 +334,7 @@ class Trainer:
                     best_val = val_loss
                     stale_evals = 0
                     self._log({"checkpoint/best_val_loss": best_val}, step, event="checkpoint")
-                    save_checkpoint(
+                    self.checkpoints.save(
                         self.output_dir / "best.pt",
                         self.model,
                         self.optimizer,
@@ -256,7 +349,7 @@ class Trainer:
                         break
 
             if step > 0 and step % self.train_cfg.save_interval == 0:
-                save_checkpoint(
+                self.checkpoints.save(
                     self.output_dir / f"step-{step}.pt",
                     self.model,
                     self.optimizer,
@@ -266,7 +359,10 @@ class Trainer:
                     self.ema.state_dict() if self.ema else None,
                 )
 
-        save_checkpoint(
+            if self.train_cfg.sample_interval > 0 and step > 0 and step % self.train_cfg.sample_interval == 0:
+                self._log(self.generate_sample(step), step, event="sample")
+
+        self.checkpoints.save(
             self.output_dir / "last.pt",
             self.model,
             self.optimizer,
@@ -275,9 +371,23 @@ class Trainer:
             None,
             self.ema.state_dict() if self.ema else None,
         )
+        self.checkpoints.close()
         self._log({"train/final_step": self.train_cfg.max_steps, "val/best_loss": best_val}, self.train_cfg.max_steps, event="done")
 
 
 def train_from_config(path: str | Path) -> None:
     cfg = load_config(path)
     Trainer(cfg).train()
+
+
+def _repetition_score(ids: list[int], n: int = 3) -> float:
+    if len(ids) < n:
+        return 0.0
+    grams = [tuple(ids[idx : idx + n]) for idx in range(len(ids) - n + 1)]
+    return 1.0 - (len(set(grams)) / max(1, len(grams)))
+
+
+def _distinct_ratio(ids: list[int]) -> float:
+    if not ids:
+        return 0.0
+    return len(set(ids)) / len(ids)

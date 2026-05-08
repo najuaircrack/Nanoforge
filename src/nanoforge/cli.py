@@ -19,7 +19,33 @@ def cmd_params(args: argparse.Namespace) -> None:
     print(f"non_embedding_parameters: {model.estimate_num_params(non_embedding=True):,}")
 
 
+def cmd_registries(args: argparse.Namespace) -> None:
+    import json
+
+    from nanoforge.registry import registry_snapshot
+
+    snapshot = registry_snapshot()
+    if args.name:
+        snapshot = {args.name: snapshot[args.name]}
+    print(json.dumps(snapshot, indent=2, sort_keys=True))
+
+
+def cmd_validate_config(args: argparse.Namespace) -> None:
+    from nanoforge.config import load_config
+
+    cfg = load_config(args.config)
+    print("valid: true")
+    print(f"block: {cfg.model.block_type}")
+    print(f"attention: {cfg.model.attention_backend}")
+    print(f"ffn: {cfg.model.ffn_type}")
+    print(f"normalization: {cfg.model.normalization}")
+    print(f"tokenizer: {cfg.data.tokenizer_type}")
+
+
 def cmd_train_tokenizer(args: argparse.Namespace) -> None:
+    from dataclasses import asdict
+    import json
+
     from nanoforge.data.tokenizer import (
         train_bpe_tokenizer,
         train_sentencepiece_tokenizer,
@@ -29,13 +55,42 @@ def cmd_train_tokenizer(args: argparse.Namespace) -> None:
     files: list[Path] = []
     for root in _paths(args.input):
         files.extend([p for p in root.rglob("*") if p.is_file()] if root.is_dir() else [root])
+    columns = tuple(args.text_column or ())
     if args.type == "bpe":
-        train_bpe_tokenizer(files, args.out, args.vocab_size, args.min_frequency)
+        report = train_bpe_tokenizer(
+            files,
+            args.out,
+            args.vocab_size,
+            args.min_frequency,
+            text_key=args.text_key,
+            text_columns=columns,
+            dry_run=args.dry_run,
+            max_records=args.max_records,
+        )
     elif args.type == "wordpiece":
-        train_wordpiece_tokenizer(files, args.out, args.vocab_size, args.min_frequency)
+        report = train_wordpiece_tokenizer(
+            files,
+            args.out,
+            args.vocab_size,
+            args.min_frequency,
+            text_key=args.text_key,
+            text_columns=columns,
+            dry_run=args.dry_run,
+            max_records=args.max_records,
+        )
     else:
         model_type = "unigram" if args.type == "unigram" else "bpe"
-        train_sentencepiece_tokenizer(files, args.out, args.vocab_size, model_type=model_type)
+        report = train_sentencepiece_tokenizer(
+            files,
+            args.out,
+            args.vocab_size,
+            model_type=model_type,
+            text_key=args.text_key,
+            text_columns=columns,
+            dry_run=args.dry_run,
+            max_records=args.max_records,
+        )
+    print(json.dumps(asdict(report), indent=2))
 
 
 def cmd_prepare(args: argparse.Namespace) -> None:
@@ -82,10 +137,86 @@ def cmd_inspect_dataset(args: argparse.Namespace) -> None:
     print(f"bytes_read: {stats.bytes_read}")
     print(f"formats: {stats.formats}")
     print(f"fields: {stats.fields}")
+    print(f"schemas: {stats.schemas}")
+    print(f"text_columns: {stats.text_columns}")
+    print(f"skipped_records: {stats.skipped_records}")
+    print(f"invalid_records: {stats.invalid_records}")
+    print(f"fingerprints: {stats.fingerprints}")
     if stats.issues:
         print("issues:")
         for issue in stats.issues[:20]:
             print(f"- {issue.kind}: {issue.source}: {issue.message}")
+
+
+def cmd_validate_dataset(args: argparse.Namespace) -> None:
+    from nanoforge.data.formats import inspect_dataset
+
+    stats = inspect_dataset(_paths(args.input), text_key=args.text_key, limit=args.limit)
+    has_records = stats.records > 0
+    has_errors = any(issue.kind == "error" for issue in stats.issues)
+    print(f"valid: {has_records and not has_errors}")
+    print(f"records_checked: {stats.records}")
+    print(f"skipped_records: {stats.skipped_records}")
+    print(f"invalid_records: {stats.invalid_records}")
+    if stats.issues:
+        print("issues:")
+        for issue in stats.issues[:50]:
+            print(f"- {issue.kind}: {issue.source}: {issue.message}")
+    if not has_records or has_errors:
+        raise SystemExit(1)
+
+
+def cmd_clean_dataset(args: argparse.Namespace) -> None:
+    import json
+
+    from nanoforge.data.cleaning import CleaningConfig, clean_records
+    from nanoforge.data.formats import iter_dataset_records
+
+    out = Path(args.out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    config = CleaningConfig(
+        min_chars=args.min_chars,
+        max_chars=args.max_chars,
+        collapse_whitespace=args.collapse_whitespace,
+        deduplicate=not args.no_deduplicate,
+        near_deduplicate=args.near_deduplicate,
+        language=args.language,
+    )
+    records = iter_dataset_records(_paths(args.input), text_key=args.text_key, text_columns=args.text_column)
+    written = 0
+    with out.open("w", encoding="utf-8", newline="\n") as fh:
+        for record in clean_records(records, config):
+            fh.write(json.dumps({"text": record.text, "source": record.source, "metadata": record.metadata}, ensure_ascii=False))
+            fh.write("\n")
+            written += 1
+    print(f"written: {written}")
+    print(f"out: {out}")
+
+
+def cmd_convert_dataset(args: argparse.Namespace) -> None:
+    import json
+
+    from nanoforge.data.formats import iter_dataset_records
+
+    out = Path(args.out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    records = iter_dataset_records(_paths(args.input), text_key=args.text_key, text_columns=args.text_column)
+    written = 0
+    if args.format == "txt":
+        with out.open("w", encoding="utf-8", newline="\n") as fh:
+            for record in records:
+                fh.write(record.text)
+                if not record.text.endswith("\n"):
+                    fh.write("\n")
+                written += 1
+    else:
+        with out.open("w", encoding="utf-8", newline="\n") as fh:
+            for record in records:
+                fh.write(json.dumps({"text": record.text, "source": record.source, "metadata": record.metadata}, ensure_ascii=False))
+                fh.write("\n")
+                written += 1
+    print(f"written: {written}")
+    print(f"out: {out}")
 
 
 def cmd_tokenizer_report(args: argparse.Namespace) -> None:
@@ -100,6 +231,37 @@ def cmd_tokenizer_report(args: argparse.Namespace) -> None:
     if args.out:
         save_tokenizer_report(report, args.out)
     print(json.dumps(asdict(report), indent=2))
+
+
+def cmd_tokenizer_status(args: argparse.Namespace) -> None:
+    from dataclasses import asdict
+    import json
+
+    from nanoforge.data.native_tokenizer import native_tokenizer_status
+
+    _ = args
+    print(json.dumps(asdict(native_tokenizer_status()), indent=2))
+
+
+def cmd_benchmark_tokenizer(args: argparse.Namespace) -> None:
+    from dataclasses import asdict
+    import json
+
+    from nanoforge.data.tokenizer import load_tokenizer
+    from nanoforge.data.tokenizer_benchmark import benchmark_tokenizer
+
+    tokenizer = load_tokenizer(args.tokenizer, args.tokenizer_path)
+    result = benchmark_tokenizer(
+        tokenizer,
+        _paths(args.input),
+        text_key=args.text_key,
+        text_columns=args.text_column,
+        limit=args.limit,
+        batch_size=args.batch_size,
+        add_bos=args.add_bos,
+        add_eos=args.add_eos,
+    )
+    print(json.dumps(asdict(result), indent=2))
 
 
 def cmd_train(args: argparse.Namespace) -> None:
@@ -205,6 +367,23 @@ def cmd_benchmark(args: argparse.Namespace) -> None:
         print(f"{key}: {value:,.3f}" if isinstance(value, float) else f"{key}: {value}")
 
 
+def cmd_profile_config(args: argparse.Namespace) -> None:
+    from dataclasses import asdict
+    import json
+
+    from nanoforge.config import load_config
+    from nanoforge.profiling import estimate_model_profile
+
+    cfg = load_config(args.config)
+    profile = estimate_model_profile(
+        cfg.model,
+        batch_size=args.batch_size,
+        seq_len=args.seq_len or cfg.data.seq_len,
+        bytes_per_param=args.bytes_per_param,
+    )
+    print(json.dumps(asdict(profile), indent=2))
+
+
 def cmd_evaluate(args: argparse.Namespace) -> None:
     from nanoforge.evaluation.metrics import evaluate_checkpoint
 
@@ -221,18 +400,49 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--config", required=True)
     p.set_defaults(func=cmd_params)
 
+    p = sub.add_parser("registries", help="List registered Nanoforge component keys.")
+    p.add_argument(
+        "--name",
+        choices=[
+            "attention",
+            "ffn",
+            "activation",
+            "position",
+            "optimizer",
+            "scheduler",
+            "tokenizer",
+            "sampler",
+            "normalization",
+            "quantization",
+            "block",
+        ],
+    )
+    p.set_defaults(func=cmd_registries)
+
+    p = sub.add_parser("validate-config", help="Load a config and validate registry-backed keys.")
+    p.add_argument("--config", required=True)
+    p.set_defaults(func=cmd_validate_config)
+
     p = sub.add_parser("train-tokenizer", help="Train a BPE, WordPiece, or SentencePiece tokenizer.")
     p.add_argument("--input", nargs="+", required=True)
     p.add_argument("--out", required=True)
     p.add_argument("--type", choices=["bpe", "wordpiece", "sentencepiece", "unigram"], default="bpe")
     p.add_argument("--vocab-size", type=int, default=32000)
     p.add_argument("--min-frequency", type=int, default=2)
+    p.add_argument("--text-key", default="text")
+    p.add_argument("--text-column", action="append", help="Structured text column to train on. Can be repeated.")
+    p.add_argument("--max-records", type=int)
+    p.add_argument("--dry-run", action="store_true", help="Scan and report training corpus health without fitting.")
     p.set_defaults(func=cmd_train_tokenizer)
 
     p = sub.add_parser("prepare", help="Pack raw text/code/JSONL into train.bin and val.bin.")
     p.add_argument("--input", nargs="+", required=True)
     p.add_argument("--out", required=True)
-    p.add_argument("--tokenizer", choices=["byte", "bpe", "wordpiece", "sentencepiece"], default="byte")
+    p.add_argument(
+        "--tokenizer",
+        choices=["byte", "byte-native", "bpe", "wordpiece", "sentencepiece"],
+        default="byte",
+    )
     p.add_argument("--tokenizer-path")
     p.add_argument("--val-fraction", type=float, default=0.01)
     p.add_argument("--code-only", action="store_true")
@@ -248,14 +458,77 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--limit", type=int, default=1000)
     p.set_defaults(func=cmd_inspect_dataset)
 
+    p = sub.add_parser("validate-dataset", help="Validate readable text records before tokenization or packing.")
+    p.add_argument("--input", nargs="+", required=True)
+    p.add_argument("--text-key", default="text")
+    p.add_argument("--limit", type=int, default=1000)
+    p.set_defaults(func=cmd_validate_dataset)
+
+    p = sub.add_parser("clean-dataset", help="Clean, normalize, and deduplicate inputs into JSONL.")
+    p.add_argument("--input", nargs="+", required=True)
+    p.add_argument("--out", required=True)
+    p.add_argument("--text-key", default="text")
+    p.add_argument("--text-column", action="append")
+    p.add_argument("--min-chars", type=int, default=16)
+    p.add_argument("--max-chars", type=int)
+    p.add_argument("--collapse-whitespace", action="store_true")
+    p.add_argument("--no-deduplicate", action="store_true")
+    p.add_argument("--near-deduplicate", action="store_true")
+    p.add_argument("--language")
+    p.set_defaults(func=cmd_clean_dataset)
+
+    p = sub.add_parser("deduplicate-dataset", help="Deduplicate inputs into cleaned JSONL.")
+    p.add_argument("--input", nargs="+", required=True)
+    p.add_argument("--out", required=True)
+    p.add_argument("--text-key", default="text")
+    p.add_argument("--text-column", action="append")
+    p.add_argument("--min-chars", type=int, default=16)
+    p.add_argument("--max-chars", type=int)
+    p.add_argument("--collapse-whitespace", action="store_true")
+    p.add_argument("--near-deduplicate", action="store_true")
+    p.add_argument("--language")
+    p.set_defaults(no_deduplicate=False)
+    p.set_defaults(func=cmd_clean_dataset)
+
+    p = sub.add_parser("convert-dataset", help="Convert structured inputs to txt or JSONL text records.")
+    p.add_argument("--input", nargs="+", required=True)
+    p.add_argument("--out", required=True)
+    p.add_argument("--format", choices=["txt", "jsonl"], default="jsonl")
+    p.add_argument("--text-key", default="text")
+    p.add_argument("--text-column", action="append")
+    p.set_defaults(func=cmd_convert_dataset)
+
+    p = sub.add_parser("tokenizer-status", help="Show native tokenizer acceleration status.")
+    p.set_defaults(func=cmd_tokenizer_status)
+
     p = sub.add_parser("tokenizer-report", help="Measure tokenizer compression and vocabulary usage.")
     p.add_argument("--input", nargs="+", required=True)
-    p.add_argument("--tokenizer", choices=["byte", "bpe", "wordpiece", "sentencepiece"], default="byte")
+    p.add_argument(
+        "--tokenizer",
+        choices=["byte", "byte-native", "bpe", "wordpiece", "sentencepiece"],
+        default="byte",
+    )
     p.add_argument("--tokenizer-path")
     p.add_argument("--text-key", default="text")
     p.add_argument("--limit", type=int, default=1000)
     p.add_argument("--out")
     p.set_defaults(func=cmd_tokenizer_report)
+
+    p = sub.add_parser("benchmark-tokenizer", help="Benchmark tokenizer throughput and memory use.")
+    p.add_argument("--input", nargs="+", required=True)
+    p.add_argument(
+        "--tokenizer",
+        choices=["byte", "byte-native", "bpe", "wordpiece", "sentencepiece"],
+        default="byte-native",
+    )
+    p.add_argument("--tokenizer-path")
+    p.add_argument("--text-key", default="text")
+    p.add_argument("--text-column", action="append")
+    p.add_argument("--limit", type=int, default=1000)
+    p.add_argument("--batch-size", type=int, default=64)
+    p.add_argument("--add-bos", action="store_true")
+    p.add_argument("--add-eos", action="store_true")
+    p.set_defaults(func=cmd_benchmark_tokenizer)
 
     p = sub.add_parser("train", help="Train from YAML config.")
     p.add_argument("--config", required=True)
@@ -307,6 +580,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--steps", type=int, default=20)
     p.add_argument("--device", default="auto")
     p.set_defaults(func=cmd_benchmark)
+
+    p = sub.add_parser("profile-config", help="Estimate params, FLOPs, and memory from config.")
+    p.add_argument("--config", required=True)
+    p.add_argument("--batch-size", type=int, default=1)
+    p.add_argument("--seq-len", type=int)
+    p.add_argument("--bytes-per-param", type=int, default=2)
+    p.set_defaults(func=cmd_profile_config)
 
     p = sub.add_parser("evaluate", help="Evaluate checkpoint loss, perplexity, and token accuracy.")
     p.add_argument("--checkpoint", required=True)

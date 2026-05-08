@@ -1,6 +1,6 @@
 
 model:
-  vocab_size: 4000
+  vocab_size: 32000
 
   max_seq_len: 512
 
@@ -53,6 +53,7 @@ training:
   grad_clip: 1.0
 
   precision: auto
+  resume_from_checkpoint: runs/tiny-bpe/best.pt
 
   gradient_checkpointing: false
 

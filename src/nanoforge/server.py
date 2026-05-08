@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from typing import Iterator
 
 from nanoforge.generation.engine import GenerationEngine
@@ -67,4 +67,3 @@ def serve(checkpoint: str, host: str = "127.0.0.1", port: int = 8000, device: st
         raise RuntimeError("Install server extras: pip install -e .[serve]") from exc
     engine = GenerationEngine.from_checkpoint(checkpoint, device=device)
     uvicorn.run(create_app(engine), host=host, port=port)
-

@@ -78,12 +78,15 @@ Instead, the goal is:
 ### Tokenization
 
 - Byte tokenizer
+- Optional native Rust byte tokenizer backend
 - BPE tokenizer
 - SentencePiece support
 - Special token support
 - Packed memmap datasets
 - Streaming dataset support
 - JSONL and conversation dataset paths
+- Schema-aware parquet/Arrow/csv/sqlite/json ingestion paths
+- Dataset inspection, validation, cleaning, conversion, and deduplication CLIs
 
 ### Inference
 
@@ -148,6 +151,14 @@ Full install:
 pip install -e ".[all]"
 ```
 
+Inspect registry-backed components:
+
+```powershell
+nanoforge registries
+nanoforge registries --name attention
+nanoforge validate-config --config configs/tiny.yaml
+```
+
 ---
 
 # Byte Tokenizer Smoke Test
@@ -181,6 +192,47 @@ nanoforge train-tokenizer ^
   --input data/raw ^
   --type bpe ^
   --vocab-size 4000 ^
+  --out data/tokenizers/tiny-bpe.json
+```
+
+Check tokenizer acceleration:
+
+```powershell
+nanoforge tokenizer-status
+```
+
+Benchmark tokenizer throughput and memory:
+
+```powershell
+nanoforge benchmark-tokenizer ^
+  --input data/raw ^
+  --tokenizer byte-native ^
+  --limit 10000 ^
+  --batch-size 256
+```
+
+Build the optional Rust tokenizer extension:
+
+```powershell
+pip install maturin
+cd native\nanoforge-tokenizers
+maturin develop --release
+```
+
+If the native extension is not installed, `byte-native` automatically falls back to the compatible
+Python byte tokenizer. BPE and WordPiece training use HuggingFace `tokenizers`, which is already
+implemented in Rust and is fed by Nanoforge's streaming structured-data readers.
+
+Structured datasets are read through Nanoforge's dataset adapters before tokenizer fitting, so
+parquet/Arrow files are streamed by text columns rather than treated as raw bytes. You can dry-run
+large or messy corpora before training:
+
+```powershell
+nanoforge train-tokenizer ^
+  --input data/raw ^
+  --type bpe ^
+  --text-column text ^
+  --dry-run ^
   --out data/tokenizers/tiny-bpe.json
 ```
 
@@ -224,6 +276,25 @@ Dashboard currently tracks:
 * gradient norm,
 * learning rate,
 * throughput.
+
+---
+
+# Dataset Tooling
+
+Inspect and validate structured datasets before packing:
+
+```powershell
+nanoforge inspect-dataset --input data/raw --limit 1000
+nanoforge validate-dataset --input data/raw --limit 1000
+```
+
+Clean, deduplicate, or convert inputs to normalized text records:
+
+```powershell
+nanoforge clean-dataset --input data/raw --out data/clean/train.jsonl
+nanoforge deduplicate-dataset --input data/raw --out data/clean/deduped.jsonl
+nanoforge convert-dataset --input data/raw --format txt --out data/clean/train.txt
+```
 
 ---
 
@@ -380,4 +451,3 @@ Do not rely on outputs for:
 * safety-critical systems.
 
 Use responsibly.
-

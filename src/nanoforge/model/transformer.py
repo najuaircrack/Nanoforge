@@ -9,9 +9,8 @@ from torch import nn
 from torch.nn import functional as F
 
 from nanoforge.config import ModelConfig
-from nanoforge.model.attention import CausalSelfAttention, KVCache
-from nanoforge.model.moe import FeedForward, MoEFeedForward
-from nanoforge.model.norms import RMSNorm
+from nanoforge.model.attention import KVCache
+from nanoforge.registry import ATTENTION_BACKENDS, FFN_BACKENDS, NORMALIZATIONS, TRANSFORMER_BLOCKS
 
 
 @dataclass
@@ -25,16 +24,31 @@ class CausalLMOutput:
 class TransformerBlock(nn.Module):
     def __init__(self, config: ModelConfig):
         super().__init__()
-        self.attn_norm = RMSNorm(config.d_model, config.norm_eps)
-        self.ffn_norm = RMSNorm(config.d_model, config.norm_eps)
-        self.attn = CausalSelfAttention(config)
+        norm_factory = NORMALIZATIONS.get(config.normalization)
+        self.attn_norm = norm_factory(config.d_model, config.norm_eps)
+        self.ffn_norm = norm_factory(config.d_model, config.norm_eps)
+        self.attn = ATTENTION_BACKENDS.create(config.attention_backend, config)
         hidden = int(config.d_model * config.ffn_hidden_mult)
         hidden = int(256 * math.ceil(hidden / 256)) if hidden >= 256 else hidden
         self.moe = config.moe is not None
         if self.moe:
-            self.ffn = MoEFeedForward(config.d_model, hidden, config.moe, config.activation, config.dropout)
+            self.ffn = FFN_BACKENDS.create(
+                "moe",
+                config.d_model,
+                hidden,
+                config.moe,
+                config.activation,
+                config.dropout,
+            )
         else:
-            self.ffn = FeedForward(config.d_model, hidden, config.activation, config.dropout)
+            ffn_type = config.ffn_type or config.activation
+            self.ffn = FFN_BACKENDS.create(
+                ffn_type,
+                config.d_model,
+                hidden,
+                ffn_type if ffn_type in {"swiglu", "geglu"} else config.activation,
+                config.dropout,
+            )
         self.residual_scale = config.residual_scale or (1.0 / math.sqrt(2 * config.n_layers))
 
     def forward(
@@ -61,8 +75,10 @@ class NanoforgeForCausalLM(nn.Module):
         self.config = config
         self.embed = nn.Embedding(config.vocab_size, config.d_model)
         self.drop = nn.Dropout(config.dropout)
-        self.blocks = nn.ModuleList([TransformerBlock(config) for _ in range(config.n_layers)])
-        self.norm = RMSNorm(config.d_model, config.norm_eps)
+        self.blocks = nn.ModuleList(
+            [TRANSFORMER_BLOCKS.create(config.block_type, config) for _ in range(config.n_layers)]
+        )
+        self.norm = NORMALIZATIONS.create(config.normalization, config.d_model, config.norm_eps)
         self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
         if config.tie_embeddings:
             self.lm_head.weight = self.embed.weight

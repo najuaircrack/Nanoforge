@@ -1,0 +1,18 @@
+Native BPE is completely absent - There's a native_tokenizer.py for byte tokenization with Rust acceleration, but there's NO native BPE implementation. The native module only has ByteTokenizer. The Rust crate (native/nanoforge-tokenizers) is not even in the zip.
+Transformer block variants are stubs - parallel_residual is registered as a placeholder pointing to TransformerBlock (the same class!). No actual parallel residual implementation. No other block types (Mamba SSM, RWKV, etc.).
+FFN backends are stubs - mamba_selective_state and rwkv_mixing point to FeedForward as placeholders.
+Attention backends are stubs - chunked, sparse, hybrid_local_global, paged are all placeholders pointing to CausalSelfAttention.
+Scheduler implementations are stubs - cosine, linear, constant all registered as lambda *args, **kwargs: None — they're no-ops!
+Quantization backends are stubs - none, int8, int4, gguf all no-ops.
+Training uses GradScaler (deprecated) - torch.cuda.amp.GradScaler is deprecated in newer PyTorch.
+load_tokenizer has type mismatches - bpe is a registered tokenizer type but the load function maps it differently (uses TokenizersBPE from tokenizers library, no native BPE).
+
+Missing Features
+
+No native/pure-Python BPE training/inference - completely depends on the tokenizers Rust library
+No distributed training - no DDP/FSDP/DeepSpeed support despite being a "forge" project
+No streaming dataset support - only packed memmap binary files
+No RLHF/PPO/DPO support - no fine-tuning beyond basic training + LoRA
+No multi-node support
+Config system is basic - tiny YAML subset fallback, no schema validation
+add a all config option to readme every use and how to use optmal values etvc etc

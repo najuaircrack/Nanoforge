@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import json
+import tracemalloc
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Protocol
-import tempfile
-import pandas as pd
+
+from nanoforge.data.formats import DatasetStats, iter_dataset_records
+from nanoforge.data.native_tokenizer import NativeByteTokenizer
 
 class TokenizerLike(Protocol):
     bos_id: int
@@ -126,10 +129,40 @@ class SentencePieceTokenizer:
         return self.processor.decode(ids)
 
 
-TokenizerAdapter = ByteTokenizer | TokenizersBPE | WordPieceTokenizer | SentencePieceTokenizer
+TokenizerAdapter = ByteTokenizer | NativeByteTokenizer | TokenizersBPE | WordPieceTokenizer | SentencePieceTokenizer
+
+
+@dataclass
+class TokenizerTrainingReport:
+    records: int = 0
+    chars: int = 0
+    skipped_records: int = 0
+    invalid_records: int = 0
+    peak_memory_mb: float = 0.0
+    dry_run: bool = False
+
+
+def iter_tokenizer_training_texts(
+    files: Iterable[str | Path],
+    *,
+    text_key: str = "text",
+    text_columns: Iterable[str] | None = None,
+    max_records: int | None = None,
+    stats: DatasetStats | None = None,
+) -> Iterable[str]:
+    count = 0
+    for record in iter_dataset_records(files, text_key=text_key, text_columns=text_columns, stats=stats):
+        if max_records is not None and count >= max_records:
+            break
+        count += 1
+        yield record.text
 
 
 def load_tokenizer(tokenizer_type: str = "byte", path: str | Path | None = None) -> TokenizerAdapter:
+    if tokenizer_type in {"byte-native", "native-byte"}:
+        return NativeByteTokenizer()
+    if tokenizer_type in {"byte-native-required", "native-byte-required"}:
+        return NativeByteTokenizer(require_native=True)
     if tokenizer_type == "byte" or path is None:
         return ByteTokenizer()
     if tokenizer_type == "bpe":
@@ -146,7 +179,18 @@ def train_bpe_tokenizer(
     out_path: str | Path,
     vocab_size: int = 32000,
     min_frequency: int = 2,
-) -> None:
+    *,
+    text_key: str = "text",
+    text_columns: Iterable[str] | None = None,
+    dry_run: bool = False,
+    max_records: int | None = None,
+) -> TokenizerTrainingReport:
+    files = list(files)
+    stats = DatasetStats()
+    report = _scan_training_texts(files, text_key, text_columns, max_records, stats)
+    report.dry_run = dry_run
+    if dry_run:
+        return report
     try:
         from tokenizers import Tokenizer, decoders, models, pre_tokenizers, processors, trainers
     except Exception as exc:
@@ -162,71 +206,22 @@ def train_bpe_tokenizer(
         special_tokens=special,
         show_progress=True,
     )
-   
 
-    processed_files = []
-
-    for p in files:
-        p = Path(p)
-
-        # parquet support
-        if p.suffix.lower() == ".parquet":
-            try:
-                df = pd.read_parquet(p)
-
-                candidate_cols = [
-                    "text",
-                    "content",
-                    "prompt",
-                    "completion",
-                    "story",
-                    "code",
-                    "messages"
-                ]
-
-                text_col = None
-
-                for col in candidate_cols:
-                    if col in df.columns:
-                        text_col = col
-                        break
-
-
-
-                if text_col is None:
-                    print(f"SKIP parquet no text column: {p}")
-                    continue
-
-                tmp = tempfile.NamedTemporaryFile(
-                    delete=False,
-                    suffix=".txt",
-                    mode="w",
-                    encoding="utf-8"
-                )
-
-                for x in df[text_col]:
-                    if isinstance(x, str):
-                        tmp.write(x + "\n")
-
-                tmp.close()
-
-                processed_files.append(tmp.name)
-
-                print(f"Loaded parquet: {p}")
-
-            except Exception as e:
-                print(f"Failed parquet {p}: {e}")
-
-        else:
-            processed_files.append(str(p))
-
-    tokenizer.train(processed_files, trainer=trainer)
+    iterator = iter_tokenizer_training_texts(
+        files,
+        text_key=text_key,
+        text_columns=text_columns,
+        max_records=max_records,
+        stats=DatasetStats(),
+    )
+    tokenizer.train_from_iterator(iterator, trainer=trainer)
 
 
     tokenizer.post_processor = processors.ByteLevel(trim_offsets=False)
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     tokenizer.save(str(out_path))
+    return report
 
 
 def train_wordpiece_tokenizer(
@@ -234,7 +229,18 @@ def train_wordpiece_tokenizer(
     out_path: str | Path,
     vocab_size: int = 32000,
     min_frequency: int = 2,
-) -> None:
+    *,
+    text_key: str = "text",
+    text_columns: Iterable[str] | None = None,
+    dry_run: bool = False,
+    max_records: int | None = None,
+) -> TokenizerTrainingReport:
+    files = list(files)
+    stats = DatasetStats()
+    report = _scan_training_texts(files, text_key, text_columns, max_records, stats)
+    report.dry_run = dry_run
+    if dry_run:
+        return report
     try:
         from tokenizers import Tokenizer, decoders, models, normalizers, pre_tokenizers, trainers
     except Exception as exc:
@@ -251,10 +257,18 @@ def train_wordpiece_tokenizer(
         special_tokens=special,
         show_progress=True,
     )
-    tokenizer.train([str(p) for p in files], trainer=trainer)
+    iterator = iter_tokenizer_training_texts(
+        files,
+        text_key=text_key,
+        text_columns=text_columns,
+        max_records=max_records,
+        stats=DatasetStats(),
+    )
+    tokenizer.train_from_iterator(iterator, trainer=trainer)
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     tokenizer.save(str(out_path))
+    return report
 
 
 def train_sentencepiece_tokenizer(
@@ -262,16 +276,32 @@ def train_sentencepiece_tokenizer(
     out_prefix: str | Path,
     vocab_size: int = 32000,
     model_type: str = "bpe",
-) -> None:
+    *,
+    text_key: str = "text",
+    text_columns: Iterable[str] | None = None,
+    dry_run: bool = False,
+    max_records: int | None = None,
+) -> TokenizerTrainingReport:
+    files = list(files)
+    stats = DatasetStats()
+    report = _scan_training_texts(files, text_key, text_columns, max_records, stats)
+    report.dry_run = dry_run
+    if dry_run:
+        return report
     try:
         import sentencepiece as spm
     except Exception as exc:
         raise RuntimeError("Install sentencepiece to train SentencePiece tokenizers") from exc
-    input_arg = ",".join(str(p) for p in files)
     out_prefix = Path(out_prefix)
     out_prefix.parent.mkdir(parents=True, exist_ok=True)
     spm.SentencePieceTrainer.Train(
-        input=input_arg,
+        sentence_iterator=iter_tokenizer_training_texts(
+            files,
+            text_key=text_key,
+            text_columns=text_columns,
+            max_records=max_records,
+            stats=DatasetStats(),
+        ),
         model_prefix=str(out_prefix),
         vocab_size=vocab_size,
         model_type=model_type,
@@ -280,4 +310,37 @@ def train_sentencepiece_tokenizer(
         eos_id=2,
         unk_id=3,
         user_defined_symbols="<fim_prefix>,<fim_middle>,<fim_suffix>",
+    )
+    return report
+
+
+def _scan_training_texts(
+    files: Iterable[str | Path],
+    text_key: str,
+    text_columns: Iterable[str] | None,
+    max_records: int | None,
+    stats: DatasetStats,
+) -> TokenizerTrainingReport:
+    tracemalloc.start()
+    records = 0
+    chars = 0
+    try:
+        for text in iter_tokenizer_training_texts(
+            files,
+            text_key=text_key,
+            text_columns=text_columns,
+            max_records=max_records,
+            stats=stats,
+        ):
+            records += 1
+            chars += len(text)
+    finally:
+        _, peak = tracemalloc.get_traced_memory()
+        tracemalloc.stop()
+    return TokenizerTrainingReport(
+        records=records,
+        chars=chars,
+        skipped_records=stats.skipped_records,
+        invalid_records=stats.invalid_records,
+        peak_memory_mb=peak / (1024 * 1024),
     )

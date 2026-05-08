@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import math
 from typing import Any
 
 import torch
@@ -76,4 +75,3 @@ def apply_rotary(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, offset: 
 
 def yarn_recommended_theta(base: float, factor: float, head_dim: int) -> float:
     return base * (factor ** (head_dim / max(head_dim - 2, 1)))
-
