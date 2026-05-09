@@ -153,6 +153,7 @@ def cmd_prepare(args: argparse.Namespace) -> None:
         tokenizer_batch_size=args.tokenizer_batch_size,
         progress_callback=update_bar,
         text_columns=tuple(args.text_column or ()),
+        seq_len=args.seq_len,
     )
     if progress is not None:
         progress.close()
@@ -350,19 +351,17 @@ def _sampling_from_args(args: argparse.Namespace):
 
 
 def cmd_generate(args: argparse.Namespace) -> None:
-    from nanoforge.generation.engine import GenerationEngine
-
-    engine = GenerationEngine.from_checkpoint(args.checkpoint, device=args.device)
+    engine = _load_generation_engine(args)
     if args.beams > 1:
+        if not hasattr(engine, "beam_search"):
+            raise SystemExit("Beam search is only available for native Nanoforge checkpoints.")
         print(engine.beam_search(args.prompt, args.max_new_tokens, args.beams))
     else:
         print(engine.complete(args.prompt, args.max_new_tokens, _sampling_from_args(args), args.stop_token))
 
 
 def cmd_chat(args: argparse.Namespace) -> None:
-    from nanoforge.generation.engine import GenerationEngine
-
-    engine = GenerationEngine.from_checkpoint(args.checkpoint, device=args.device)
+    engine = _load_generation_engine(args)
     print("Nanoforge chat. Press Ctrl+C or submit an empty prompt to exit.")
     try:
         while True:
@@ -375,6 +374,195 @@ def cmd_chat(args: argparse.Namespace) -> None:
             print()
     except KeyboardInterrupt:
         print()
+
+
+def _load_generation_engine(args: argparse.Namespace):
+    if getattr(args, "model", None):
+        from nanoforge.imports import load_imported_engine
+
+        return load_imported_engine(args.model, device=args.device)
+    if not getattr(args, "checkpoint", None):
+        raise SystemExit("Provide --checkpoint for a Nanoforge checkpoint or --model for an imported model.")
+    from nanoforge.generation.engine import GenerationEngine
+
+    return GenerationEngine.from_checkpoint(args.checkpoint, device=args.device)
+
+
+def cmd_import_model(args: argparse.Namespace) -> None:
+    from nanoforge.imports import import_model
+
+    entry = import_model(args.model, args.name, tokenizer=args.tokenizer, backend=args.backend)
+    print(f"imported: {entry.name}")
+    print(f"backend: {entry.backend}")
+    print(f"format: {entry.format}")
+    print(f"source: {entry.source}")
+
+
+def cmd_new_config(args: argparse.Namespace) -> None:
+    from nanoforge.templates import interactive_new_config
+
+    path = interactive_new_config(args.out)
+    print(f"wrote: {path}")
+
+
+def cmd_auto_train(args: argparse.Namespace) -> None:
+    from nanoforge.data.dataset import build_packed_dataset
+    from nanoforge.data.formats import inspect_dataset
+    from nanoforge.data.tokenizer import (
+        load_tokenizer,
+        train_bpe_tokenizer,
+        train_native_bpe_tokenizer,
+        train_python_bpe_tokenizer,
+        train_sentencepiece_tokenizer,
+        train_wordpiece_tokenizer,
+    )
+    from nanoforge.templates import build_cpu_config
+
+    input_paths = _paths(args.input)
+    text_columns = tuple(args.text_column or ())
+    mode = args.mode
+    if mode == "auto":
+        inspected = inspect_dataset(input_paths, text_key=args.text_key, limit=args.inspect_limit)
+        fields = {field.lower() for field in inspected.fields}
+        if {"messages", "conversations"} & fields or any("messages" in cols for cols in inspected.text_columns.values()):
+            mode = "chat"
+        elif {"instruction", "output", "response"} <= fields or ("instruction" in fields and {"output", "response"} & fields):
+            mode = "instruct"
+        elif "code" in fields:
+            mode = "code"
+        else:
+            mode = "generative"
+        if not text_columns and mode == "chat":
+            text_columns = ("messages",)
+    loss_masking = args.loss_masking
+    if loss_masking == "auto":
+        loss_masking = "assistant_only" if mode == "chat" else "completion_only" if mode == "instruct" else "none"
+
+    name = args.name
+    default_tokenizer_path = f"data/tokenizers/{name}.model" if args.tokenizer in {"sentencepiece", "unigram"} else f"data/tokenizers/{name}-bpe.json"
+    tokenizer_path = Path(args.tokenizer_path or default_tokenizer_path)
+    packed_dir = Path(args.packed_dir or f"data/packed/{name}")
+    config_path = Path(args.config_out or f"configs/{name}.yaml")
+    files: list[Path] = []
+    for root in input_paths:
+        files.extend([p for p in root.rglob("*") if p.is_file()] if root.is_dir() else [root])
+
+    if args.tokenizer in {"bpe", "native-bpe", "python-bpe", "wordpiece", "sentencepiece", "unigram"}:
+        print(f"[1/4] training tokenizer: {args.tokenizer} -> {tokenizer_path}")
+        if args.tokenizer == "native-bpe":
+            train_native_bpe_tokenizer(
+                files,
+                tokenizer_path,
+                args.vocab_size,
+                args.min_frequency,
+                text_key=args.text_key,
+                text_columns=text_columns,
+                max_records=args.max_records,
+                show_progress=not args.no_progress,
+            )
+        elif args.tokenizer == "python-bpe":
+            train_python_bpe_tokenizer(
+                files,
+                tokenizer_path,
+                args.vocab_size,
+                args.min_frequency,
+                text_key=args.text_key,
+                text_columns=text_columns,
+                max_records=args.max_records,
+            )
+        elif args.tokenizer == "bpe":
+            train_bpe_tokenizer(
+                files,
+                tokenizer_path,
+                args.vocab_size,
+                args.min_frequency,
+                text_key=args.text_key,
+                text_columns=text_columns,
+                max_records=args.max_records,
+            )
+        elif args.tokenizer == "wordpiece":
+            train_wordpiece_tokenizer(
+                files,
+                tokenizer_path,
+                args.vocab_size,
+                args.min_frequency,
+                text_key=args.text_key,
+                text_columns=text_columns,
+                max_records=args.max_records,
+            )
+        else:
+            train_sentencepiece_tokenizer(
+                files,
+                tokenizer_path.with_suffix(""),
+                args.vocab_size,
+                model_type="unigram" if args.tokenizer == "unigram" else "bpe",
+                text_key=args.text_key,
+                text_columns=text_columns,
+                max_records=args.max_records,
+            )
+    else:
+        print("[1/4] byte tokenizer selected; no tokenizer training needed")
+
+    print(f"[2/4] preparing data: mode={mode}, loss_masking={loss_masking} -> {packed_dir}")
+    tokenizer = load_tokenizer(args.tokenizer, tokenizer_path if args.tokenizer not in {"byte", "byte-native"} else None)
+    progress = None
+   
+    from tqdm import tqdm
+
+    progress = tqdm(desc="prepare", unit="docs", dynamic_ncols=True)
+
+    def update_bar(stats):
+        progress.update(max(0, stats.records_seen - progress.n))
+        progress.set_postfix(
+            train=f"{stats.train_tokens:,}",
+            val=f"{stats.val_tokens:,}",
+            shards=stats.shards,
+        )
+
+
+    build_packed_dataset(
+        input_paths,
+        packed_dir,
+        tokenizer,
+        val_fraction=args.val_fraction,
+        jsonl_text_key=args.text_key,
+        min_chars=args.min_chars,
+        mode=mode,
+        loss_masking=loss_masking,
+        progress_callback=update_bar,
+        tokenizer_batch_size=args.tokenizer_batch_size,
+        text_columns=text_columns,
+        seq_len=args.seq_len,
+    )
+
+    if progress is not None:
+        progress.close()
+
+    print(f"[3/4] writing config: {config_path}")
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_text = build_cpu_config(
+        name=name,
+        mode=mode,
+        ram=args.ram,
+        speed=args.speed,
+        data_format="parquet chat" if mode == "chat" else "plain text",
+        tokenizer_type=args.tokenizer,
+        tokenizer_path="null" if args.tokenizer in {"byte", "byte-native"} else str(tokenizer_path).replace("\\", "/"),
+        packed_dir=str(packed_dir).replace("\\", "/"),
+        vocab_size=args.vocab_size if args.tokenizer not in {"byte", "byte-native"} else tokenizer.vocab_size,
+        max_steps=args.max_steps,
+        seq_len_override=args.seq_len,
+        loss_masking=loss_masking,
+    )
+    config_path.write_text(config_text, encoding="utf-8")
+
+    if args.no_train:
+        print("[4/4] skipped training (--no-train)")
+        return
+    print("[4/4] training")
+    from nanoforge.training.trainer import train_from_config
+
+    train_from_config(config_path)
 
 
 def cmd_serve(args: argparse.Namespace) -> None:
@@ -461,6 +649,55 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--config", required=True)
     p.set_defaults(func=cmd_validate_config)
 
+    p = sub.add_parser("new-config", help="Interactively create a CPU-friendly training config.")
+    p.add_argument("--out", default="configs/my-model.yaml")
+    p.set_defaults(func=cmd_new_config)
+
+    p = sub.add_parser("auto-train", help="Train tokenizer, prepare data, write config, and train in one command.")
+    p.add_argument("--input", nargs="+", required=True)
+    p.add_argument("--name", required=True)
+    p.add_argument(
+        "--mode",
+        choices=["auto", "generative", "chat", "instruct", "completion", "code", "reasoning"],
+        default="auto",
+    )
+    p.add_argument(
+        "--loss-masking",
+        choices=["auto", "none", "assistant-only", "assistant_only", "completion-only", "completion_only", "partial"],
+        default="auto",
+    )
+    p.add_argument(
+        "--tokenizer",
+        choices=["byte", "byte-native", "bpe", "native-bpe", "python-bpe", "wordpiece", "sentencepiece", "unigram"],
+        default="native-bpe",
+    )
+    p.add_argument("--tokenizer-path")
+    p.add_argument("--vocab-size", type=int, default=8000)
+    p.add_argument("--min-frequency", type=int, default=2)
+    p.add_argument("--text-key", default="text")
+    p.add_argument("--text-column", action="append")
+    p.add_argument("--seq-len", type=int, default=512)
+    p.add_argument("--tokenizer-batch-size", type=int, default=128)
+    p.add_argument("--val-fraction", type=float, default=0.01)
+    p.add_argument("--min-chars", type=int, default=16)
+    p.add_argument("--max-records", type=int)
+    p.add_argument("--inspect-limit", type=int, default=1000)
+    p.add_argument("--ram", default="8GB", choices=["4GB", "8GB", "16GB", "32GB+"])
+    p.add_argument("--speed", default="fast/small", choices=["fast/small", "balanced", "slow/large"])
+    p.add_argument("--max-steps", type=int, default=50000)
+    p.add_argument("--packed-dir")
+    p.add_argument("--config-out")
+    p.add_argument("--no-progress", action="store_true")
+    p.add_argument("--no-train", action="store_true", help="Run tokenizer/config/data prep only.")
+    p.set_defaults(func=cmd_auto_train)
+
+    p = sub.add_parser("import", help="Register an external GGUF, ONNX, SafeTensors, or HuggingFace model.")
+    p.add_argument("--model", required=True)
+    p.add_argument("--name", required=True)
+    p.add_argument("--tokenizer", help="Optional tokenizer path/name for ONNX or custom imports.")
+    p.add_argument("--backend", choices=["llama_cpp", "transformers", "onnxruntime", "safetensors"])
+    p.set_defaults(func=cmd_import_model)
+
     p = sub.add_parser("train-tokenizer", help="Train a BPE, WordPiece, or SentencePiece tokenizer.")
     p.add_argument("--input", nargs="+", required=True)
     p.add_argument("--out", required=True)
@@ -498,6 +735,7 @@ def build_parser() -> argparse.ArgumentParser:
         default="auto",
     )
     p.add_argument("--tokenizer-batch-size", type=int, default=256)
+    p.add_argument("--seq-len", type=int, default=512)
     p.add_argument("--min-chars", type=int, default=16)
     p.add_argument("--no-progress", action="store_true")
     p.add_argument("--text-column", action="append", help="Structured text column(s) to use. Can be repeated.")
@@ -599,7 +837,8 @@ def build_parser() -> argparse.ArgumentParser:
         ("chat", "Interactive chat.", cmd_chat),
     ]:
         p = sub.add_parser(name, help=help_text)
-        p.add_argument("--checkpoint", required=True)
+        p.add_argument("--checkpoint")
+        p.add_argument("--model", help="Imported model name or external model path/HuggingFace id.")
         p.add_argument("--prompt", default="")
         p.add_argument("--device", default="auto")
         p.add_argument("--max-new-tokens", type=int, default=256)

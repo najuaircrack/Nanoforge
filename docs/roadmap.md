@@ -29,8 +29,9 @@ to read, but has clear extension points for modern training, inference, and data
 - Validate datasets before fitting, recover from malformed UTF-8, skip bad rows, expose dry-run
   reports, memory profiles, unknown-token diagnostics, token distribution summaries, vocabulary
   collapse checks, and merge-quality reports.
-- Add native tokenizer engines in Rust first, with Python orchestration and graceful fallback to
-  pure Python or `tokenizers`/SentencePiece adapters when native extensions are unavailable.
+- Native byte and byte-level BPE engines are available through Rust/PyO3 with Python fallback.
+  Remaining tokenizer work is focused on lower-memory training, SIMD normalization, and richer
+  diagnostics.
 
 ## Dataset Inspection And Cleaning
 
@@ -70,10 +71,11 @@ to read, but has clear extension points for modern training, inference, and data
 - Use C++ for low-level CPU kernels, quantized inference paths, SIMD-heavy compute, and cache
   systems.
 - Keep Python focused on configuration, orchestration, experimentation, and research APIs.
-- Current implementation target: `native/nanoforge-tokenizers` provides the first optional
-  Rust/PyO3 tokenizer module. `byte-native` auto-detects it and falls back to Python when absent.
-- Next native milestones: BPE training/merging, mmap corpus readers, SIMD normalization, and a
-  Rust parquet/Arrow text extractor shared by tokenizer fitting and dataset packing.
+- Current implementation target: `native/nanoforge-tokenizers` provides optional Rust/PyO3
+  byte and byte-level BPE tokenization. `byte-native` and `native-bpe` auto-detect it and fall
+  back to Python when absent.
+- Next native milestones: mmap corpus readers, SIMD normalization, and a Rust parquet/Arrow
+  text extractor shared by tokenizer fitting and dataset packing.
 
 ## Finalization Criteria
 

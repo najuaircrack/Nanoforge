@@ -20,13 +20,13 @@ The codebase currently supports:
 - KV cache inference
 - optional MoE feed-forward layers
 - LoRA-ready linear layers
-- streaming dataset ingestion and packed memmap datasets
-- byte, BPE, WordPiece, SentencePiece, and Unigram tokenizer paths
+- streaming dataset ingestion, boundary-aware chat packing, and packed memmap datasets
+- byte, native byte, BPE, native byte-level BPE, WordPiece, SentencePiece, and Unigram tokenizer paths
 - AdamW, Lion, Adafactor, and SophiaG optimizer options
 - mixed precision training with bf16/fp16 logic
 - gradient accumulation, clipping, warmup, cosine LR decay, EMA, checkpointing
 - live dashboard backed by `metrics.jsonl`
-- generation CLI, API server, ONNX export, and GGUF manifest export
+- `auto-train`, `new-config`, generation/chat CLI, external model imports, API server, ONNX export, and GGUF manifest export
 
 ## Important Commands
 
@@ -43,6 +43,12 @@ Inspect data:
 
 ```powershell
 nanoforge inspect-dataset --input data/raw --limit 2000
+```
+
+One-command chat training:
+
+```powershell
+nanoforge auto-train --input data/raw --name ultrachat-18m --mode chat --tokenizer native-bpe --vocab-size 8000 --text-column messages --seq-len 512
 ```
 
 Pack data with the byte tokenizer:
@@ -668,4 +674,3 @@ Data ingestion and packing are streaming and live in src/nanoforge/data/. The da
 runs/<name>/metrics.jsonl via src/nanoforge/dashboard.py. Keep changes minimal, preserve checkpoint
 compatibility where possible, and run pytest after edits.
 ```
-

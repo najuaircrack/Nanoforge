@@ -430,6 +430,143 @@ inference:
   min_p: 0.05
 ```
 
+---
+
+# CPU Training Workflows
+
+These commands are tuned for Windows 11 CPU-only training with about 8GB RAM.
+
+## 0. One-Command Auto Training
+
+```powershell
+nanoforge auto-train ^
+  --input data/raw ^
+  --name ultrachat-18m ^
+  --mode chat ^
+  --tokenizer native-bpe ^
+  --vocab-size 8000 ^
+  --text-column messages ^
+  --seq-len 512
+```
+
+This trains the tokenizer, prepares boundary-aware packed data, writes `configs/ultrachat-18m.yaml`,
+and starts training. Add `--no-train` to stop after setup.
+
+## 1. Generative Model
+
+Use this for stories, Wikipedia-style text, notes, books, or plain continuation models.
+
+```powershell
+nanoforge train-tokenizer ^
+  --input data/raw ^
+  --type native-bpe ^
+  --vocab-size 8000 ^
+  --out data/tokenizers/tiny-bpe.json
+
+nanoforge prepare ^
+  --input data/raw ^
+  --tokenizer native-bpe ^
+  --tokenizer-path data/tokenizers/tiny-bpe.json ^
+  --mode generative ^
+  --loss-masking none ^
+  --seq-len 1024 ^
+  --out data/packed/story
+
+nanoforge train --config configs/my-story.yaml
+nanoforge generate --checkpoint runs/my-story/best.pt --mode creative --prompt "Once upon a time"
+```
+
+## 2. Chat Model
+
+Use this for UltraChat, ShareGPT, or rows containing `messages`/`conversations`.
+
+```powershell
+nanoforge train-tokenizer ^
+  --input data/raw ^
+  --type native-bpe ^
+  --vocab-size 8000 ^
+  --text-column messages ^
+  --out data/tokenizers/tiny-bpe.json
+
+nanoforge prepare ^
+  --input data/raw ^
+  --tokenizer native-bpe ^
+  --tokenizer-path data/tokenizers/tiny-bpe.json ^
+  --mode chat ^
+  --loss-masking assistant_only ^
+  --text-column messages ^
+  --seq-len 512 ^
+  --out data/packed/ultrachat
+
+nanoforge train --config configs/ultrachat.yaml
+nanoforge chat --checkpoint runs/ultrachat-18m/best.pt --mode chat
+```
+
+Chat packing is conversation-boundary aware. Each fixed sequence starts from a user/system/assistant boundary, long assistant responses are split with the user prefix repeated, and labels target assistant tokens only.
+
+## 3. Instruct Model
+
+Use this for Alpaca-style rows with `instruction`, optional `input`, and `output`/`response`.
+
+```powershell
+nanoforge prepare ^
+  --input data/alpaca.jsonl ^
+  --tokenizer native-bpe ^
+  --tokenizer-path data/tokenizers/tiny-bpe.json ^
+  --mode instruct ^
+  --loss-masking completion_only ^
+  --seq-len 512 ^
+  --out data/packed/instruct
+
+nanoforge train --config configs/my-instruct.yaml
+```
+
+## 4. Check Data Before Training
+
+```powershell
+python -c "import numpy as np; labels=np.fromfile('data/packed/ultrachat/train.labels.bin', dtype=np.int32); masked=(labels==-100).sum(); total=len(labels); print(f'Masked: {masked/total*100:.1f}%'); print(f'Unmasked: {(total-masked)/total*100:.1f}%')"
+```
+
+Healthy targets:
+
+- Chat/instruct: about 40-70% masked and 30-60% unmasked.
+- Generative: no label file, or 0% masked if a label file exists.
+- No sampled batch should be entirely masked or entirely unmasked for chat data.
+
+## 5. Healthy Training Signs
+
+- For `vocab_size=8000`, step-1 loss should usually start around `8-10`, not `30-60`.
+- Loss should decline steadily over the first few hundred steps.
+- Gradient norm before clipping should usually stay below `5.0`.
+- `skip=no` should appear on most steps.
+- Stop immediately if you see persistent `loss=0.000`, `loss=NaN`, or all-masked batches.
+
+## 6. New Config Wizard
+
+```powershell
+nanoforge new-config --out configs/my-model.yaml
+```
+
+The wizard asks what you are training, available RAM, speed/size preference, and dataset format, then writes a complete CPU-friendly YAML.
+
+## 7. Import External Models
+
+```powershell
+nanoforge import --model path\to\model.gguf --name my-gguf
+nanoforge import --model mistralai/Mistral-7B-v0.1 --name mistral
+nanoforge import --model path\to\model.onnx --name my-onnx --tokenizer path\to\tokenizer-dir
+
+nanoforge chat --model my-gguf --mode chat
+nanoforge generate --model mistral --prompt "Hello"
+```
+
+Backends:
+
+- GGUF uses `llama-cpp-python`.
+- HuggingFace directories and Hub IDs use `transformers`.
+- SafeTensors runs through `transformers` when a compatible `config.json` and tokenizer are present.
+- ONNX uses `onnxruntime` with an adjacent or specified HuggingFace tokenizer.
+
 ## Train Model
 
 ```powershell

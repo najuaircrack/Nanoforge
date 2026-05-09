@@ -8,6 +8,7 @@ import sqlite3
 import tarfile
 import unicodedata
 import zipfile
+import ast
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Iterator
@@ -268,7 +269,7 @@ def _extract_text_from_row(
                 val = row[key]
                 if val is None:
                     continue
-                if key in {"messages", "conversations"} and isinstance(val, list):
+                if key in {"messages", "conversations"}:
                     formatted = _format_messages(val)
                     if formatted.strip():
                         parts.append(formatted)
@@ -277,6 +278,8 @@ def _extract_text_from_row(
                     if cell.strip():
                         parts.append(cell)
             return "\n".join(parts) if parts else None
+        if text_key in row and text_key in {"messages", "conversations"}:
+            return _format_messages(row[text_key])
         if text_key in row:
             return _coerce_cell(row[text_key])
         if "messages" in row:
@@ -343,7 +346,19 @@ def _infer_row_mode(row: Any) -> str:
 
 
 def _format_messages(messages: Any) -> str:
+    if isinstance(messages, str):
+        stripped = messages.strip()
+        if stripped.startswith("[") or stripped.startswith("{"):
+            try:
+                messages = json.loads(stripped)
+            except Exception:
+                try:
+                    messages = ast.literal_eval(stripped)
+                except Exception:
+                    return stripped
     parts = []
+    if isinstance(messages, dict):
+        messages = messages.get("messages", messages.get("conversations", [messages]))
     if isinstance(messages, list):
         for msg in messages:
             if isinstance(msg, dict):

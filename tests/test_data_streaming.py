@@ -5,6 +5,7 @@ import json
 import pytest
 
 from nanoforge.data.formats import detect_format, inspect_dataset, iter_dataset_records
+from nanoforge.data.dataset import PackedMemmapDataset
 from nanoforge.data.modes import encode_training_record
 from nanoforge.data.packing import build_packed_dataset_streaming
 from nanoforge.data.tokenizer import ByteTokenizer
@@ -115,7 +116,29 @@ def test_packed_chat_dataset_writes_label_masks(tmp_path):
         val_fraction=0.0,
         mode="auto",
         loss_masking="auto",
+        seq_len=64,
         cleaning=None,
     )
     assert stats.records_written == 1
+    assert stats.mixed_sequences >= 1
+    assert stats.all_masked_sequences == 0
+    assert stats.all_unmasked_sequences == 0
     assert (tmp_path / "packed" / "train.labels.manifest.json").exists()
+    dataset = PackedMemmapDataset(tmp_path / "packed" / "train.bin", seq_len=64)
+    _x, y = dataset.sample(4)
+    unmasked = (y != -100).sum(dim=1)
+    assert bool(((unmasked > 0) & (unmasked < 64)).all())
+
+
+def test_parquet_messages_column_formats_stringified_chat(tmp_path):
+    pytest.importorskip("pyarrow")
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    path = tmp_path / "chat.parquet"
+    messages = json.dumps([{"role": "user", "content": "Hi"}, {"role": "assistant", "content": "Hello"}])
+    pq.write_table(pa.table({"messages": [messages]}), path)
+    records = list(iter_dataset_records([path], text_columns=("messages",)))
+    assert "<|user|>" in records[0].text
+    assert "<|assistant|>" in records[0].text
+    assert records[0].metadata["mode"] == "chat"

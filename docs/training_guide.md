@@ -1,78 +1,91 @@
 # Training Guide
 
-## Implementation plan
+Nanoforge supports three main local training styles:
 
-1. Build a tokenizer on your target code and text mix.
-2. Pack data into `train.bin` and `val.bin` with document-level deduplication.
-3. Run `nanoforge params` and check the model fits your VRAM budget.
-4. Train a tiny model first to validate loss, checkpointing, and sampling.
-5. Scale width before depth for very small models; scale depth once width is at least 512.
-6. Add longer context only after short-context loss is stable.
-7. Fine-tune with LoRA on instruction and debugging conversations.
-8. Distill from a larger teacher if you have high-quality prompts and completions.
-9. Export for inference after validation loss and qualitative code samples improve together.
+- `generative`: plain next-token text or story continuation.
+- `chat`: role-based conversations with assistant-only labels.
+- `instruct`: instruction/response pairs with completion-only labels.
 
-## Dataset recommendations
+For Windows 11 CPU-only training with 8GB RAM, start with `native-bpe`, `vocab_size=8000`,
+`seq_len=512` for chat/instruct, and `seq_len=1024` for plain generative text.
 
-Use a deliberate blend:
+## Fast Path
 
-- 45 percent source code from Python, C/C++, JavaScript/TypeScript, Rust, and Pawn/SA-MP
-- 20 percent tests, docs, examples, READMEs, and API references
-- 15 percent high-quality coding conversations and debugging traces
-- 10 percent math, logic, and structured reasoning text
-- 10 percent general clean prose for language fluency
+Use the automatic pipeline:
 
-For code models, keep licensing metadata. Validate by repository split to avoid measuring
-memorization of near-duplicate files.
+```powershell
+nanoforge auto-train ^
+  --input data/raw ^
+  --name ultrachat-18m ^
+  --mode chat ^
+  --tokenizer native-bpe ^
+  --vocab-size 8000 ^
+  --text-column messages ^
+  --seq-len 512
+```
 
-## Curriculum
+Add `--no-train` to stop after tokenizer training, data packing, and config generation.
 
-Start with short, syntactically clean files and examples. Gradually increase:
+## Manual Path
 
-- max sequence length
-- multi-file snippets
-- incomplete autocomplete examples
-- bug-fix and refactor prompts
-- tool-call or function-call traces
+Train a tokenizer:
 
-## Hardware recommendations
+```powershell
+nanoforge train-tokenizer ^
+  --input data/raw ^
+  --type native-bpe ^
+  --vocab-size 8000 ^
+  --text-column messages ^
+  --out data/tokenizers/tiny-bpe.json
+```
 
-- CPU only: 10M model, seq_len 256-512, batch 1-4, use byte tokenizer for debugging.
-- 4 GB GPU: 10M-35M, BF16/FP16, gradient checkpointing, micro_batch_size 1-2.
-- 8 GB GPU: 35M-110M, seq_len 2048-4096, GQA, gradient accumulation.
-- 12 GB GPU: 110M with 4096 context comfortably, 250M with careful checkpointing.
-- 24 GB GPU: 250M-500M, longer context, LoRA fine-tuning, distillation.
+Prepare chat data:
 
-Ryzen CPU tips:
+```powershell
+nanoforge prepare ^
+  --input data/raw ^
+  --tokenizer native-bpe ^
+  --tokenizer-path data/tokenizers/tiny-bpe.json ^
+  --mode chat ^
+  --loss-masking assistant_only ^
+  --text-column messages ^
+  --seq-len 512 ^
+  --out data/packed/ultrachat
+```
 
-- use memmap packed data
-- keep workers modest to avoid RAM pressure
-- prefer larger contiguous batches when enough memory exists
-- set PyTorch thread count explicitly during benchmarking
+Train:
 
-## Optimization strategies
+```powershell
+nanoforge train --config configs/ultrachat.yaml
+```
 
-- GQA reduces KV cache memory from `n_heads` to `n_kv_heads`.
-- Tied embeddings save parameters and usually improve small-model quality.
-- RMSNorm avoids mean-centering and is cheaper than LayerNorm.
-- SwiGLU improves quality per parameter over plain GELU MLPs.
-- Flash SDPA selects efficient kernels when the backend supports them.
-- Gradient accumulation simulates larger batches without increasing activation memory.
-- Checkpointing trades compute for memory and is essential on low VRAM.
-- EMA can slightly improve evaluation stability for noisy small runs.
-- LoRA makes fine-tuning cheap and prevents full-model overfitting on small instruction data.
+## Boundary-Aware Chat Packing
 
-## Scaling guidance
+Chat and instruct packing writes fixed sequences instead of sampling arbitrary windows from one
+long stream. Each sequence starts from a conversation boundary, includes user/context tokens,
+and labels assistant/completion tokens only. Long assistant responses are split into multiple
+sequences with the user/context prefix repeated so batches do not become 100% unmasked.
 
-Approximate recipes:
+Healthy chat/instruct packing:
 
-- 10M: `d_model=256`, `layers=6`, `heads=4`, `kv_heads=2`
-- 35M: `d_model=512`, `layers=8`, `heads=8`, `kv_heads=2`
-- 110M: `d_model=768`, `layers=12`, `heads=12`, `kv_heads=4`
-- 250M: `d_model=1024`, `layers=18`, `heads=16`, `kv_heads=4`
-- 500M: `d_model=1280`, `layers=24`, `heads=20`, `kv_heads=5`
+- 40-70% masked labels,
+- 30-60% unmasked labels,
+- no all-masked sampled batches,
+- no all-unmasked sampled batches.
 
-Train with at least 20 tokens per non-embedding parameter for initial competence. Code-focused
-models benefit from more repeated exposure to curated high-signal examples than from simply
-maximizing raw token count.
+## Healthy Training Signs
 
+- `vocab_size=8000` should start near loss `8-10`.
+- Loss should decrease over the first few hundred steps.
+- Gradient norm before clipping should usually stay below `5.0`.
+- `skip=no` should appear on most steps.
+- Stop and inspect data if loss is `0.000`, `NaN`, or starts around `30-60`.
+
+## CPU Presets
+
+- 4GB RAM: `d_model=192`, `n_layers=3`, `n_heads=3`, `seq_len=384`.
+- 8GB RAM fast chat: `d_model=256`, `n_layers=4`, `n_heads=4`, `seq_len=512`.
+- 8GB RAM balanced: `d_model=384`, `n_layers=6`, `n_heads=6`, `seq_len=1024`.
+- 16GB RAM: `d_model=512`, `n_layers=8`, `n_heads=8`, `seq_len=1024`.
+
+Use `nanoforge new-config` for an interactive config generator.

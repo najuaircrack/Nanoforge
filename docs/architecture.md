@@ -33,9 +33,9 @@ Consumer GPUs are usually bottlenecked by VRAM. Nanoforge therefore prioritizes:
 - optional 8-bit optimizer compatibility hooks
 - small, focused evaluation intervals
 
-CPU-only training is supported for tiny models and data-pipeline debugging. Ryzen CPUs benefit
-from packed contiguous token buffers and larger batch prefetching. GPU training benefits from
-pinning, persistent workers, and packed fixed-length sequences.
+CPU-only training is supported for tiny models and chat experiments. On 8GB RAM, prefer
+`fp32`, `num_workers=0`, `pin_memory=false`, small micro-batches, and boundary-aware fixed
+sequences for chat/instruct data.
 
 ## Data architecture
 
@@ -48,6 +48,11 @@ avoid loading full parquet/Arrow tables into RAM.
 Tokenizer training uses the same record stream as packing. This keeps BPE/WordPiece/SentencePiece
 fitting aligned with preprocessing behavior and prevents accidental tokenization of structured
 container bytes such as parquet binaries.
+
+Chat and instruct packing is boundary-aware: records are encoded into fixed training sequences
+that start at role/conversation boundaries. Labels are shifted during packing so the trainer can
+consume `train.bin` and `train.labels.bin` directly. Assistant-only masking targets assistant
+responses while user/system/padding tokens use `-100`.
 
 ## Registry architecture
 
@@ -92,10 +97,17 @@ and cache-sensitive systems. Native modules must be optional: Python fallbacks p
 usability when a compiler toolchain is unavailable.
 
 The first native target is `native/nanoforge-tokenizers`, a Rust/PyO3 extension discovered as
-`nanoforge_tokenizers`. The Python tokenizer API exposes `byte-native`, which uses the Rust
-backend when installed and otherwise falls back to the exact same byte-token ID layout. This
-keeps packed datasets and checkpoints compatible while allowing local builds to opt into faster
-parallel batch tokenization.
+`nanoforge_tokenizers`. The Python tokenizer API exposes `byte-native` and `native-bpe`, which
+use Rust when installed and otherwise fall back to compatible Python implementations. This keeps
+packed datasets and checkpoints compatible while allowing local builds to opt into faster
+parallel batch tokenization and native byte-level BPE.
+
+## CLI orchestration
+
+`nanoforge auto-train` is the high-level workflow command. It inspects input data, trains the
+selected tokenizer, prepares packed data with the right mode and masking, writes a CPU-friendly
+config, and starts training. Lower-level commands remain available for manual workflows:
+`train-tokenizer`, `prepare`, `new-config`, `train`, `chat`, `generate`, and `import`.
 
 ## Model quality strategy
 

@@ -21,14 +21,20 @@ class PackedMemmapDataset:
         meta_path = self.path.with_suffix(self.path.suffix + ".meta")
         dtype = "uint16"
         files = [self.path]
+        self.fixed_sequence_len = 0
         if manifest_path.exists():
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
             dtype = manifest.get("dtype", dtype)
             files = [self.path.parent / name for name in manifest.get("files", [self.path.name])]
+            self.fixed_sequence_len = int(manifest.get("sequence_length", 0) or 0)
         elif meta_path.exists():
             for line in meta_path.read_text(encoding="utf-8").splitlines():
                 if line.startswith("dtype="):
                     dtype = line.split("=", 1)[1].strip()
+        if self.fixed_sequence_len and self.seq_len > self.fixed_sequence_len:
+            raise ValueError(
+                f"Requested seq_len={self.seq_len}, but packed fixed sequence length is {self.fixed_sequence_len}."
+            )
         self.tokens = [np.memmap(file, dtype=np.dtype(dtype), mode="r") for file in files if file.exists()]
         label_manifest_path = self.path.with_name(f"{self.path.stem}.labels.manifest.json")
         self.labels: list[np.memmap] | None = None
@@ -40,7 +46,12 @@ class PackedMemmapDataset:
             if len(labels) == len(self.tokens):
                 self.labels = labels
         self.lengths = np.asarray([len(tokens) for tokens in self.tokens], dtype=np.int64)
-        if self.labels is not None:
+        if self.fixed_sequence_len:
+            valid = self.lengths >= max(self.seq_len, self.fixed_sequence_len)
+            if self.labels is not None:
+                label_lengths = np.asarray([len(labels) for labels in self.labels], dtype=np.int64)
+                valid = valid & (self.lengths == label_lengths)
+        elif self.labels is not None:
             label_lengths = np.asarray([len(labels) for labels in self.labels], dtype=np.int64)
             valid = (self.lengths > seq_len + 1) & (self.lengths == label_lengths)
         else:
@@ -54,16 +65,24 @@ class PackedMemmapDataset:
         self.probs = self.lengths / self.lengths.sum()
 
     def __len__(self) -> int:
+        if self.fixed_sequence_len:
+            return int(sum(len(tokens) // self.fixed_sequence_len for tokens in self.tokens))
         return int(max(1, self.lengths.sum() - self.seq_len - len(self.tokens)))
 
     def sample(self, batch_size: int):
         import torch
 
         shard_ids = np.random.choice(len(self.tokens), size=(batch_size,), p=self.probs)
-        starts = [
-            np.random.randint(0, len(self.tokens[shard]) - self.seq_len - 1)
-            for shard in shard_ids
-        ]
+        if self.fixed_sequence_len:
+            starts = []
+            for shard in shard_ids:
+                n_sequences = max(1, len(self.tokens[shard]) // self.fixed_sequence_len)
+                starts.append(np.random.randint(0, n_sequences) * self.fixed_sequence_len)
+        else:
+            starts = [
+                np.random.randint(0, len(self.tokens[shard]) - self.seq_len - 1)
+                for shard in shard_ids
+            ]
         x = np.stack([self.tokens[shard][i : i + self.seq_len] for shard, i in zip(shard_ids, starts)])
         if self.labels is None:
             y = np.stack([self.tokens[shard][i + 1 : i + 1 + self.seq_len] for shard, i in zip(shard_ids, starts)])
@@ -88,6 +107,7 @@ def build_packed_dataset(
     tokenizer_batch_size: int = 256,
     progress_callback=None,
     text_columns: tuple = (),   
+    seq_len: int | None = None,
 ) -> None:
     _ = jsonl, shuffle_docs
     build_packed_dataset_streaming(
@@ -99,6 +119,7 @@ def build_packed_dataset(
         code_only=code_only,
         text_columns=text_columns, 
         seed=seed,
+        seq_len=seq_len or 512,
         cleaning=CleaningConfig(min_chars=min_chars, deduplicate=True),
         mode=mode,
         loss_masking=loss_masking,
@@ -127,4 +148,5 @@ def prepare_from_config(config_path: str | Path, input_paths: Iterable[str | Pat
         mode=cfg.data.mode,
         loss_masking="assistant_only" if cfg.data.assistant_only_loss else cfg.data.loss_masking,
         tokenizer_batch_size=cfg.data.tokenizer_batch_size,
+        seq_len=cfg.data.seq_len,
     )
