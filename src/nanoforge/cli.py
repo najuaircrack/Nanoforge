@@ -560,6 +560,30 @@ def cmd_auto_train(args: argparse.Namespace) -> None:
         print("[4/4] skipped training (--no-train)")
         return
     print("[4/4] training")
+
+    if args.dashboard:
+        import threading
+        import webbrowser
+
+        from nanoforge.config import load_config
+        from nanoforge.dashboard import serve_dashboard
+        from nanoforge.progress import reset_metric_file
+
+        cfg = load_config(args.config)
+        reset_metric_file(Path(cfg.training.output_dir) / "metrics.jsonl", backup=True)
+        url = f"http://{args.dashboard_host}:{args.dashboard_port}"
+        thread = threading.Thread(
+            target=serve_dashboard,
+            args=(cfg.training.output_dir, args.dashboard_host, args.dashboard_port),
+            daemon=True,
+        )
+        thread.start()
+        print(f"dashboard: {url}")
+        try:
+            webbrowser.open(url)
+        except Exception:
+            pass
+
     from nanoforge.training.trainer import train_from_config
 
     train_from_config(config_path)
@@ -689,6 +713,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--config-out")
     p.add_argument("--no-progress", action="store_true")
     p.add_argument("--no-train", action="store_true", help="Run tokenizer/config/data prep only.")
+    p.add_argument("--dashboard", action="store_true", help="Start the live web dashboard beside training.")
+    p.add_argument("--dashboard-host", default="127.0.0.1")
+    p.add_argument("--dashboard-port", type=int, default=7860)
     p.set_defaults(func=cmd_auto_train)
 
     p = sub.add_parser("import", help="Register an external GGUF, ONNX, SafeTensors, or HuggingFace model.")

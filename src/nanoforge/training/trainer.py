@@ -199,6 +199,7 @@ class Trainer:
 
     def train(self) -> None:
         self.model.train()
+
         best_val = float("inf")
         last_val = float("nan")
         last_ppl = float("nan")
@@ -263,7 +264,7 @@ class Trainer:
                     break
                 last_logits = out.logits.detach()
                 self.scaler.scale(loss).backward()
-                total_loss += float(loss.detach().cpu()) * self.train_cfg.grad_accum_steps
+                total_loss += float(loss.detach().cpu())  # loss is already the per-token mean
             grad_norm_before = 0.0
             grad_norm_after = 0.0
             if skip_step:
