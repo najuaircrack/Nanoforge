@@ -361,19 +361,41 @@ def cmd_generate(args: argparse.Namespace) -> None:
 
 
 def cmd_chat(args: argparse.Namespace) -> None:
+    if args.mode == "balanced":
+        args.mode = "chat"
     engine = _load_generation_engine(args)
+    system = args.system if args.system is not None else _default_system_prompt(engine)
     print("Nanoforge chat. Press Ctrl+C or submit an empty prompt to exit.")
+    if system:
+        print(f"[system] {system}")
     try:
         while True:
             prompt = input("\nuser> ").strip()
             if not prompt:
                 return
             print("assistant> ", end="", flush=True)
-            for chunk in engine.stream(prompt, args.max_new_tokens, _sampling_from_args(args), args.stop_token):
+            # This pipeline packs each assistant turn conditioned on the system
+            # prompt + most recent user turn (see data/modes._chat_prefix), so we
+            # condition inference the same way to match training.
+            for chunk in engine.chat_stream(
+                [("user", prompt)],
+                args.max_new_tokens,
+                _sampling_from_args(args),
+                system=system,
+            ):
                 print(chunk, end="", flush=True)
             print()
     except KeyboardInterrupt:
         print()
+
+
+def _default_system_prompt(engine) -> str | None:
+    cfg = getattr(engine, "config", None)
+    if cfg is not None and getattr(cfg.data, "mode", "") == "chat":
+        # Must match the system prompt the model was trained on exactly, and stay
+        # short: the boundary packer truncates long prefixes (see data/modes).
+        return "You are Nano, Najwan's assistant."
+    return None
 
 
 def _load_generation_engine(args: argparse.Namespace):
@@ -505,8 +527,7 @@ def cmd_auto_train(args: argparse.Namespace) -> None:
 
     print(f"[2/4] preparing data: mode={mode}, loss_masking={loss_masking} -> {packed_dir}")
     tokenizer = load_tokenizer(args.tokenizer, tokenizer_path if args.tokenizer not in {"byte", "byte-native"} else None)
-    progress = None
-   
+
     from tqdm import tqdm
 
     progress = tqdm(desc="prepare", unit="docs", dynamic_ncols=True)
@@ -518,7 +539,6 @@ def cmd_auto_train(args: argparse.Namespace) -> None:
             val=f"{stats.val_tokens:,}",
             shards=stats.shards,
         )
-
 
     build_packed_dataset(
         input_paths,
@@ -535,8 +555,7 @@ def cmd_auto_train(args: argparse.Namespace) -> None:
         seq_len=args.seq_len,
     )
 
-    if progress is not None:
-        progress.close()
+    progress.close()
 
     print(f"[3/4] writing config: {config_path}")
     config_path.parent.mkdir(parents=True, exist_ok=True)
@@ -569,7 +588,7 @@ def cmd_auto_train(args: argparse.Namespace) -> None:
         from nanoforge.dashboard import serve_dashboard
         from nanoforge.progress import reset_metric_file
 
-        cfg = load_config(args.config)
+        cfg = load_config(config_path)
         reset_metric_file(Path(cfg.training.output_dir) / "metrics.jsonl", backup=True)
         url = f"http://{args.dashboard_host}:{args.dashboard_port}"
         thread = threading.Thread(
@@ -735,7 +754,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--text-column", action="append", help="Structured text column to train on. Can be repeated.")
     p.add_argument("--max-records", type=int)
     p.add_argument("--dry-run", action="store_true", help="Scan and report training corpus health without fitting.")
-    p.add_argument("--no-progress", action="store_true", help="Disable the merge progress bar.")  # ← ADD THIS
+    p.add_argument("--no-progress", action="store_true", help="Disable the merge progress bar.")
     p.set_defaults(func=cmd_train_tokenizer)
 
     p = sub.add_parser("prepare", help="Pack raw text/code/JSONL into train.bin and val.bin.")
@@ -887,6 +906,7 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--repetition-window", type=int, default=64)
         p.add_argument("--repetition-threshold", type=float, default=0.85)
         p.add_argument("--stop-token", action="append")
+        p.add_argument("--system", default=None, help="System prompt for chat mode (overrides the default).")
         p.add_argument("--mirostat", action="store_true")
         p.add_argument("--beams", type=int, default=1)
         p.set_defaults(func=func)

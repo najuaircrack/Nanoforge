@@ -29,10 +29,12 @@ class GenerationEngine:
         model: NanoforgeForCausalLM,
         tokenizer: TokenizerAdapter,
         device: str | torch.device = "auto",
+        config: NanoforgeConfig | None = None,
     ):
         self.device = resolve_device(str(device))
         self.model = model.to(self.device).eval()
         self.tokenizer = tokenizer
+        self.config = config
         self.prefix_cache: dict[tuple[int, ...], PrefixCacheEntry] = {}
 
     @classmethod
@@ -52,14 +54,14 @@ class GenerationEngine:
         tok_type = tokenizer_type or cfg.data.tokenizer_type
         tok_path = tokenizer_path or cfg.data.tokenizer_path
         tokenizer = load_tokenizer(tok_type, tok_path)
-        return cls(model, tokenizer, device=device)
+        return cls(model, tokenizer, device=device, config=cfg)
 
     @classmethod
     def from_config(cls, config_path: str | Path, device: str = "auto") -> "GenerationEngine":
         cfg: NanoforgeConfig = load_config(config_path)
         model = NanoforgeForCausalLM(cfg.model)
         tokenizer = load_tokenizer(cfg.data.tokenizer_type, cfg.data.tokenizer_path)
-        return cls(model, tokenizer, device=device)
+        return cls(model, tokenizer, device=device, config=cfg)
 
     @torch.inference_mode()
     def generate_ids(
@@ -102,10 +104,20 @@ class GenerationEngine:
             else:
                 out = self.model(ids[:, -1:], caches=caches, use_cache=True)
             caches = out.caches
-            token = sample_next(out.logits, ids[0], sampling, miro)
+            # Penalties (repetition / frequency / no-repeat-ngram) must only see
+            # tokens the model generated, not the prompt. Feeding the prompt as
+            # history makes byte-level greedy decoding ban common characters that
+            # already appear in the system/user text, producing garbled output.
+            history = ids[0, len(input_ids):]
+            token = sample_next(out.logits, history, sampling, miro)
             next_id = int(token.item())
             ids = torch.cat([ids, token], dim=1)
             if (eos_id is not None and next_id == eos_id) or (stop_ids is not None and next_id in stop_ids):
+                # Flush any tokens buffered for stop-sequence matching before
+                # stopping, otherwise the last ~max_stop_len tokens are dropped.
+                for item in pending:
+                    emitted.append(item)
+                    yield item
                 break
             pending.append(next_id)
             matched = _matched_stop_sequence(pending, stop_sequences)
@@ -169,6 +181,37 @@ class GenerationEngine:
         return "".join(
             self.stream(prompt, max_new_tokens=max_new_tokens, sampling=sampling, stop_tokens=stop_tokens)
         )
+
+    @staticmethod
+    def build_chat_prompt(
+        messages: list[tuple[str, str]],
+        system: str | None = None,
+    ) -> str:
+        """Render a role-marked prompt ending in an open assistant turn.
+
+        Matches the training format produced by the chat data pipeline
+        (``<|system|>`` / ``<|user|>`` / ``<|assistant|>`` markers), so a
+        chat-trained model continues as the assistant.
+        """
+        parts: list[str] = []
+        if system:
+            parts.append(f"<|system|>\n{system}\n")
+        for role, content in messages:
+            parts.append(f"<|{role}|>\n{content}\n")
+        parts.append("<|assistant|>\n")
+        return "".join(parts)
+
+    def chat_stream(
+        self,
+        messages: list[tuple[str, str]],
+        max_new_tokens: int = 256,
+        sampling: SamplingConfig | None = None,
+        system: str | None = None,
+    ) -> Iterator[str]:
+        """Stream an assistant reply for a role-tagged conversation history."""
+        sampling = sampling or SamplingConfig(mode="chat")
+        prompt = self.build_chat_prompt(messages, system=system)
+        yield from self.stream(prompt, max_new_tokens=max_new_tokens, sampling=sampling)
 
     async def astream(
         self,

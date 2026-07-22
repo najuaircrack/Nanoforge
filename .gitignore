@@ -1,4 +1,3 @@
-```gitignore id="n8v2qx"
 # Python
 __pycache__/
 *.py[cod]
@@ -16,6 +15,7 @@ build/
 dist/
 *.egg-info/
 .eggs/
+native/**/target/
 
 # IDEs
 .vscode/
@@ -24,12 +24,9 @@ dist/
 # OS files
 .DS_Store
 Thumbs.db
-native/**/target/
+
 # Logs
 *.log
-
-# TensorBoard
-runs/**/events.out.tfevents.*
 
 # Training outputs
 runs/
@@ -45,21 +42,24 @@ outputs/
 *.onnx
 *.gguf
 
-# Large datasets
+# Datasets and tokenizers
 data/raw/
 data/packed/
 data/chat/
-
-# Tokenizers
 data/tokenizers/
+
+# Imported model registry / scratch
+models/
+backup/
 
 # Reports
 reports/
 
-# Cache
+# Caches
 .cache/
 .pytest_cache/
 .mypy_cache/
+.ruff_cache/
 
 # Jupyter
 .ipynb_checkpoints/
@@ -68,14 +68,15 @@ reports/
 hf_cache/
 huggingface/
 
-# Temporary files
+# Temporary / scratch files
 tmp/
 temp/
 *.tmp
+nextupdate.txt
 
 # Metrics / dashboards
 metrics.jsonl
-nextupdate.txt
+
 # WandB
 wandb/
 
@@ -92,4 +93,3 @@ generated/
 # Environment variables
 .env
 .env.local
-```

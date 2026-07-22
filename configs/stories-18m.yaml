@@ -1,0 +1,84 @@
+model:
+  vocab_size: 8000
+  max_seq_len: 1024
+  d_model: 256
+  n_layers: 4
+  n_heads: 4
+  n_kv_heads: 2
+  ffn_hidden_mult: 2.67
+  dropout: 0.0
+  rope_theta: 500000.0
+  norm_eps: 1.0e-5
+  tie_embeddings: true
+  use_flash: false
+  activation: swiglu
+  block_type: transformer
+  attention_backend: sdpa
+  normalization: rmsnorm
+  position_embedding: rope
+  quantization_backend: none
+
+training:
+  mode: generative
+  run_name: stories-18m
+  output_dir: runs/stories-18m
+  seed: 1337
+  max_steps: 50000
+  batch_size: 8
+  micro_batch_size: 1
+  grad_accum_steps: 8
+  learning_rate: 1.0e-4
+  min_learning_rate: 1.0e-5
+  resume_from_checkpoint: runs/stories-18m/best.pt
+  warmup_ratio: 0.10
+  optimizer: adamw
+  scheduler: cosine
+  weight_decay: 0.1
+  betas: [0.9, 0.95]
+  eps: 1.0e-8
+  grad_clip: 1.0
+  precision: fp32
+  gradient_checkpointing: false
+  eval_interval: 500
+  eval_steps: 20
+  save_interval: 500
+  early_stopping_patience: 15
+  log_interval: 10
+  health_interval: 10
+  low_memory: false
+  tensorboard: true
+  wandb: false
+  distributed_backend: none
+
+data:
+  train_path: data/packed/stories-18m/train.bin
+  val_path: data/packed/stories-18m/val.bin
+  tokenizer_type: native-bpe
+  tokenizer_path: data/tokenizers/stories-18m-bpe.json
+  seq_len: 1024
+  mode: generative
+  loss_masking: none
+  assistant_only_loss: false
+  tokenizer_batch_size: 128
+  num_workers: 0
+  pin_memory: false
+
+inference:
+  mode: creative
+  max_new_tokens: 128
+  temperature: 0.9
+  top_k: 40
+  top_p: 0.95
+  min_p: 0.05
+  repetition_penalty: 1.1
+  frequency_penalty: 0.1
+  presence_penalty: 0.0
+  no_repeat_ngram_size: 4
+  stop_on_repetition: true
+  repetition_window: 64
+  repetition_threshold: 0.85
+  deterministic: false
+  mirostat: false
+
+# Prepare example:
+# nanoforge prepare --input data/raw --tokenizer native-bpe --tokenizer-path data/tokenizers/stories-18m-bpe.json --mode generative --loss-masking none --text-column text --seq-len 1024 --out data/packed/stories-18m
