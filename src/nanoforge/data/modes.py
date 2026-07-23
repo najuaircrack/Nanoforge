@@ -6,7 +6,6 @@ from dataclasses import dataclass
 from nanoforge.data.formats import DatasetRecord
 from nanoforge.data.tokenizer import TokenizerLike
 
-
 ROLE_RE = re.compile(r"(<\|(system|user|assistant|tool)\|>\s*)")
 CODE_SUFFIXES = {".py", ".js", ".ts", ".tsx", ".jsx", ".rs", ".c", ".cpp", ".h", ".hpp", ".go", ".java"}
 

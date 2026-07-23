@@ -5,7 +5,6 @@ from dataclasses import dataclass, field
 from importlib import import_module, metadata
 from typing import Any, Generic, TypeVar
 
-
 T = TypeVar("T")
 
 

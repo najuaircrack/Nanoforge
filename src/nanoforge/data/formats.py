@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import csv
 import hashlib
 import io
@@ -8,7 +9,6 @@ import sqlite3
 import tarfile
 import unicodedata
 import zipfile
-import ast
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Iterator
@@ -16,7 +16,6 @@ from urllib.request import Request, urlopen
 from xml.etree import ElementTree
 
 from nanoforge.data.preprocess import CODE_EXTENSIONS, normalize_text
-
 
 TEXT_EXTENSIONS = {".txt", ".text", ".md", ".markdown", ".rst", ".log"}
 STRUCTURED_EXTENSIONS = {".json", ".jsonl", ".csv", ".tsv", ".yaml", ".yml", ".xml", ".sqlite", ".db"}
@@ -292,6 +291,16 @@ def _extract_text_from_row(
             return f"<|user|>\n{prompt}\n<|assistant|>\n{response}" if response else prompt
         if "prompt" in row and any(key in row for key in ("completion", "response")):
             return "\n".join(_coerce_cell(row[key]) for key in ("prompt", "completion", "response") if row.get(key))
+        turn_field = _best_turn_field(row)
+        if turn_field is not None:
+            turns = row[turn_field]
+            formatted = (
+                _format_alternating(turns)
+                if all(isinstance(v, str) for v in turns)
+                else _format_messages(turns)
+            )
+            if formatted.strip():
+                return formatted
         key = _best_text_key(row, text_key)
         if key is not None:
             return _coerce_cell(row[key])
@@ -330,6 +339,40 @@ def _best_text_key(row: dict[str, Any], text_key: str) -> str | None:
     return best[1] if best else None
 
 
+def _is_role_dict(item: Any) -> bool:
+    """A message-like dict, e.g. {"role": "user", "content": "..."} or ShareGPT {"from","value"}."""
+    if not isinstance(item, dict):
+        return False
+    has_role = any(k in item for k in ("role", "from", "speaker"))
+    has_text = any(k in item for k in ("content", "value", "text", "message"))
+    return has_role and has_text
+
+
+def _looks_like_turn_list(value: Any) -> bool:
+    """True for a conversation held in a bare list — either alternating strings
+    (UltraChat ``{"id","data":[...]}``) or a list of role dicts (ShareGPT/OpenAI)."""
+    if not isinstance(value, (list, tuple)) or len(value) < 2:
+        return False
+    strings = [v for v in value if isinstance(v, str) and v.strip()]
+    if len(strings) == len(value) and len(strings) >= 2:
+        # A list of non-trivial strings; guard against short tag/label lists.
+        return sum(len(s) for s in strings) >= 40
+    return all(_is_role_dict(v) for v in value)
+
+
+def _best_turn_field(row: dict[str, Any]) -> str | None:
+    """Pick the list-valued field that best represents a conversation."""
+    best: tuple[int, str] | None = None
+    for key, value in row.items():
+        if not _looks_like_turn_list(value):
+            continue
+        size = sum(len(_coerce_cell(v)) for v in value)
+        candidate = (size, str(key))
+        if best is None or candidate > best:
+            best = candidate
+    return best[1] if best else None
+
+
 def _infer_row_mode(row: Any) -> str:
     if not isinstance(row, dict):
         return "generative"
@@ -342,7 +385,24 @@ def _infer_row_mode(row: Any) -> str:
         return "completion"
     if "code" in keys:
         return "code"
+    # Value-based fallback: a conversation may live in an arbitrarily named list
+    # field (UltraChat "data", "turns", "dialog", ...). Detect by shape, not name.
+    if _best_turn_field(row) is not None:
+        return "chat"
     return "generative"
+
+
+def _format_alternating(turns: Any) -> str:
+    """Format a bare list of strings as alternating user/assistant turns.
+    Even index = user, odd index = assistant (UltraChat convention)."""
+    parts = []
+    for idx, turn in enumerate(turns):
+        text = _coerce_cell(turn).strip()
+        if not text:
+            continue
+        role = "user" if idx % 2 == 0 else "assistant"
+        parts.append(f"<|{role}|>\n{text}")
+    return "\n".join(parts)
 
 
 def _format_messages(messages: Any) -> str:
@@ -548,8 +608,8 @@ def _iter_arrow_like(
     batch_size: int = 1024,
 ) -> Iterator[DatasetRecord]:
     try:
-        import pyarrow.parquet as pq
         import pyarrow.ipc as ipc
+        import pyarrow.parquet as pq
     except Exception:
         stats.issues.append(DatasetIssue(str(path), f"Install pyarrow to read {fmt} datasets."))
         return

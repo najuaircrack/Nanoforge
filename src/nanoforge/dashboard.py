@@ -17,7 +17,6 @@ Usage:
 from __future__ import annotations
 
 import collections
-import time
 from pathlib import Path
 
 from nanoforge.progress import json_safe, read_jsonl_tail
@@ -1101,13 +1100,18 @@ def _load_engine_compat(path: str):
         if "dict config" in msg or "dict" in msg.lower():
             # Old checkpoint with raw dict config — try manual reconstruction
             try:
-                import torch
-                from nanoforge.training.checkpoint import load_checkpoint
-                from nanoforge.config import NanoforgeConfig, ModelConfig, TrainConfig, DataConfig, InferenceConfig
-                from nanoforge.model.transformer import NanoforgeForCausalLM
+                from nanoforge.config import (
+                    DataConfig,
+                    InferenceConfig,
+                    ModelConfig,
+                    NanoforgeConfig,
+                    TrainConfig,
+                )
                 from nanoforge.data.tokenizer import load_tokenizer
-                from nanoforge.training.utils import resolve_device
                 from nanoforge.generation.engine import GenerationEngine
+                from nanoforge.model.transformer import NanoforgeForCausalLM
+                from nanoforge.training.checkpoint import load_checkpoint
+                from nanoforge.training.utils import resolve_device
 
                 payload = load_checkpoint(path, map_location="cpu")
                 raw_cfg = payload["config"]
@@ -1155,7 +1159,6 @@ def create_dashboard_app(run_dir):
             "Install serve extras to use dashboard: pip install -e .[serve]"
         ) from exc
 
-    import json as _json
 
     run_path = Path(run_dir)
     metrics_path = run_path / "metrics.jsonl"

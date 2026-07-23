@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import signal
 import time
 from pathlib import Path
 
@@ -11,6 +12,7 @@ from nanoforge.config import NanoforgeConfig, load_config
 from nanoforge.data.dataset import PackedMemmapDataset, make_torch_batch
 from nanoforge.data.tokenizer import load_tokenizer
 from nanoforge.generation.sampling import SamplingConfig
+from nanoforge.logging_utils import get_logger
 from nanoforge.model.transformer import NanoforgeForCausalLM
 from nanoforge.profiling import estimate_model_profile
 from nanoforge.progress import JsonlMetricLogger
@@ -200,6 +202,28 @@ class Trainer:
     def train(self) -> None:
         self.model.train()
 
+        logger = get_logger("training.trainer")
+        self._stop_requested = False
+
+        def _request_stop(signum, frame):  # noqa: ANN001
+            # Second signal escalates to the default (hard) behavior.
+            if self._stop_requested:
+                signal.signal(signum, signal.SIG_DFL)
+                return
+            self._stop_requested = True
+            logger.warning("stop requested (signal %s); will checkpoint and exit after this step", signum)
+
+        previous_handlers: list[tuple[int, object]] = []
+        for sig in (getattr(signal, "SIGINT", None), getattr(signal, "SIGTERM", None)):
+            if sig is None:
+                continue
+            try:
+                previous_handlers.append((sig, signal.getsignal(sig)))
+                signal.signal(sig, _request_stop)
+            except (ValueError, OSError):
+                # Not on the main thread (e.g. under a dashboard thread) — skip.
+                pass
+
         best_val = float("inf")
         last_val = float("nan")
         last_ppl = float("nan")
@@ -243,7 +267,23 @@ class Trainer:
             0,
             event="start",
         )
+        interrupted = False
+        last_step = self.start_step
         for step in pbar:
+            last_step = step
+            if self._stop_requested:
+                interrupted = True
+                logger.warning("saving interrupt checkpoint at step %s", step)
+                self.checkpoints.save(
+                    self.output_dir / "interrupt.pt",
+                    self.model,
+                    self.optimizer,
+                    self.config,
+                    step,
+                    None,
+                    self.ema.state_dict() if self.ema else None,
+                )
+                break
             step_t0 = time.time()
             lr = scheduler(step)
             for group in self.optimizer.param_groups:
@@ -376,17 +416,30 @@ class Trainer:
             if self.train_cfg.sample_interval > 0 and step > 0 and step % self.train_cfg.sample_interval == 0:
                 self._log(self.generate_sample(step), step, event="sample")
 
-        self.checkpoints.save(
-            self.output_dir / "last.pt",
-            self.model,
-            self.optimizer,
-            self.config,
-            self.train_cfg.max_steps,
-            None,
-            self.ema.state_dict() if self.ema else None,
-        )
+        final_step = last_step if interrupted else self.train_cfg.max_steps
+        if not interrupted:
+            self.checkpoints.save(
+                self.output_dir / "last.pt",
+                self.model,
+                self.optimizer,
+                self.config,
+                self.train_cfg.max_steps,
+                None,
+                self.ema.state_dict() if self.ema else None,
+            )
         self.checkpoints.close()
-        self._log({"train/final_step": self.train_cfg.max_steps, "val/best_loss": best_val}, self.train_cfg.max_steps, event="done")
+        for sig, handler in previous_handlers:
+            try:
+                signal.signal(sig, handler)
+            except (ValueError, OSError):
+                pass
+        self._log(
+            {"train/final_step": final_step, "val/best_loss": best_val},
+            final_step,
+            event="interrupted" if interrupted else "done",
+        )
+        if interrupted:
+            logger.warning("training interrupted at step %s; checkpoint saved to interrupt.pt", final_step)
 
 
 def train_from_config(path: str | Path) -> None:

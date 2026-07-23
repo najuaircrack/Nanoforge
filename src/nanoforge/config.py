@@ -4,6 +4,7 @@ from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Any
 
+from nanoforge.logging_utils import get_logger
 from nanoforge.registry import validate_registry_key
 
 
@@ -176,6 +177,14 @@ class NanoforgeConfig:
 
 def _dataclass_from_dict(cls: type, data: dict[str, Any]):
     names = {f.name for f in fields(cls)}
+    unknown = [k for k in data if k not in names]
+    if unknown:
+        logger = get_logger(__name__)
+        logger.warning(
+            "config section %s ignored unknown key(s): %s",
+            cls.__name__,
+            ", ".join(sorted(unknown)),
+        )
     return cls(**{k: v for k, v in data.items() if k in names})
 
 

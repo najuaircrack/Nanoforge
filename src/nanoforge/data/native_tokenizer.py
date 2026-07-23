@@ -179,7 +179,7 @@ class NativeBPETokenizer:
             self._native.save(str(path))
         else:
             self._fallback.save(path)
-            
+
 def train_native_bpe_from_texts(
     texts: Iterable[str],
     out_path: str | Path,
@@ -218,7 +218,8 @@ def train_native_bpe_from_texts(
             pass  # tqdm not installed, train silently
 
     try:
-        import tempfile, os
+        import os
+        import tempfile
         with tempfile.NamedTemporaryFile(
             mode="w", encoding="utf-8", suffix=".txt", delete=False
         ) as tmp:

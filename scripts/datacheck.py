@@ -19,7 +19,6 @@ import math
 import sys
 from pathlib import Path
 
-import numpy as np
 import torch
 
 # ── allow running from project root without install ──────────────────────────
@@ -117,11 +116,11 @@ def check_dataset(cfg, tok, split="train", n_samples=200):
 
     if ds.labels is not None:
         ok(f"label arrays found ({len(ds.labels)} shards)")
-        for i, (t, l) in enumerate(zip(ds.tokens, ds.labels)):
-            if len(t) != len(l):
-                fail(f"  shard {i}: token len {len(t)} ≠ label len {len(l)}")
+        for i, (tok, lab) in enumerate(zip(ds.tokens, ds.labels)):
+            if len(tok) != len(lab):
+                fail(f"  shard {i}: token len {len(tok)} ≠ label len {len(lab)}")
             else:
-                ok(f"  shard {i}: token/label lengths match ({len(t)})")
+                ok(f"  shard {i}: token/label lengths match ({len(tok)})")
     else:
         warn("No label arrays — labels will be auto-shifted input_ids (no masking).")
 
@@ -143,12 +142,12 @@ def check_dataset(cfg, tok, split="train", n_samples=200):
 
     if mask_rate == 0.0:
         fail(
-            f"Unmasked token rate = 0%  ← THIS IS YOUR BUG.\n"
-            f"     Every label is -100. The model computes zero loss, "
-            f"gradients are garbage.\n"
-            f"     Your packed data has no assistant tokens or the label\n"
-            f"     file is all -100. Re-run `nanoforge prepare` with\n"
-            f"     --mode chat --loss-masking assistant_only."
+            "Unmasked token rate = 0%  ← THIS IS YOUR BUG.\n"
+            "     Every label is -100. The model computes zero loss, "
+            "gradients are garbage.\n"
+            "     Your packed data has no assistant tokens or the label\n"
+            "     file is all -100. Re-run `nanoforge prepare` with\n"
+            "     --mode chat --loss-masking assistant_only."
         )
     elif mask_rate < 0.05:
         warn(
@@ -226,7 +225,7 @@ def check_model_loss(cfg, ds):
     mean_std     = sum(logit_stds) / len(logit_stds)
     mean_unmasked = sum(unmasked_counts) / len(unmasked_counts)
 
-    print(f"\n  Results over 10 forward passes:")
+    print("\n  Results over 10 forward passes:")
     print(f"    mean loss        = {mean_loss:.4f}  (expected ≈ {expected:.4f})")
     print(f"    mean logit std   = {mean_std:.4f}  (expected ≈ 1–3; >10 is bad)")
     print(f"    mean unmasked/batch = {mean_unmasked:.1f} / {cfg.data.seq_len}")
@@ -287,7 +286,7 @@ def main():
     args = parser.parse_args()
 
     print(f"\n{'═'*70}")
-    print(f"  nanoforge data diagnostic")
+    print("  nanoforge data diagnostic")
     print(f"  config: {args.config}")
     print(f"{'═'*70}")
 

@@ -10,7 +10,12 @@ from typing import Callable, Iterable, Iterator
 
 from nanoforge.data.cleaning import CleaningConfig, clean_records
 from nanoforge.data.formats import DatasetRecord, DatasetStats, iter_dataset_records
-from nanoforge.data.modes import encode_training_record, encode_training_sequences, infer_record_mode, resolve_loss_masking
+from nanoforge.data.modes import (
+    encode_training_record,
+    encode_training_sequences,
+    infer_record_mode,
+    resolve_loss_masking,
+)
 from nanoforge.data.native_tokenizer import encode_batch
 from nanoforge.data.tokenizer import TokenizerLike
 

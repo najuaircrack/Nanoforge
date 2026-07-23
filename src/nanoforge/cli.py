@@ -43,8 +43,8 @@ def cmd_validate_config(args: argparse.Namespace) -> None:
 
 
 def cmd_train_tokenizer(args: argparse.Namespace) -> None:
-    from dataclasses import asdict
     import json
+    from dataclasses import asdict
 
     from nanoforge.data.tokenizer import (
         train_bpe_tokenizer,
@@ -196,6 +196,26 @@ def cmd_validate_dataset(args: argparse.Namespace) -> None:
         raise SystemExit(1)
 
 
+def cmd_profile_dataset(args: argparse.Namespace) -> None:
+    import json
+
+    from nanoforge.data.profiler import profile_dataset
+
+    profile = profile_dataset(_paths(args.input), text_key=args.text_key, limit=args.limit)
+    if args.json:
+        print(json.dumps(profile.to_dict(), indent=2, ensure_ascii=False))
+        return
+    print(profile.summary_line())
+    print(f"recommended_text_columns: {list(profile.recommended_text_columns)}")
+    print(f"recommended_loss_masking: {profile.recommended_loss_masking}")
+    print(f"turn_field: {profile.turn_field}")
+    print(f"role_style: {profile.role_style}")
+    print(f"mode_votes: {profile.mode_votes}")
+    print(f"fields: {profile.fields}")
+    for note in profile.notes:
+        print(f"note: {note}")
+
+
 def cmd_clean_dataset(args: argparse.Namespace) -> None:
     import json
 
@@ -250,8 +270,8 @@ def cmd_convert_dataset(args: argparse.Namespace) -> None:
 
 
 def cmd_tokenizer_report(args: argparse.Namespace) -> None:
-    from dataclasses import asdict
     import json
+    from dataclasses import asdict
 
     from nanoforge.data.tokenizer import load_tokenizer
     from nanoforge.data.tokenizer_metrics import evaluate_tokenizer, save_tokenizer_report
@@ -264,8 +284,8 @@ def cmd_tokenizer_report(args: argparse.Namespace) -> None:
 
 
 def cmd_tokenizer_status(args: argparse.Namespace) -> None:
-    from dataclasses import asdict
     import json
+    from dataclasses import asdict
 
     from nanoforge.data.native_tokenizer import native_tokenizer_status
 
@@ -274,8 +294,8 @@ def cmd_tokenizer_status(args: argparse.Namespace) -> None:
 
 
 def cmd_benchmark_tokenizer(args: argparse.Namespace) -> None:
-    from dataclasses import asdict
     import json
+    from dataclasses import asdict
 
     from nanoforge.data.tokenizer import load_tokenizer
     from nanoforge.data.tokenizer_benchmark import benchmark_tokenizer
@@ -429,7 +449,6 @@ def cmd_new_config(args: argparse.Namespace) -> None:
 
 def cmd_auto_train(args: argparse.Namespace) -> None:
     from nanoforge.data.dataset import build_packed_dataset
-    from nanoforge.data.formats import inspect_dataset
     from nanoforge.data.tokenizer import (
         load_tokenizer,
         train_bpe_tokenizer,
@@ -444,18 +463,15 @@ def cmd_auto_train(args: argparse.Namespace) -> None:
     text_columns = tuple(args.text_column or ())
     mode = args.mode
     if mode == "auto":
-        inspected = inspect_dataset(input_paths, text_key=args.text_key, limit=args.inspect_limit)
-        fields = {field.lower() for field in inspected.fields}
-        if {"messages", "conversations"} & fields or any("messages" in cols for cols in inspected.text_columns.values()):
-            mode = "chat"
-        elif {"instruction", "output", "response"} <= fields or ("instruction" in fields and {"output", "response"} & fields):
-            mode = "instruct"
-        elif "code" in fields:
-            mode = "code"
-        else:
-            mode = "generative"
-        if not text_columns and mode == "chat":
-            text_columns = ("messages",)
+        from nanoforge.data.profiler import profile_dataset
+
+        profile = profile_dataset(input_paths, text_key=args.text_key, limit=args.inspect_limit)
+        print(f"[0/4] inspecting dataset: {profile.summary_line()}")
+        for note in profile.notes:
+            print(f"       note: {note}")
+        mode = profile.detected_mode
+        if not text_columns and profile.recommended_text_columns:
+            text_columns = profile.recommended_text_columns
     loss_masking = args.loss_masking
     if loss_masking == "auto":
         loss_masking = "assistant_only" if mode == "chat" else "completion_only" if mode == "instruct" else "none"
@@ -637,8 +653,8 @@ def cmd_benchmark(args: argparse.Namespace) -> None:
 
 
 def cmd_profile_config(args: argparse.Namespace) -> None:
-    from dataclasses import asdict
     import json
+    from dataclasses import asdict
 
     from nanoforge.config import load_config
     from nanoforge.profiling import estimate_model_profile
@@ -798,6 +814,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--text-key", default="text")
     p.add_argument("--limit", type=int, default=1000)
     p.set_defaults(func=cmd_validate_dataset)
+
+    p = sub.add_parser("profile-dataset", help="Detect mode, text columns, and loss masking by inspecting structure.")
+    p.add_argument("--input", nargs="+", required=True)
+    p.add_argument("--text-key", default="text")
+    p.add_argument("--limit", type=int, default=200)
+    p.add_argument("--json", action="store_true", help="Emit the full profile as JSON.")
+    p.set_defaults(func=cmd_profile_dataset)
 
     p = sub.add_parser("clean-dataset", help="Clean, normalize, and deduplicate inputs into JSONL.")
     p.add_argument("--input", nargs="+", required=True)

@@ -48,6 +48,11 @@ data/packed/
 data/chat/
 data/tokenizers/
 
+# ...but keep the small committed demo sample
+!data/demo/
+!data/demo/*.jsonl
+!data/demo/*.md
+
 # Imported model registry / scratch
 models/
 backup/

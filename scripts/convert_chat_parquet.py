@@ -1,5 +1,6 @@
 
 from pathlib import Path
+
 import pandas as pd
 
 INPUT_DIR = Path("data/raw")

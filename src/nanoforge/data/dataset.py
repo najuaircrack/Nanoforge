@@ -1,8 +1,8 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Iterable
-import json
 
 import numpy as np
 
@@ -106,7 +106,7 @@ def build_packed_dataset(
     loss_masking: str = "auto",
     tokenizer_batch_size: int = 256,
     progress_callback=None,
-    text_columns: tuple = (),   
+    text_columns: tuple = (),
     seq_len: int | None = None,
 ) -> None:
     _ = jsonl, shuffle_docs
@@ -117,7 +117,7 @@ def build_packed_dataset(
         val_fraction=val_fraction,
         text_key=jsonl_text_key,
         code_only=code_only,
-        text_columns=text_columns, 
+        text_columns=text_columns,
         seed=seed,
         seq_len=seq_len or 512,
         cleaning=CleaningConfig(min_chars=min_chars, deduplicate=True),

@@ -4,12 +4,15 @@ import json
 
 import pytest
 
-from nanoforge.data.formats import detect_format, inspect_dataset, iter_dataset_records
 from nanoforge.data.dataset import PackedMemmapDataset
+from nanoforge.data.formats import detect_format, inspect_dataset, iter_dataset_records
 from nanoforge.data.modes import encode_training_record
 from nanoforge.data.packing import build_packed_dataset_streaming
-from nanoforge.data.tokenizer import ByteTokenizer
-from nanoforge.data.tokenizer import iter_tokenizer_training_texts, train_bpe_tokenizer
+from nanoforge.data.tokenizer import (
+    ByteTokenizer,
+    iter_tokenizer_training_texts,
+    train_bpe_tokenizer,
+)
 from nanoforge.data.tokenizer_metrics import evaluate_tokenizer
 
 

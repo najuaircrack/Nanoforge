@@ -14,7 +14,6 @@ import torch
 from nanoforge.config import NanoforgeConfig, save_config
 from nanoforge.registry import registry_snapshot
 
-
 CHECKPOINT_SCHEMA_VERSION = 2
 
 

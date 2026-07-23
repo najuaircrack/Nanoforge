@@ -8,7 +8,12 @@ from pathlib import Path
 from typing import Iterable, Protocol
 
 from nanoforge.data.formats import DatasetStats, iter_dataset_records
-from nanoforge.data.native_tokenizer import NativeBPETokenizer, NativeByteTokenizer, train_native_bpe_from_texts
+from nanoforge.data.native_tokenizer import (
+    NativeBPETokenizer,
+    NativeByteTokenizer,
+    train_native_bpe_from_texts,
+)
+
 
 class TokenizerLike(Protocol):
     bos_id: int
@@ -293,7 +298,7 @@ def train_bpe_tokenizer(
         return report
     try:
         from tokenizers import Tokenizer, decoders, models, pre_tokenizers, processors, trainers
-    except Exception as exc:
+    except Exception:
         return train_python_bpe_tokenizer(
             files,
             out_path,
@@ -388,7 +393,7 @@ def train_native_bpe_tokenizer(
     dry_run: bool = False,
     max_records: int | None = None,
     require_native: bool = False,
-    show_progress: bool = True, 
+    show_progress: bool = True,
 ) -> TokenizerTrainingReport:
     files = list(files)
     stats = DatasetStats()

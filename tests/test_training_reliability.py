@@ -4,7 +4,6 @@ import importlib.util
 
 import pytest
 
-
 pytestmark = pytest.mark.skipif(importlib.util.find_spec("torch") is None, reason="torch not installed")
 
 

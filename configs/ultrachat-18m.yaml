@@ -30,8 +30,8 @@ model:
 training:
   mode: chat
 
-  run_name: ultrachat-100m
-  output_dir: runs/ultrachat-100m
+  run_name: ultrachat-18m
+  output_dir: runs/ultrachat-18m
 
   seed: 1337
 
@@ -78,11 +78,11 @@ training:
   distributed_backend: none
 
 data:
-  train_path: data/packed/ultrachat-100m-sft/train.bin
-  val_path: data/packed/ultrachat-100m-sft/val.bin
+  train_path: data/packed/ultrachat-18m/train.bin
+  val_path: data/packed/ultrachat-18m/val.bin
 
   tokenizer_type: native-bpe
-  tokenizer_path: data/tokenizers/ultrachat-32k.json
+  tokenizer_path: data/tokenizers/ultrachat-18m-bpe.json
 
   seq_len: 2048
 
