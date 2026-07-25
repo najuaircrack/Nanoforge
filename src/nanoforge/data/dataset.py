@@ -97,10 +97,8 @@ def build_packed_dataset(
     tokenizer: TokenizerLike,
     val_fraction: float = 0.01,
     code_only: bool = False,
-    jsonl: bool = False,
     jsonl_text_key: str = "text",
     min_chars: int = 16,
-    shuffle_docs: bool = True,
     seed: int = 1337,
     mode: str = "auto",
     loss_masking: str = "auto",
@@ -109,7 +107,6 @@ def build_packed_dataset(
     text_columns: tuple = (),
     seq_len: int | None = None,
 ) -> None:
-    _ = jsonl, shuffle_docs
     build_packed_dataset_streaming(
         input_paths,
         out_dir,

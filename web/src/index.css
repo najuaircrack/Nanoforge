@@ -1,0 +1,131 @@
+@import "tailwindcss";
+
+/* ============================================================
+   Nanoforge — dark-tech design system
+   One theme (dark), one accent (indigo), one radius scale.
+   ============================================================ */
+
+@theme {
+  --font-sans: "Geist", "Inter Tight", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-mono: "Geist Mono", "JetBrains Mono", ui-monospace, "SFMono-Regular", monospace;
+
+  --color-bg: #0a0b0e;
+  --color-surface: #101217;
+  --color-surface-2: #161922;
+  --color-surface-3: #1e222d;
+  --color-line: #23272f;
+  --color-line-2: #313743;
+
+  --color-ink: #e8ebf2;
+  --color-ink-2: #9aa3b2;
+  --color-ink-3: #5b6472;
+
+  --color-accent: #6d8bff;
+  --color-accent-ink: #0a0b0e;
+
+  --color-pos: #3ecf8e;
+  --color-warn: #f5b750;
+  --color-neg: #f2726b;
+
+  --radius-ui: 10px;
+}
+
+:root {
+  color-scheme: dark;
+}
+
+* { box-sizing: border-box; }
+html, body, #root { height: 100%; }
+
+body {
+  margin: 0;
+  background: var(--color-bg);
+  color: var(--color-ink);
+  font-family: var(--font-sans);
+  font-feature-settings: "cv02", "cv03", "cv04", "cv11";
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+/* Scrollbars ------------------------------------------------ */
+::-webkit-scrollbar { width: 9px; height: 9px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--color-line-2); border-radius: 6px; }
+::-webkit-scrollbar-thumb:hover { background: #3d4550; }
+
+/* Typography ------------------------------------------------ */
+.mono { font-family: var(--font-mono); font-feature-settings: "zero", "ss01"; }
+
+h1, h2, h3 { letter-spacing: -0.02em; }
+
+/* Component classes ----------------------------------------- */
+.card {
+  background: var(--color-surface);
+  border: 1px solid var(--color-line);
+  border-radius: var(--radius-ui);
+}
+.card-2 {
+  background: var(--color-surface-2);
+  border: 1px solid var(--color-line);
+  border-radius: var(--radius-ui);
+}
+
+.btn {
+  display: inline-flex; align-items: center; justify-content: center; gap: 7px;
+  padding: 8px 14px; border-radius: var(--radius-ui);
+  font-size: 13px; font-weight: 500; line-height: 1;
+  border: 1px solid var(--color-line-2);
+  background: var(--color-surface-3); color: var(--color-ink);
+  cursor: pointer; white-space: nowrap;
+  transition: background .15s, border-color .15s, transform .05s;
+}
+.btn:hover:not(:disabled) { border-color: var(--color-ink-3); background: #242936; }
+.btn:active:not(:disabled) { transform: translateY(1px); }
+.btn:disabled { opacity: .45; cursor: not-allowed; }
+
+.btn-primary {
+  background: var(--color-accent); color: var(--color-accent-ink);
+  border-color: transparent; font-weight: 600;
+}
+.btn-primary:hover:not(:disabled) { background: #829dff; border-color: transparent; }
+
+.btn-ghost { background: transparent; border-color: transparent; color: var(--color-ink-2); }
+.btn-ghost:hover:not(:disabled) { background: var(--color-surface-3); color: var(--color-ink); border-color: transparent; }
+
+.input, .select, .textarea {
+  width: 100%; background: var(--color-surface-3);
+  border: 1px solid var(--color-line-2); border-radius: var(--radius-ui);
+  padding: 9px 11px; color: var(--color-ink);
+  font-size: 13px; font-family: inherit; line-height: 1.4;
+  transition: border-color .15s;
+}
+.textarea { resize: vertical; }
+.input::placeholder, .textarea::placeholder { color: var(--color-ink-3); }
+.input:focus, .select:focus, .textarea:focus {
+  outline: none; border-color: var(--color-accent);
+  box-shadow: 0 0 0 3px rgb(109 139 255 / .18);
+}
+.select { appearance: none; cursor: pointer; }
+
+.chip {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 4px 9px; border-radius: 999px;
+  font-size: 11px; font-weight: 500;
+  background: var(--color-surface-3); color: var(--color-ink-2);
+  border: 1px solid var(--color-line);
+}
+
+.field-label { font-size: 12px; color: var(--color-ink-2); font-weight: 500; }
+
+/* Motion (MOTION_INTENSITY 4, honors reduced-motion) -------- */
+@keyframes nf-pulse { 0%,100% { opacity: 1 } 50% { opacity: .3 } }
+@keyframes nf-spin { to { transform: rotate(360deg) } }
+@keyframes nf-fade { from { opacity: 0; transform: translateY(6px) } to { opacity: 1; transform: none } }
+
+.live-dot { animation: nf-pulse 1.4s ease-in-out infinite; }
+.spin { animation: nf-spin .8s linear infinite; }
+.fade-in { animation: nf-fade .35s cubic-bezier(0.16, 1, 0.3, 1) both; }
+
+@media (prefers-reduced-motion: reduce) {
+  .live-dot, .spin, .fade-in { animation: none !important; }
+}

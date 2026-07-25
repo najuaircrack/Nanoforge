@@ -82,7 +82,10 @@ def load_imported_engine(name_or_source: str, *, device: str = "auto"):
     if entry.backend == "onnxruntime":
         return OnnxRuntimeEngine(entry)
     if entry.backend == "safetensors":
-        return SafeTensorsEngine(entry)
+        raise RuntimeError(
+            "Standalone .safetensors files require a HuggingFace config and tokenizer directory. "
+            "Load the full model directory instead."
+        )
     raise ValueError(f"Unsupported imported model backend '{entry.backend}'.")
 
 
@@ -190,19 +193,3 @@ class OnnxRuntimeEngine:
             ids.append(next_id)
             generated.append(next_id)
         return self.tokenizer.decode(generated, skip_special_tokens=True)
-
-
-class SafeTensorsEngine:
-    def __init__(self, entry: ImportedModel):
-        try:
-            from safetensors import safe_open
-        except Exception as exc:
-            raise RuntimeError("Install safetensors to inspect standalone SafeTensors files.") from exc
-        self.entry = entry
-        self.safe_open = safe_open
-
-    def stream(self, prompt: str, max_new_tokens: int = 256, sampling: SamplingConfig | None = None, **_) -> Iterator[str]:
-        raise RuntimeError("Standalone .safetensors files need a HuggingFace config/tokenizer directory to generate text.")
-
-    def complete(self, prompt: str, max_new_tokens: int = 256, sampling: SamplingConfig | None = None, **kwargs) -> str:
-        return "".join(self.stream(prompt, max_new_tokens, sampling, **kwargs))

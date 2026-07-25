@@ -145,7 +145,6 @@ def cmd_prepare(args: argparse.Namespace) -> None:
         tokenizer,
         val_fraction=args.val_fraction,
         code_only=args.code_only,
-        jsonl=args.jsonl,
         jsonl_text_key=args.jsonl_text_key,
         min_chars=args.min_chars,
         mode=args.mode,
@@ -371,6 +370,21 @@ def cmd_dashboard(args: argparse.Namespace) -> None:
     from nanoforge.dashboard import serve_dashboard
 
     serve_dashboard(args.run, args.host, args.port)
+
+
+def cmd_web(args: argparse.Namespace) -> None:
+    import webbrowser
+
+    from nanoforge.webapp import serve_webapp
+
+    url = f"http://{args.host}:{args.port}"
+    print(f"web: {url}")
+    if not args.no_browser:
+        try:
+            webbrowser.open(url)
+        except Exception:
+            pass
+    serve_webapp(args.run, args.host, args.port)
 
 
 def cmd_tui(args: argparse.Namespace) -> None:
@@ -730,6 +744,9 @@ def build_parser() -> argparse.ArgumentParser:
             "normalization",
             "quantization",
             "block",
+            "head",
+            "loss",
+            "embedding",
         ],
     )
     p.set_defaults(func=cmd_registries)
@@ -814,7 +831,6 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--tokenizer-path")
     p.add_argument("--val-fraction", type=float, default=0.01)
     p.add_argument("--code-only", action="store_true")
-    p.add_argument("--jsonl", action="store_true")
     p.add_argument("--jsonl-text-key", default="text")
     p.add_argument(
         "--mode",
@@ -945,6 +961,13 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("tui", help="Launch the full-scope terminal UI.")
     p.add_argument("--run", default="runs/nanoforge", help="Run directory to monitor.")
     p.set_defaults(func=cmd_tui)
+
+    p = sub.add_parser("web", help="Launch the full-scope web UI (React SPA + FastAPI).")
+    p.add_argument("--run", default="runs/nanoforge", help="Run directory to monitor.")
+    p.add_argument("--host", default="127.0.0.1")
+    p.add_argument("--port", type=int, default=7860)
+    p.add_argument("--no-browser", action="store_true", help="Do not auto-open a browser.")
+    p.set_defaults(func=cmd_web)
 
     for name, help_text, func in [
         ("generate", "Generate one completion.", cmd_generate),

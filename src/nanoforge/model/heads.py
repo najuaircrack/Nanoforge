@@ -179,18 +179,3 @@ class RewardModelHead(nn.Module):
 
 # Alias — same architecture, different semantic role
 ValueHead = RewardModelHead
-
-
-def _stub_head(config: ModelConfig, *args, **kwargs):
-    raise NotImplementedError(
-        f"Task head '{config.task_type}' is registered but not yet implemented. "
-        "It requires a dedicated input embedding and data pipeline (e.g. patch/audio). "
-        "Implement a head in nanoforge.model.heads and register it, or contribute via the plugin system."
-    )
-
-
-def _stub_embedding(*args, **kwargs):
-    raise NotImplementedError(
-        "This input embedding (patch/audio/multimodal) is registered but not yet implemented. "
-        "Only 'token' input is currently supported end-to-end."
-    )

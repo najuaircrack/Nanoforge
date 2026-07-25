@@ -35,6 +35,17 @@ try:
     _TEXTUAL_OK = True
 except ImportError:
     _TEXTUAL_OK = False
+    # Fallbacks so the module imports without the optional [tui] extra.
+    # launch_tui() raises a helpful error via _require_textual() before use.
+    App = Screen = object  # type: ignore
+    ComposeResult = object  # type: ignore
+
+    class Binding:  # type: ignore
+        def __init__(self, *args, **kwargs):
+            pass
+
+    def reactive(*args, **kwargs):  # type: ignore
+        return None
 
 
 def _require_textual():
@@ -109,8 +120,12 @@ class TrainingScreen(Screen):
         self._poll()
 
     def _poll(self) -> None:
-        self._rows = _read_metrics(self._run_dir)
-        self.app.call_from_thread(self._update_ui)
+        # Runs on the event-loop thread (set_interval). Do the file read in a
+        # worker thread and marshal the UI update back with call_from_thread.
+        def _do():
+            self._rows = _read_metrics(self._run_dir)
+            self.app.call_from_thread(self._update_ui)
+        threading.Thread(target=_do, daemon=True).start()
 
     def _update_ui(self) -> None:
         rows = self._rows
@@ -394,6 +409,72 @@ class SystemScreen(Screen):
         )
 
 
+# ── Launch / Train Screen ──────────────────────────────────────────────────────
+
+class LaunchScreen(Screen):
+    """Start a training run, pipeline, or auto-train from the TUI."""
+
+    def compose(self) -> ComposeResult:
+        yield Header(show_clock=True)
+        with Vertical(id="launch-wrap"):
+            yield Label("Config file", classes="stat-label")
+            yield Input("configs/nano-debug.yaml", id="launch-config", placeholder="path/to/config.yaml")
+            yield Label("Mode", classes="stat-label")
+            with Horizontal():
+                yield Button("train", id="btn-train", variant="primary")
+                yield Button("pretrain", id="btn-pretrain")
+                yield Button("pipeline", id="btn-pipeline")
+                yield Button("auto-train", id="btn-auto")
+            yield Label("", id="launch-status")
+            yield Label("Output", classes="stat-label")
+            yield Log(id="launch-log", highlight=True)
+        yield Footer()
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        mode_map = {
+            "btn-train": "train",
+            "btn-pretrain": "pretrain",
+            "btn-pipeline": "pipeline",
+            "btn-auto": "auto-train",
+        }
+        mode = mode_map.get(event.button.id)
+        if mode:
+            self._launch(mode)
+
+    def _launch(self, mode: str) -> None:
+        config = self.query_one("#launch-config", Input).value.strip()
+        if not config:
+            self.query_one("#launch-status", Label).update("Set a config path first.")
+            return
+        log = self.query_one("#launch-log", Log)
+        status = self.query_one("#launch-status", Label)
+        self.app.call_from_thread(status.update, f"Starting {mode}…")
+
+        def _do():
+            import subprocess, sys
+            cmd = [sys.executable, "-m", "nanoforge", mode, "--config", config]
+            self.app.call_from_thread(log.write_line, f"$ {' '.join(cmd)}")
+            try:
+                proc = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    bufsize=1,
+                )
+                for line in proc.stdout:
+                    self.app.call_from_thread(log.write_line, line.rstrip())
+                proc.wait()
+                self.app.call_from_thread(
+                    status.update,
+                    f"{'✓ done' if proc.returncode == 0 else f'✗ exit {proc.returncode}'}"
+                )
+            except Exception as exc:
+                self.app.call_from_thread(status.update, f"Error: {exc}")
+
+        threading.Thread(target=_do, daemon=True).start()
+
+
 # ── Main App ───────────────────────────────────────────────────────────────────
 
 class NanoforgeApp(App):
@@ -410,6 +491,8 @@ class NanoforgeApp(App):
     #cfg-left { width: 30%; padding: 1; }
     #cfg-right { width: 70%; padding: 1; }
     #cfg-editor { height: 1fr; }
+    #launch-wrap { padding: 1; }
+    #launch-log { height: 1fr; }
     .stat-label { color: $text-muted; text-style: bold; margin-top: 1; }
     DataTable { height: 1fr; }
     Log { height: 1fr; border: solid $primary; }
@@ -417,11 +500,12 @@ class NanoforgeApp(App):
     """
 
     BINDINGS = [
-        Binding("1", "switch_screen('training')", "Training"),
-        Binding("2", "switch_screen('inference')", "Inference"),
-        Binding("3", "switch_screen('data')", "Data"),
-        Binding("4", "switch_screen('config')", "Config"),
-        Binding("5", "switch_screen('system')", "System"),
+        Binding("1", "switch_screen('launch')", "Launch"),
+        Binding("2", "switch_screen('training')", "Monitor"),
+        Binding("3", "switch_screen('inference')", "Inference"),
+        Binding("4", "switch_screen('data')", "Data"),
+        Binding("5", "switch_screen('config')", "Config"),
+        Binding("6", "switch_screen('system')", "System"),
         Binding("q", "quit", "Quit"),
     ]
 
@@ -430,12 +514,13 @@ class NanoforgeApp(App):
         self._run_dir = Path(run_dir)
 
     def on_mount(self) -> None:
+        self.install_screen(LaunchScreen(), name="launch")
         self.install_screen(TrainingScreen(self._run_dir), name="training")
         self.install_screen(InferenceScreen(self._run_dir), name="inference")
         self.install_screen(DataScreen(), name="data")
         self.install_screen(ConfigScreen(), name="config")
         self.install_screen(SystemScreen(), name="system")
-        self.push_screen("training")
+        self.push_screen("launch")
 
     def action_switch_screen(self, name: str) -> None:
         self.switch_screen(name)

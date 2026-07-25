@@ -39,7 +39,7 @@ training:
   grad_clip: 1.0
   precision: fp32
   gradient_checkpointing: false
-  eval_interval: 500
+  eval_interval: 250
   eval_steps: 20
   save_interval: 500
   early_stopping_patience: 15
