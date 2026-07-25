@@ -7,6 +7,11 @@ from typing import Any
 from nanoforge.logging_utils import get_logger
 from nanoforge.registry import validate_registry_key
 
+_CAUSAL_TASKS: frozenset[str] = frozenset({
+    "causal_lm", "chat", "code_generation", "instruction_following",
+    "reward_modeling", "value_estimation", "preference_learning", "dpo",
+})
+
 
 @dataclass
 class MoEConfig:
@@ -48,14 +53,8 @@ class ModelConfig:
     # Task / head configuration
     task_type: str = "causal_lm"
     num_labels: int = 2
-    input_type: str = "text"   # "text" | "patch" | "audio"
-    is_causal: bool | None = None  # None = auto-derived from task_type
-
-    # Decoder-only task types (causal attention)
-    _CAUSAL_TASKS: frozenset[str] = field(default_factory=lambda: frozenset({
-        "causal_lm", "chat", "code_generation", "instruction_following",
-        "reward_modeling", "value_estimation", "preference_learning", "dpo",
-    }), init=False, repr=False, compare=False)
+    input_type: str = "text"
+    is_causal: bool | None = None
 
     def __post_init__(self) -> None:
         if self.n_kv_heads is None:
@@ -69,7 +68,7 @@ class ModelConfig:
         if self.ffn_type is None:
             self.ffn_type = "moe" if self.moe is not None else self.activation
         if self.is_causal is None:
-            self.is_causal = self.task_type in self._CAUSAL_TASKS
+            self.is_causal = self.task_type in _CAUSAL_TASKS
         validate_registry_key("block", self.block_type)
         validate_registry_key("attention", self.attention_backend)
         validate_registry_key("ffn", self.ffn_type)
@@ -101,7 +100,6 @@ class TrainConfig:
     grad_clip: float = 1.0
     precision: str = "auto"
     gradient_checkpointing: bool = True
-    activation_offload: bool = False
     low_memory: bool = False
     eval_interval: int = 100
     eval_steps: int = 20
@@ -115,8 +113,6 @@ class TrainConfig:
     sample_max_new_tokens: int = 128
     health_interval: int = 10
     grad_explosion_factor: float = 10.0
-    adaptive_grad_clip: bool = True
-    rollback_on_nonfinite: bool = True
     distributed_backend: str = "none"
     log_interval: int = 10
     tensorboard: bool = True
@@ -145,8 +141,7 @@ class DataConfig:
     dataset_weights: dict[str, float] | None = None
     streaming: bool = False
     tokenizer_batch_size: int = 256
-    num_workers: int = 2
-    prefetch_factor: int = 2
+    num_workers: int = 0
     pin_memory: bool = True
 
     def __post_init__(self) -> None:

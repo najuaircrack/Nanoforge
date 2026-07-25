@@ -158,13 +158,15 @@ class CausalSelfAttention(nn.Module):
         v_full = repeat_kv(v, self.kv_repeat)
 
         if self.use_flash and hasattr(F, "scaled_dot_product_attention"):
+            is_causal_attn = getattr(self.config, 'is_causal', True)
             is_simple_causal = (
-                kv_len == seq_len
+                is_causal_attn
+                and kv_len == seq_len
                 and self.config.sliding_window is None
                 and self.config.position_embedding != "alibi"
             )
             attn_mask = None
-            if not is_simple_causal:
+            if is_causal_attn and not is_simple_causal:
                 attn_mask = _attention_mask(
                     seq_len, kv_len, x.device, q.dtype, self.config.sliding_window
                 )
@@ -180,10 +182,12 @@ class CausalSelfAttention(nn.Module):
                 is_causal=is_simple_causal,
             )
         else:
+            is_causal_attn = getattr(self.config, 'is_causal', True)
             scores = (q @ k_full.transpose(-2, -1)) / math.sqrt(self.head_dim)
-            scores = scores + _attention_mask(
-                seq_len, kv_len, x.device, scores.dtype, self.config.sliding_window
-            )
+            if is_causal_attn:
+                scores = scores + _attention_mask(
+                    seq_len, kv_len, x.device, scores.dtype, self.config.sliding_window
+                )
             if self.config.position_embedding == "alibi":
                 scores = scores + _alibi_bias(seq_len, kv_len, self.n_heads, x.device, scores.dtype)
             probs = F.softmax(scores.float(), dim=-1).to(q.dtype)
@@ -194,8 +198,6 @@ class CausalSelfAttention(nn.Module):
 
 
 class ChunkedCausalSelfAttention(CausalSelfAttention):
-    """Memory-bounded attention variant using a local chunk-sized cache window."""
-
     def __init__(self, config: ModelConfig):
         cfg = copy(config)
         cfg.sliding_window = cfg.sliding_window or min(cfg.max_seq_len, 1024)
@@ -203,8 +205,6 @@ class ChunkedCausalSelfAttention(CausalSelfAttention):
 
 
 class SparseCausalSelfAttention(CausalSelfAttention):
-    """Experimental sparse-style local attention approximation."""
-
     def __init__(self, config: ModelConfig):
         cfg = copy(config)
         cfg.sliding_window = cfg.sliding_window or min(cfg.max_seq_len, 512)
@@ -212,8 +212,6 @@ class SparseCausalSelfAttention(CausalSelfAttention):
 
 
 class HybridLocalGlobalCausalAttention(CausalSelfAttention):
-    """Hybrid backend hook with local-window behavior and full-prefill compatibility."""
-
     def __init__(self, config: ModelConfig):
         cfg = copy(config)
         cfg.sliding_window = cfg.sliding_window or min(cfg.max_seq_len, 2048)
@@ -221,12 +219,6 @@ class HybridLocalGlobalCausalAttention(CausalSelfAttention):
 
 
 class PagedCausalSelfAttention(CausalSelfAttention):
-    """Paged-cache compatible attention surface.
-
-    The current implementation uses bounded contiguous pages internally; the class gives runtime
-    code a distinct backend to target without pretending it is the base SDPA backend.
-    """
-
     def __init__(self, config: ModelConfig):
         cfg = copy(config)
         cfg.sliding_window = cfg.sliding_window or cfg.max_seq_len

@@ -1,24 +1,38 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
 
 import torch
 import torch.utils.checkpoint
 from torch import nn
-from torch.nn import functional as F
 
-from nanoforge.config import ModelConfig
+from nanoforge.config import ModelConfig, NanoforgeConfig
 from nanoforge.model.attention import KVCache
-from nanoforge.registry import ATTENTION_BACKENDS, FFN_BACKENDS, NORMALIZATIONS, TRANSFORMER_BLOCKS
+from nanoforge.model.heads import CausalLMHead, ModelOutput, CausalLMOutput  # noqa: F401 (re-export)
+from nanoforge.registry import ATTENTION_BACKENDS, FFN_BACKENDS, NORMALIZATIONS, TASK_HEADS, TRANSFORMER_BLOCKS
 
 
-@dataclass
-class CausalLMOutput:
-    logits: torch.Tensor
-    loss: torch.Tensor | None = None
-    aux_loss: torch.Tensor | None = None
-    caches: list[KVCache] | None = None
+class TokenEmbedding(nn.Module):
+    def __init__(self, vocab_size: int, d_model: int, dropout: float = 0.0):
+        super().__init__()
+        self.embed = nn.Embedding(vocab_size, d_model)
+        self.drop = nn.Dropout(dropout)
+
+    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return self.drop(self.embed(input_ids))
+
+
+def _build_ffn(config: ModelConfig) -> tuple[nn.Module, bool]:
+    """Construct the FFN (or MoE) sublayer for a block. Returns (module, is_moe)."""
+    hidden = int(config.d_model * config.ffn_hidden_mult)
+    hidden = int(256 * math.ceil(hidden / 256)) if hidden >= 256 else hidden
+    if config.moe is not None:
+        ffn = FFN_BACKENDS.create("moe", config.d_model, hidden, config.moe, config.activation, config.dropout)
+        return ffn, True
+    ffn_type = config.ffn_type or config.activation
+    activation = ffn_type if ffn_type in {"swiglu", "geglu"} else config.activation
+    ffn = FFN_BACKENDS.create(ffn_type, config.d_model, hidden, activation, config.dropout)
+    return ffn, False
 
 
 class TransformerBlock(nn.Module):
@@ -28,35 +42,10 @@ class TransformerBlock(nn.Module):
         self.attn_norm = norm_factory(config.d_model, config.norm_eps)
         self.ffn_norm = norm_factory(config.d_model, config.norm_eps)
         self.attn = ATTENTION_BACKENDS.create(config.attention_backend, config)
-        hidden = int(config.d_model * config.ffn_hidden_mult)
-        hidden = int(256 * math.ceil(hidden / 256)) if hidden >= 256 else hidden
-        self.moe = config.moe is not None
-        if self.moe:
-            self.ffn = FFN_BACKENDS.create(
-                "moe",
-                config.d_model,
-                hidden,
-                config.moe,
-                config.activation,
-                config.dropout,
-            )
-        else:
-            ffn_type = config.ffn_type or config.activation
-            self.ffn = FFN_BACKENDS.create(
-                ffn_type,
-                config.d_model,
-                hidden,
-                ffn_type if ffn_type in {"swiglu", "geglu"} else config.activation,
-                config.dropout,
-            )
+        self.ffn, self.moe = _build_ffn(config)
         self.residual_scale = config.residual_scale or (1.0 / math.sqrt(2 * config.n_layers))
 
-    def forward(
-        self,
-        x: torch.Tensor,
-        cache: KVCache | None = None,
-        use_cache: bool = False,
-    ) -> tuple[torch.Tensor, KVCache | None, torch.Tensor | None]:
+    def forward(self, x, cache=None, use_cache=False):
         attn_out, cache = self.attn(self.attn_norm(x), cache=cache, use_cache=use_cache)
         x = x + attn_out * self.residual_scale
         ffn_in = self.ffn_norm(x)
@@ -77,35 +66,10 @@ class ParallelResidualTransformerBlock(nn.Module):
         norm_factory = NORMALIZATIONS.get(config.normalization)
         self.norm = norm_factory(config.d_model, config.norm_eps)
         self.attn = ATTENTION_BACKENDS.create(config.attention_backend, config)
-        hidden = int(config.d_model * config.ffn_hidden_mult)
-        hidden = int(256 * math.ceil(hidden / 256)) if hidden >= 256 else hidden
-        self.moe = config.moe is not None
-        if self.moe:
-            self.ffn = FFN_BACKENDS.create(
-                "moe",
-                config.d_model,
-                hidden,
-                config.moe,
-                config.activation,
-                config.dropout,
-            )
-        else:
-            ffn_type = config.ffn_type or config.activation
-            self.ffn = FFN_BACKENDS.create(
-                ffn_type,
-                config.d_model,
-                hidden,
-                ffn_type if ffn_type in {"swiglu", "geglu"} else config.activation,
-                config.dropout,
-            )
+        self.ffn, self.moe = _build_ffn(config)
         self.residual_scale = config.residual_scale or (1.0 / math.sqrt(2 * config.n_layers))
 
-    def forward(
-        self,
-        x: torch.Tensor,
-        cache: KVCache | None = None,
-        use_cache: bool = False,
-    ) -> tuple[torch.Tensor, KVCache | None, torch.Tensor | None]:
+    def forward(self, x, cache=None, use_cache=False):
         hidden = self.norm(x)
         attn_out, cache = self.attn(hidden, cache=cache, use_cache=use_cache)
         aux_loss = None
@@ -117,19 +81,17 @@ class ParallelResidualTransformerBlock(nn.Module):
         return x, cache, aux_loss
 
 
-class NanoforgeForCausalLM(nn.Module):
+class NanoforgeBackbone(nn.Module):
+    """Shared transformer backbone: embed → blocks → norm → hidden states."""
+
     def __init__(self, config: ModelConfig):
         super().__init__()
         self.config = config
-        self.embed = nn.Embedding(config.vocab_size, config.d_model)
-        self.drop = nn.Dropout(config.dropout)
+        self.embedding = TokenEmbedding(config.vocab_size, config.d_model, config.dropout)
         self.blocks = nn.ModuleList(
             [TRANSFORMER_BLOCKS.create(config.block_type, config) for _ in range(config.n_layers)]
         )
         self.norm = NORMALIZATIONS.create(config.normalization, config.d_model, config.norm_eps)
-        self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
-        if config.tie_embeddings:
-            self.lm_head.weight = self.embed.weight
         self.apply(self._init_weights)
 
     def _init_weights(self, module: nn.Module) -> None:
@@ -144,58 +106,91 @@ class NanoforgeForCausalLM(nn.Module):
     def device(self) -> torch.device:
         return next(self.parameters()).device
 
-    def forward(
-        self,
-        input_ids: torch.Tensor,
-        labels: torch.Tensor | None = None,
-        caches: list[KVCache] | None = None,
-        use_cache: bool = False,
-    ) -> CausalLMOutput:
-        if input_ids.shape[1] > self.config.max_seq_len and not use_cache:
-            raise ValueError(f"Sequence length exceeds max_seq_len={self.config.max_seq_len}.")
-        x = self.drop(self.embed(input_ids))
+    def forward(self, input_ids: torch.Tensor, caches=None, use_cache: bool = False):
+        x = self.embedding(input_ids)
         new_caches: list[KVCache] = []
         aux_losses: list[torch.Tensor] = []
         if caches is None:
-            caches = [None] * len(self.blocks)  # type: ignore[list-item]
+            caches = [None] * len(self.blocks)
 
         for block, cache in zip(self.blocks, caches):
             if self.config.gradient_checkpointing and self.training and not use_cache:
-                def checkpoint_block(hidden: torch.Tensor) -> torch.Tensor:
-                    y, _, _ = block(hidden, None, False)
+                def _ckpt(h: torch.Tensor) -> torch.Tensor:
+                    y, _, _ = block(h, None, False)
                     return y
-
-                x = torch.utils.checkpoint.checkpoint(checkpoint_block, x, use_reentrant=False)
-                aux = None
-                new_cache = None
+                x = torch.utils.checkpoint.checkpoint(_ckpt, x, use_reentrant=False)
+                new_cache, aux = None, None
             else:
                 x, new_cache, aux = block(x, cache=cache, use_cache=use_cache)
             if use_cache:
                 new_caches.append(new_cache or KVCache())
             if aux is not None:
                 aux_losses.append(aux)
-        x = self.norm(x)
-        logits = self.lm_head(x)
-        loss = None
-        if labels is not None:
-            flat_logits = logits.view(-1, logits.size(-1))
-            flat_labels = labels.reshape(-1)
-            n_tokens = (flat_labels != -100).sum()
-            if n_tokens == 0:
-                loss = flat_logits.sum() * 0.0  # zero loss, preserves gradient graph
-            else:
-                loss = F.cross_entropy(flat_logits, flat_labels, ignore_index=-100, reduction="sum") / n_tokens
-        aux_loss = torch.stack(aux_losses).mean() if aux_losses else None
-        if loss is not None and aux_loss is not None and self.config.moe is not None:
-            loss = loss + self.config.moe.router_aux_loss_coef * aux_loss
-        return CausalLMOutput(logits=logits, loss=loss, aux_loss=aux_loss, caches=new_caches or None)
 
-    @torch.inference_mode()
-    def prefill(self, input_ids: torch.Tensor) -> CausalLMOutput:
-        return self(input_ids, use_cache=True)
+        x = self.norm(x)
+        return x, new_caches or None, aux_losses
 
     def estimate_num_params(self, non_embedding: bool = False) -> int:
         n = sum(p.numel() for p in self.parameters())
         if non_embedding:
-            n -= self.embed.weight.numel()
+            n -= self.embedding.embed.weight.numel()
         return n
+
+
+class NanoforgeModel(nn.Module):
+    """Backbone + pluggable task head. Supports any task type registered in TASK_HEADS."""
+
+    def __init__(self, config: ModelConfig):
+        super().__init__()
+        self.config = config
+        self.backbone = NanoforgeBackbone(config)
+
+        head_factory = TASK_HEADS.get(config.task_type)
+        # Generative heads get the embedding weight for optional tying
+        tie_weight = self.backbone.embedding.embed.weight if config.tie_embeddings else None
+        try:
+            self.head = head_factory(config, tie_weight)
+        except TypeError:
+            self.head = head_factory(config)
+
+    @property
+    def device(self) -> torch.device:
+        return self.backbone.device
+
+    # Keep .embed accessible for compat (e.g. engine weight tying checks)
+    @property
+    def embed(self):
+        return self.backbone.embedding.embed
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        labels: torch.Tensor | None = None,
+        caches=None,
+        use_cache: bool = False,
+    ) -> ModelOutput:
+        if input_ids.shape[1] > self.config.max_seq_len and not use_cache:
+            raise ValueError(f"Sequence length exceeds max_seq_len={self.config.max_seq_len}.")
+        hidden, new_caches, aux_losses = self.backbone(input_ids, caches, use_cache)
+        return self.head(hidden, labels, aux_losses, new_caches)
+
+    @torch.inference_mode()
+    def prefill(self, input_ids: torch.Tensor) -> ModelOutput:
+        return self(input_ids, use_cache=True)
+
+    def estimate_num_params(self, non_embedding: bool = False) -> int:
+        return self.backbone.estimate_num_params(non_embedding)
+
+
+def NanoforgeForCausalLM(config: ModelConfig) -> NanoforgeModel:
+    """Backward-compat factory: always returns a causal LM model."""
+    from copy import copy
+    cfg = copy(config)
+    cfg.task_type = "causal_lm"
+    cfg.is_causal = True
+    return NanoforgeModel(cfg)
+
+
+def build_model(config: NanoforgeConfig) -> NanoforgeModel:
+    """Primary factory used by trainer and engine."""
+    return NanoforgeModel(config.model)

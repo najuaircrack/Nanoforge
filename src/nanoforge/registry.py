@@ -132,6 +132,9 @@ SAMPLERS: Registry[Any] = Registry("sampler")
 NORMALIZATIONS: Registry[Any] = Registry("normalization")
 QUANTIZATION_BACKENDS: Registry[Any] = Registry("quantization backend")
 TRANSFORMER_BLOCKS: Registry[Any] = Registry("transformer block")
+TASK_HEADS: Registry[Any] = Registry("task head")
+LOSSES: Registry[Any] = Registry("loss function")
+EMBEDDINGS: Registry[Any] = Registry("input embedding")
 
 
 ALL_REGISTRIES: dict[str, Registry[Any]] = {
@@ -146,6 +149,9 @@ ALL_REGISTRIES: dict[str, Registry[Any]] = {
     "normalization": NORMALIZATIONS,
     "quantization": QUANTIZATION_BACKENDS,
     "block": TRANSFORMER_BLOCKS,
+    "head": TASK_HEADS,
+    "loss": LOSSES,
+    "embedding": EMBEDDINGS,
 }
 
 _BUILTINS_REGISTERED = False
@@ -239,6 +245,19 @@ def register_builtin_components() -> None:
         version="1",
         replace=True,
     )
+
+    # Task heads
+    for _name in ["causal_lm", "chat", "code_generation", "instruction_following"]:
+        TASK_HEADS.register(_name, "nanoforge.model.heads:CausalLMHead", version="1", replace=True)
+    TASK_HEADS.register("masked_lm", "nanoforge.model.heads:MaskedLMHead", version="1", replace=True)
+    TASK_HEADS.register("sequence_classification", "nanoforge.model.heads:SequenceClassificationHead", version="1", replace=True)
+    TASK_HEADS.register("token_classification", "nanoforge.model.heads:TokenClassificationHead", version="1", replace=True)
+    TASK_HEADS.register("reward_modeling", "nanoforge.model.heads:RewardModelHead", version="1", replace=True)
+    TASK_HEADS.register("value_estimation", "nanoforge.model.heads:ValueHead", version="1", replace=True)
+    TASK_HEADS.register("preference_learning", "nanoforge.model.heads:RewardModelHead", aliases=["dpo"], version="1", replace=True)
+
+    # Input embeddings
+    EMBEDDINGS.register("token", "nanoforge.model.transformer:TokenEmbedding", version="1", replace=True)
 
 
 def load_plugins() -> None:

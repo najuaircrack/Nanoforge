@@ -12,7 +12,7 @@ from nanoforge.config import NanoforgeConfig, load_config
 from nanoforge.data.tokenizer import TokenizerAdapter, load_tokenizer
 from nanoforge.generation.sampling import MirostatState, SamplingConfig, sample_next
 from nanoforge.model.attention import KVCache
-from nanoforge.model.transformer import NanoforgeForCausalLM
+from nanoforge.model.transformer import build_model
 from nanoforge.training.checkpoint import load_checkpoint
 from nanoforge.training.utils import resolve_device
 
@@ -49,7 +49,7 @@ class GenerationEngine:
         cfg = payload["config"]
         if isinstance(cfg, dict):
             raise RuntimeError("This checkpoint stores an old dict config. Save again with NanoforgeConfig.")
-        model = NanoforgeForCausalLM(cfg.model)
+        model = build_model(cfg)
         model.load_state_dict(payload["model"], strict=True)
         tok_type = tokenizer_type or cfg.data.tokenizer_type
         tok_path = tokenizer_path or cfg.data.tokenizer_path
@@ -59,7 +59,7 @@ class GenerationEngine:
     @classmethod
     def from_config(cls, config_path: str | Path, device: str = "auto") -> "GenerationEngine":
         cfg: NanoforgeConfig = load_config(config_path)
-        model = NanoforgeForCausalLM(cfg.model)
+        model = build_model(cfg)
         tokenizer = load_tokenizer(cfg.data.tokenizer_type, cfg.data.tokenizer_path)
         return cls(model, tokenizer, device=device, config=cfg)
 
@@ -99,8 +99,6 @@ class GenerationEngine:
                 prefill = torch.tensor([pending_ids[-self.model.config.max_seq_len :]], dtype=torch.long, device=self.device)
                 out = self.model(prefill, caches=caches, use_cache=True)
                 ids = torch.cat([ids, prefill], dim=1) if prefix_len else prefill
-            elif step == 0:
-                out = self.model(ids[:, -1:], caches=caches, use_cache=True)
             else:
                 out = self.model(ids[:, -1:], caches=caches, use_cache=True)
             caches = out.caches
@@ -181,6 +179,18 @@ class GenerationEngine:
         return "".join(
             self.stream(prompt, max_new_tokens=max_new_tokens, sampling=sampling, stop_tokens=stop_tokens)
         )
+
+    @torch.inference_mode()
+    def classify(self, text: str) -> dict[str, float]:
+        """Return per-label probabilities for sequence-classification models."""
+        input_ids = self.tokenizer.encode(text, add_bos=True, add_eos=True)
+        x = torch.tensor([input_ids[: self.model.config.max_seq_len]], dtype=torch.long, device=self.device)
+        out = self.model(x)
+        logits = out.logits[0]
+        if logits.dim() > 1:  # token-level → mean over sequence
+            logits = logits.mean(dim=0)
+        probs = torch.softmax(logits, dim=-1)
+        return {str(i): float(p) for i, p in enumerate(probs.tolist())}
 
     @staticmethod
     def build_chat_prompt(
@@ -311,17 +321,3 @@ def _is_repetitive_tail(ids: list[int], *, window: int, threshold: float) -> boo
             return True
     repeats = 1.0 - (len(set(tail)) / max(1, len(tail)))
     return repeats >= threshold and len(tail) >= window
-
-    @torch.inference_mode()
-    def speculative_generate(
-        self,
-        prompt: str,
-        draft: "GenerationEngine",
-        max_new_tokens: int,
-        sampling: SamplingConfig | None = None,
-        draft_tokens: int = 4,
-    ) -> str:
-        # Conservative compatibility hook. It accepts a draft model and falls back to target
-        # generation if exact token verification is not beneficial for the current backend.
-        _ = draft, draft_tokens
-        return self.complete(prompt, max_new_tokens=max_new_tokens, sampling=sampling)

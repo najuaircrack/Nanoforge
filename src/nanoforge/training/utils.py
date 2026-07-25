@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import math
 import os
 import random
 from pathlib import Path
@@ -38,23 +37,6 @@ def autocast_dtype(precision: str, device: torch.device) -> torch.dtype | None:
         return torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
     return None
 
-
-def cosine_lr(step: int, max_steps: int, warmup_steps: int, lr: float, min_lr: float) -> float:
-    if step < warmup_steps:
-        return lr * (step + 1) / max(1, warmup_steps)
-    progress = (step - warmup_steps) / max(1, max_steps - warmup_steps)
-    coeff = 0.5 * (1.0 + math.cos(math.pi * min(1.0, progress)))
-    return min_lr + coeff * (lr - min_lr)
-
-
-def configure_optimizer(
-    model: torch.nn.Module,
-    lr: float,
-    weight_decay: float,
-    betas: tuple[float, float],
-    eps: float = 1e-8,
-):
-    return configure_named_optimizer(model, "adamw", lr, weight_decay, betas, eps)
 
 
 def configure_named_optimizer(

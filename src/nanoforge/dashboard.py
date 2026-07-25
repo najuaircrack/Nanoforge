@@ -396,6 +396,10 @@ canvas.sp{width:100%;height:170px;display:block}
       <span class="ico">◧</span>Checkpoints<span class="nbadge" id="ck-n">0</span>
     </div>
     <div class="nav-item" onclick="go('chat')"><span class="ico">◻</span>Chat</div>
+    <div class="nav-item" onclick="go('inference')"><span class="ico">▶</span>Inference</div>
+    <div class="nav-item" onclick="go('models')"><span class="ico">◨</span>Models</div>
+    <div class="nav-sect">Data</div>
+    <div class="nav-item" onclick="go('data')"><span class="ico">▤</span>Datasets</div>
     <div class="nav-sect">Run</div>
     <div class="nav-item" onclick="go('config')"><span class="ico">⊞</span>Config</div>
     <div class="nav-item" onclick="go('events')"><span class="ico">≡</span>Events</div>
@@ -627,6 +631,54 @@ canvas.sp{width:100%;height:170px;display:block}
           <thead><tr><th>Step</th><th>Time</th><th>Event</th><th>Loss</th><th>Val Loss</th><th>LR</th><th>Grad Norm</th></tr></thead>
           <tbody id="ev-body"></tbody>
         </table>
+      </div>
+    </div>
+
+    <!-- ═══ INFERENCE ═══ -->
+    <div class="pg" id="pg-inference">
+      <div class="card">
+        <div style="display:flex;gap:8px;align-items:center;margin-bottom:10px">
+          <select id="inf-ck" style="flex:1;background:var(--bg2);color:var(--ink);border:1px solid var(--line2);padding:7px;font-family:var(--mono);font-size:12px"></select>
+          <button class="btn" onclick="infLoad()">Load</button>
+          <span id="inf-task" style="font-family:var(--mono);font-size:11px;color:var(--ink2)"></span>
+        </div>
+        <div id="inf-st" style="font-size:11px;color:var(--ink2);margin-bottom:8px">No model loaded</div>
+        <div style="display:flex;gap:10px;margin-bottom:8px;flex-wrap:wrap">
+          <label style="font-size:11px">temp <input id="inf-temp" type="number" step="0.05" value="0.8" style="width:60px"></label>
+          <label style="font-size:11px">top_k <input id="inf-topk" type="number" value="50" style="width:60px"></label>
+          <label style="font-size:11px">max tokens <input id="inf-max" type="number" value="256" style="width:70px"></label>
+        </div>
+        <textarea id="inf-in" placeholder="Enter prompt or text to classify…" style="width:100%;height:120px;background:var(--bg2);color:var(--ink);border:1px solid var(--line2);padding:9px;font-family:var(--mono);font-size:12px"></textarea>
+        <div style="margin-top:8px"><button class="btn" onclick="infRun()" id="inf-btn">Run</button></div>
+        <div id="inf-out" style="margin-top:12px;background:var(--bg2);border:1px solid var(--line);padding:11px;min-height:60px;font-family:var(--mono);font-size:12px;white-space:pre-wrap"></div>
+      </div>
+    </div>
+
+    <!-- ═══ MODELS ═══ -->
+    <div class="pg" id="pg-models">
+      <div class="card" style="padding:0;overflow:auto">
+        <table class="et">
+          <thead><tr><th>Checkpoint</th><th>Size (MB)</th></tr></thead>
+          <tbody id="mdl-body"></tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- ═══ DATA ═══ -->
+    <div class="pg" id="pg-data">
+      <div class="card">
+        <div style="display:flex;gap:8px;margin-bottom:10px">
+          <input id="data-root" value="data" style="width:160px;background:var(--bg2);color:var(--ink);border:1px solid var(--line2);padding:7px;font-family:var(--mono)">
+          <button class="btn" onclick="dataList()">List</button>
+          <button class="btn" onclick="dataProfileSel()">Profile selected</button>
+        </div>
+        <div class="card" style="padding:0;overflow:auto;max-height:280px">
+          <table class="et">
+            <thead><tr><th></th><th>File</th><th>Size (KB)</th></tr></thead>
+            <tbody id="data-body"></tbody>
+          </table>
+        </div>
+        <div id="data-prof" style="margin-top:12px;background:var(--bg2);border:1px solid var(--line);padding:11px;font-family:var(--mono);font-size:11px;white-space:pre-wrap"></div>
       </div>
     </div>
 
@@ -993,6 +1045,7 @@ async function refreshMetrics(){
     if(document.getElementById('pg-health').classList.contains('on')) drawAll(R);
     if(p.checkpoints){
       ckList=p.checkpoints;
+      window.__ckpts=ckList;
       document.getElementById('ck-n').textContent=ckList.length;
       syncChatSel();
       if(document.getElementById('pg-checkpoints').classList.contains('on')) renderCkpts();
@@ -1024,6 +1077,86 @@ async function refreshSystem(){
     drawSysFull();
   } catch(_){}
 }
+
+// ── Inference page ──────────────────────────────────────────────────────────
+let infLoaded=false;
+function fillCkSelect(id){
+  const sel=document.getElementById(id); if(!sel) return;
+  const cur=sel.value;
+  sel.innerHTML=(window.__ckpts||[]).map(c=>`<option value="${c.path}">${c.path.split(/[\\/]/).pop()}</option>`).join('');
+  if(cur) sel.value=cur;
+}
+async function infLoad(){
+  const path=document.getElementById('inf-ck').value;
+  if(!path){document.getElementById('inf-st').textContent='Select a checkpoint';return;}
+  document.getElementById('inf-st').textContent='Loading…';
+  try{
+    const r=await fetch('/api/chat/load',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({path})});
+    const d=await r.json();
+    if(d.ok){infLoaded=true;document.getElementById('inf-st').textContent='✓ loaded '+path.split(/[\\/]/).pop();}
+    else{document.getElementById('inf-st').textContent='Error: '+(d.error||'unknown');}
+  }catch(e){document.getElementById('inf-st').textContent='Network error';}
+}
+async function infRun(){
+  if(!infLoaded){document.getElementById('inf-out').textContent='Load a model first.';return;}
+  const body={prompt:document.getElementById('inf-in').value,
+    temperature:parseFloat(document.getElementById('inf-temp').value),
+    top_k:parseInt(document.getElementById('inf-topk').value),
+    max_new_tokens:parseInt(document.getElementById('inf-max').value)};
+  document.getElementById('inf-btn').disabled=true;
+  document.getElementById('inf-out').textContent='…';
+  try{
+    const r=await fetch('/api/inference',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    const d=await r.json();
+    if(!d.ok){document.getElementById('inf-out').textContent='Error: '+(d.error||'unknown');}
+    else if(d.type==='classification'){
+      document.getElementById('inf-task').textContent='['+d.task+']';
+      const rows=Object.entries(d.labels).sort((a,b)=>b[1]-a[1]);
+      document.getElementById('inf-out').textContent=rows.map(([k,v])=>`label ${k}: ${(v*100).toFixed(2)}%`).join('\n');
+    } else {
+      document.getElementById('inf-task').textContent='['+d.task+']';
+      document.getElementById('inf-out').textContent=d.text;
+    }
+  }catch(e){document.getElementById('inf-out').textContent='Network error';}
+  document.getElementById('inf-btn').disabled=false;
+}
+// ── Models page ─────────────────────────────────────────────────────────────
+async function refreshModels(){
+  try{
+    const r=await fetch('/api/model/list'); const d=await r.json();
+    document.getElementById('mdl-body').innerHTML=(d.models||[]).map(m=>
+      `<tr><td style="font-family:var(--mono)">${m.path}</td><td>${(m.size/1e6).toFixed(1)}</td></tr>`).join('')
+      ||'<tr><td colspan="2">No models found in runs/ or models/</td></tr>';
+  }catch(_){}
+}
+// ── Data page ───────────────────────────────────────────────────────────────
+async function dataList(){
+  const root=document.getElementById('data-root').value||'data';
+  try{
+    const r=await fetch('/api/data/list?root='+encodeURIComponent(root)); const d=await r.json();
+    document.getElementById('data-body').innerHTML=(d.files||[]).map((f,i)=>
+      `<tr><td><input type="radio" name="datasel" value="${f.path}"></td><td style="font-family:var(--mono)">${f.path}</td><td>${(f.size/1024).toFixed(1)}</td></tr>`).join('')
+      ||'<tr><td colspan="3">No data files found</td></tr>';
+  }catch(_){}
+}
+async function dataProfileSel(){
+  const sel=document.querySelector('input[name="datasel"]:checked');
+  if(!sel){document.getElementById('data-prof').textContent='Select a file first.';return;}
+  document.getElementById('data-prof').textContent='Profiling…';
+  try{
+    const r=await fetch('/api/data/profile',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({path:sel.value})});
+    const d=await r.json();
+    document.getElementById('data-prof').textContent=d.ok?JSON.stringify(d.profile,null,2):('Error: '+(d.error||'unknown'));
+  }catch(e){document.getElementById('data-prof').textContent='Network error';}
+}
+// Hook page switches to lazy-load their data
+const _go_orig=go;
+go=function(id){
+  _go_orig(id);
+  if(id==='inference'){fillCkSelect('inf-ck');}
+  if(id==='models'){refreshModels();}
+  if(id==='data'){dataList();}
+};
 
 refreshMetrics().catch(console.error);
 refreshSystem().catch(console.error);
@@ -1299,6 +1432,105 @@ def create_dashboard_app(run_dir):
             return {"text": result or "(empty response)"}
         except Exception as exc:
             return {"text": f"[generation error: {exc}]"}
+
+    # ── Inference (task-aware: generate OR classify) ──────────────────────────
+    @app.post("/api/inference")
+    def inference(req: GenerateRequest):
+        engine = _engine_holder.get("engine")
+        if engine is None:
+            return {"ok": False, "error": "no checkpoint loaded"}
+        task = getattr(getattr(engine.model, "config", None), "task_type", "causal_lm")
+        try:
+            if task in {"sequence_classification", "token_classification", "reward_modeling",
+                        "value_estimation", "masked_lm"} and hasattr(engine, "classify"):
+                probs = engine.classify(req.prompt)
+                return {"ok": True, "task": task, "type": "classification", "labels": probs}
+            from nanoforge.generation.sampling import SamplingConfig
+            sc = SamplingConfig(mode=req.mode, temperature=req.temperature, top_k=req.top_k)
+            text = engine.complete(req.prompt, max_new_tokens=req.max_new_tokens, sampling=sc)
+            return {"ok": True, "task": task, "type": "generation", "text": text or "(empty)"}
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+
+    # ── Data management ───────────────────────────────────────────────────────
+    class PathRequest(BaseModel):
+        path: str
+
+    @app.get("/api/data/list")
+    def data_list(root: str = "data"):
+        base = Path(root)
+        if not base.exists():
+            return {"ok": True, "files": []}
+        files = []
+        for p in sorted(base.rglob("*")):
+            if p.is_file() and p.suffix.lower() in {".txt", ".jsonl", ".json", ".csv", ".tsv", ".parquet", ".bin"}:
+                try:
+                    files.append({"path": str(p), "size": p.stat().st_size})
+                except OSError:
+                    pass
+        return {"ok": True, "files": files[:500]}
+
+    @app.post("/api/data/profile")
+    def data_profile(req: PathRequest):
+        try:
+            from nanoforge.data.profiler import DatasetProfiler
+            prof = DatasetProfiler().profile(req.path)
+            return {"ok": True, "profile": json_safe(prof.__dict__ if hasattr(prof, "__dict__") else prof)}
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+
+    # ── Config management ─────────────────────────────────────────────────────
+    @app.get("/api/config/templates")
+    def config_templates():
+        cfgs = []
+        for p in sorted(Path("configs").glob("*.yaml")) if Path("configs").exists() else []:
+            cfgs.append(str(p))
+        return {"ok": True, "templates": cfgs}
+
+    @app.post("/api/config/load")
+    def config_load(req: PathRequest):
+        try:
+            from nanoforge.config import load_config
+            return {"ok": True, "config": _flatten_config(load_config(req.path))}
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+
+    class SaveConfigRequest(BaseModel):
+        path: str
+        yaml_text: str
+
+    @app.post("/api/config/save")
+    def config_save(req: SaveConfigRequest):
+        try:
+            out = Path(req.path)
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out.write_text(req.yaml_text, encoding="utf-8")
+            # validate it loads
+            from nanoforge.config import load_config
+            load_config(out)
+            return {"ok": True, "path": str(out)}
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+
+    # ── Model management ──────────────────────────────────────────────────────
+    @app.get("/api/model/list")
+    def model_list():
+        models = []
+        for root in ("runs", "models"):
+            base = Path(root)
+            if base.exists():
+                for p in sorted(base.rglob("*.pt")):
+                    try:
+                        models.append({"path": str(p), "size": p.stat().st_size})
+                    except OSError:
+                        pass
+        return {"ok": True, "models": models[:200]}
+
+    @app.get("/api/tasks")
+    def list_tasks():
+        from nanoforge.registry import TASK_HEADS, ensure_registry_ready
+        ensure_registry_ready()
+        return {"ok": True, "tasks": TASK_HEADS.names()}
 
     @app.get("/favicon.ico")
     def favicon():
