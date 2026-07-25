@@ -1,0 +1,71 @@
+model:
+  vocab_size: 32000
+  max_seq_len: 512
+  d_model: 512
+  n_layers: 8
+  n_heads: 8
+  n_kv_heads: 2
+  ffn_hidden_mult: 2.67
+  dropout: 0.0
+  rope_theta: 500000.0
+  norm_eps: 1.0e-5
+  tie_embeddings: true
+  use_flash: false
+  activation: swiglu
+  block_type: transformer
+  attention_backend: sdpa
+  normalization: rmsnorm
+  position_embedding: rope
+  quantization_backend: none
+  task_type: causal_lm
+
+training:
+  mode: pretrain
+  run_name: pipeline
+  output_dir: runs/pipeline
+  seed: 1337
+  max_steps: 4000
+  batch_size: 12
+  micro_batch_size: 4
+  grad_accum_steps: 3
+  learning_rate: 3.0e-4
+  min_learning_rate: 3.0e-5
+  warmup_ratio: 0.05
+  optimizer: adamw
+  scheduler: cosine
+  weight_decay: 0.1
+  betas: [0.9, 0.95]
+  eps: 1.0e-8
+  grad_clip: 1.0
+  precision: fp32
+  gradient_checkpointing: false
+  eval_interval: 500
+  eval_steps: 20
+  save_interval: 500
+  early_stopping_patience: 15
+  log_interval: 10
+  health_interval: 10
+  tensorboard: true
+  wandb: false
+  distributed_backend: none
+
+data:
+  train_path: data/packed/pretrain/train.bin
+  val_path: data/packed/pretrain/val.bin
+  tokenizer_type: bpe
+  tokenizer_path: data/tokenizers/chat25m-bpe.json
+  seq_len: 512
+  mode: pretrain
+  loss_masking: none
+  assistant_only_loss: false
+  tokenizer_batch_size: 128
+  num_workers: 0
+  pin_memory: false
+
+inference:
+  mode: chat
+  max_new_tokens: 128
+  temperature: 0.75
+  top_k: 40
+  top_p: 0.92
+  repetition_penalty: 1.1

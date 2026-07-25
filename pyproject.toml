@@ -22,6 +22,7 @@ tokenizers = ["tokenizers>=0.15", "sentencepiece>=0.1.99"]
 data = ["pyarrow>=15.0", "datasets>=2.18", "webdataset>=0.2.86"]
 native = ["maturin>=1.5"]
 serve = ["fastapi>=0.110", "uvicorn>=0.27"]
+tui = ["textual>=0.50"]
 logging = ["tensorboard>=2.14", "wandb>=0.16"]
 export = ["onnx>=1.15", "onnxruntime>=1.16"]
 dev = ["pytest>=7.4", "ruff>=0.3"]
@@ -38,6 +39,7 @@ all = [
   "wandb>=0.16",
   "onnx>=1.15",
   "onnxruntime>=1.16",
+  "textual>=0.50",
   "pytest>=7.4",
   "ruff>=0.3",
 ]

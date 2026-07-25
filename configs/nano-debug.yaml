@@ -1,0 +1,72 @@
+# nano-debug — ~25M params, single GPU or CPU
+# Use this to validate your data pipeline and training loop fast.
+
+model:
+  vocab_size: 32000
+  max_seq_len: 2048
+  d_model: 512
+  n_layers: 8
+  n_heads: 8
+  n_kv_heads: 2           # GQA: 4x fewer KV heads
+  ffn_hidden_mult: 2.67   # SwiGLU standard
+  dropout: 0.0
+  rope_theta: 500000.0
+  norm_eps: 1.0e-5
+  tie_embeddings: true
+  activation: swiglu
+  normalization: rmsnorm
+  position_embedding: rope
+  attention_backend: sdpa
+  ffn_type: swiglu
+  block_type: transformer
+  gradient_checkpointing: false
+  lora_rank: 0
+  moe: null
+
+training:
+  run_name: nano-debug
+  output_dir: runs/nano-debug
+  seed: 42
+  max_steps: 10000
+  batch_size: 32
+  micro_batch_size: 4
+  grad_accum_steps: 8
+  learning_rate: 3.0e-4
+  min_learning_rate: 3.0e-5
+  warmup_ratio: 0.05
+  optimizer: adamw
+  scheduler: cosine
+  weight_decay: 0.1
+  betas: [0.9, 0.95]
+  eps: 1.0e-8
+  grad_clip: 1.0
+  precision: bf16
+  gradient_checkpointing: false
+  eval_interval: 500
+  eval_steps: 50
+  save_interval: 1000
+  log_interval: 10
+  health_interval: 10
+  early_stopping_patience: 10
+  ema_decay: 0.0
+  tensorboard: true
+  wandb: false
+  distributed_backend: none
+
+data:
+  train_path: data/packed/YOUR_DATASET/train.bin
+  val_path: data/packed/YOUR_DATASET/val.bin
+  tokenizer_type: bpe
+  tokenizer_path: data/tokenizers/YOUR_TOKENIZER.json
+  seq_len: 2048
+  mode: generative
+  loss_masking: none
+  num_workers: 2
+  pin_memory: true
+
+inference:
+  max_new_tokens: 256
+  temperature: 0.8
+  top_k: 50
+  top_p: 0.95
+  repetition_penalty: 1.1

@@ -1,0 +1,81 @@
+# moe-large — Mixture of Experts, ~1.3B total / ~350M active params
+# Multi-GPU recommended. High capacity at lower active compute.
+
+model:
+  vocab_size: 32000
+  max_seq_len: 8192
+  d_model: 1024
+  n_layers: 24
+  n_heads: 16
+  n_kv_heads: 4           # GQA
+  ffn_hidden_mult: 2.67
+  dropout: 0.0
+  rope_theta: 1000000.0
+  rope_scaling:
+    type: yarn
+    factor: 2.0
+    original_max_position_embeddings: 4096
+  norm_eps: 1.0e-5
+  tie_embeddings: false
+  activation: swiglu
+  normalization: rmsnorm
+  position_embedding: rope
+  attention_backend: sdpa
+  ffn_type: swiglu
+  block_type: transformer
+  gradient_checkpointing: true
+  lora_rank: 0
+  moe:
+    num_experts: 8
+    top_k: 2              # 2 of 8 experts active per token
+    capacity_factor: 1.25
+    load_balancing_weight: 0.01
+
+training:
+  run_name: moe-large
+  output_dir: runs/moe-large
+  seed: 1337
+  max_steps: 200000
+  batch_size: 512
+  micro_batch_size: 4
+  grad_accum_steps: 32
+  learning_rate: 4.0e-4
+  min_learning_rate: 4.0e-5
+  warmup_ratio: 0.01
+  optimizer: adamw
+  scheduler: cosine
+  weight_decay: 0.1
+  betas: [0.9, 0.95]
+  eps: 1.0e-8
+  grad_clip: 1.0
+  precision: bf16
+  gradient_checkpointing: true
+  eval_interval: 2000
+  eval_steps: 100
+  save_interval: 5000
+  log_interval: 20
+  health_interval: 20
+  early_stopping_patience: 30
+  ema_decay: 0.0
+  tensorboard: true
+  wandb: false
+  distributed_backend: fsdp   # multi-GPU; falls back to single-device if unavailable
+
+data:
+  train_path: data/packed/YOUR_DATASET/train.bin
+  val_path: data/packed/YOUR_DATASET/val.bin
+  tokenizer_type: bpe
+  tokenizer_path: data/tokenizers/YOUR_TOKENIZER.json
+  seq_len: 8192
+  mode: generative
+  loss_masking: none
+  num_workers: 8
+  prefetch_factor: 4
+  pin_memory: true
+
+inference:
+  max_new_tokens: 1024
+  temperature: 0.7
+  top_k: 50
+  top_p: 0.95
+  repetition_penalty: 1.05

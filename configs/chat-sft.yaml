@@ -1,0 +1,78 @@
+# chat-sft — ~350M params, chat/instruct fine-tuning
+# Assistant-only loss masking. Point this at a base checkpoint or train from scratch.
+
+model:
+  vocab_size: 32000
+  max_seq_len: 4096
+  d_model: 1024
+  n_layers: 16
+  n_heads: 16
+  n_kv_heads: 4           # GQA
+  ffn_hidden_mult: 2.67
+  dropout: 0.0
+  rope_theta: 1000000.0
+  norm_eps: 1.0e-5
+  tie_embeddings: true
+  activation: swiglu
+  normalization: rmsnorm
+  position_embedding: rope
+  attention_backend: sdpa
+  ffn_type: swiglu
+  block_type: transformer
+  gradient_checkpointing: true
+  lora_rank: 0             # set >0 (e.g. 16) for LoRA fine-tuning
+  moe: null
+
+training:
+  mode: chat
+  run_name: chat-sft
+  output_dir: runs/chat-sft
+  seed: 1337
+  max_steps: 20000
+  batch_size: 64
+  micro_batch_size: 2
+  grad_accum_steps: 32
+  learning_rate: 1.0e-4    # lower LR for fine-tuning
+  min_learning_rate: 1.0e-5
+  warmup_ratio: 0.03
+  optimizer: adamw
+  scheduler: cosine
+  weight_decay: 0.05
+  betas: [0.9, 0.95]
+  eps: 1.0e-8
+  grad_clip: 1.0
+  precision: bf16
+  gradient_checkpointing: true
+  eval_interval: 500
+  eval_steps: 50
+  save_interval: 1000
+  log_interval: 10
+  health_interval: 10
+  early_stopping_patience: 10
+  ema_decay: 0.0
+  tensorboard: true
+  wandb: false
+  distributed_backend: none
+
+data:
+  train_path: data/packed/YOUR_CHAT_DATA/train.bin
+  val_path: data/packed/YOUR_CHAT_DATA/val.bin
+  tokenizer_type: bpe
+  tokenizer_path: data/tokenizers/YOUR_TOKENIZER.json
+  seq_len: 4096
+  mode: chat
+  loss_masking: assistant_only   # only train on assistant turns
+  assistant_only_loss: true
+  num_workers: 4
+  pin_memory: true
+
+inference:
+  mode: chat
+  max_new_tokens: 512
+  temperature: 0.7
+  top_k: 40
+  top_p: 0.92
+  min_p: 0.05
+  repetition_penalty: 1.1
+  frequency_penalty: 0.1
+  no_repeat_ngram_size: 4

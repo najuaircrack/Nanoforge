@@ -56,7 +56,58 @@ def hamming(a: int, b: int) -> int:
     return (a ^ b).bit_count()
 
 
+def _load_native_cleaning():
+    try:
+        import nanoforge_tokenizers as _m
+        if hasattr(_m, "StreamingDeduplicator"):
+            return _m
+    except Exception:
+        pass
+    return None
+
+
 def clean_records(records: Iterable[DatasetRecord], config: CleaningConfig) -> Iterator[DatasetRecord]:
+    native = _load_native_cleaning()
+    if native is not None:
+        yield from _clean_records_native(records, config, native)
+    else:
+        yield from _clean_records_python(records, config)
+
+
+def _clean_records_native(records: Iterable[DatasetRecord], config: CleaningConfig, native) -> Iterator[DatasetRecord]:
+    """Fast path: cleaning + dedup via Rust StreamingDeduplicator."""
+    deduper = native.StreamingDeduplicator(
+        normalize_unicode=config.normalize_unicode,
+        collapse_whitespace=config.collapse_whitespace,
+        deduplicate=config.deduplicate,
+        near_deduplicate=config.near_deduplicate,
+    )
+    BATCH = 512
+    buf: list[DatasetRecord] = []
+
+    def flush(batch: list[DatasetRecord]) -> Iterator[DatasetRecord]:
+        results = deduper.process_batch([r.text for r in batch], config.min_chars)
+        for record, (cleaned, keep) in zip(batch, results):
+            if not keep:
+                continue
+            if config.max_chars is not None and len(cleaned) > config.max_chars:
+                cleaned = cleaned[: config.max_chars].rstrip() + "\n"
+            if config.language is not None and likely_language(cleaned) != config.language:
+                continue
+            record.text = cleaned
+            yield record
+
+    for record in records:
+        buf.append(record)
+        if len(buf) >= BATCH:
+            yield from flush(buf)
+            buf = []
+    if buf:
+        yield from flush(buf)
+
+
+def _clean_records_python(records: Iterable[DatasetRecord], config: CleaningConfig) -> Iterator[DatasetRecord]:
+    """Pure-Python fallback (original implementation)."""
     seen_exact: set[str] = set()
     seen_near: list[int] = []
     for record in records:

@@ -45,6 +45,17 @@ class ModelConfig:
     lora_rank: int = 0
     lora_alpha: float = 16.0
     lora_dropout: float = 0.0
+    # Task / head configuration
+    task_type: str = "causal_lm"
+    num_labels: int = 2
+    input_type: str = "text"   # "text" | "patch" | "audio"
+    is_causal: bool | None = None  # None = auto-derived from task_type
+
+    # Decoder-only task types (causal attention)
+    _CAUSAL_TASKS: frozenset[str] = field(default_factory=lambda: frozenset({
+        "causal_lm", "chat", "code_generation", "instruction_following",
+        "reward_modeling", "value_estimation", "preference_learning", "dpo",
+    }), init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         if self.n_kv_heads is None:
@@ -57,12 +68,15 @@ class ModelConfig:
             self.moe = MoEConfig(**self.moe)
         if self.ffn_type is None:
             self.ffn_type = "moe" if self.moe is not None else self.activation
+        if self.is_causal is None:
+            self.is_causal = self.task_type in self._CAUSAL_TASKS
         validate_registry_key("block", self.block_type)
         validate_registry_key("attention", self.attention_backend)
         validate_registry_key("ffn", self.ffn_type)
         validate_registry_key("normalization", self.normalization)
         validate_registry_key("position", self.position_embedding)
         validate_registry_key("quantization", self.quantization_backend)
+        validate_registry_key("head", self.task_type)
 
 
 @dataclass
@@ -120,6 +134,7 @@ class TrainConfig:
 class DataConfig:
     train_path: str = "data/packed/train.bin"
     val_path: str = "data/packed/val.bin"
+    sources: list[dict[str, Any]] | None = None
     tokenizer_path: str | None = None
     tokenizer_type: str = "byte"
     seq_len: int = 2048

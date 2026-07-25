@@ -314,6 +314,30 @@ def cmd_benchmark_tokenizer(args: argparse.Namespace) -> None:
     print(json.dumps(asdict(result), indent=2))
 
 
+def cmd_pipeline(args: argparse.Namespace) -> None:
+    from nanoforge.training.pipeline import load_recipe, run_pipeline
+    recipe = load_recipe(args.config)
+    if args.output_dir:
+        recipe.output_dir = args.output_dir
+    run_pipeline(recipe)
+
+
+def cmd_pretrain(args: argparse.Namespace) -> None:
+    """Convenience: single pretrain stage (plain CLM, no role masking)."""
+    from nanoforge.config import load_config
+    from nanoforge.training.trainer import Trainer
+    cfg = load_config(args.config)
+    cfg.training.mode = "pretrain"
+    cfg.data.mode = "pretrain"
+    cfg.data.loss_masking = "none"
+    cfg.data.assistant_only_loss = False
+    if args.steps:
+        cfg.training.max_steps = args.steps
+    if args.resume:
+        cfg.training.resume_from_checkpoint = args.resume
+    Trainer(cfg).train()
+
+
 def cmd_train(args: argparse.Namespace) -> None:
     if args.dashboard:
         import threading
@@ -347,6 +371,12 @@ def cmd_dashboard(args: argparse.Namespace) -> None:
     from nanoforge.dashboard import serve_dashboard
 
     serve_dashboard(args.run, args.host, args.port)
+
+
+def cmd_tui(args: argparse.Namespace) -> None:
+    from nanoforge.tui import launch_tui
+
+    launch_tui(run_dir=args.run)
 
 
 def _sampling_from_args(args: argparse.Namespace):
@@ -895,11 +925,26 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--dashboard-port", type=int, default=7860)
     p.set_defaults(func=cmd_train)
 
+    p = sub.add_parser("pipeline", help="Run a multi-stage training recipe (e.g. pretrain -> SFT -> DPO).")
+    p.add_argument("--config", required=True, help="Recipe YAML (see configs/recipes/).")
+    p.add_argument("--output-dir", help="Override the recipe's output_dir.")
+    p.set_defaults(func=cmd_pipeline)
+
+    p = sub.add_parser("pretrain", help="Pretrain a base model on raw text (mode=pretrain, no loss masking).")
+    p.add_argument("--config", required=True)
+    p.add_argument("--steps", type=int, help="Override max_steps.")
+    p.add_argument("--resume", help="Resume model weights from a checkpoint.")
+    p.set_defaults(func=cmd_pretrain)
+
     p = sub.add_parser("dashboard", help="Run a live browser dashboard for a training run.")
     p.add_argument("--run", default="runs/tiny")
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--port", type=int, default=7860)
     p.set_defaults(func=cmd_dashboard)
+
+    p = sub.add_parser("tui", help="Launch the full-scope terminal UI.")
+    p.add_argument("--run", default="runs/nanoforge", help="Run directory to monitor.")
+    p.set_defaults(func=cmd_tui)
 
     for name, help_text, func in [
         ("generate", "Generate one completion.", cmd_generate),

@@ -13,7 +13,7 @@ from nanoforge.data.dataset import PackedMemmapDataset, make_torch_batch
 from nanoforge.data.tokenizer import load_tokenizer
 from nanoforge.generation.sampling import SamplingConfig
 from nanoforge.logging_utils import get_logger
-from nanoforge.model.transformer import NanoforgeForCausalLM
+from nanoforge.model.transformer import build_model
 from nanoforge.profiling import estimate_model_profile
 from nanoforge.progress import JsonlMetricLogger
 from nanoforge.training.checkpoint import AsyncCheckpointSaver, load_checkpoint, restore_rng_state
@@ -43,7 +43,7 @@ class Trainer:
         seed_everything(self.train_cfg.seed)
         self.device = resolve_device(self.train_cfg.device)
         self.model_cfg.gradient_checkpointing = self.train_cfg.gradient_checkpointing
-        self.model = NanoforgeForCausalLM(self.model_cfg).to(self.device)
+        self.model = build_model(config).to(self.device)
         if self.train_cfg.compile and hasattr(torch, "compile"):
             self.model = torch.compile(self.model)  # type: ignore[assignment]
         self.optimizer = configure_named_optimizer(
@@ -55,7 +55,7 @@ class Trainer:
             self.train_cfg.eps,
         )
         self.ema = EMA(self.model, self.train_cfg.ema_decay) if self.train_cfg.ema_decay > 0 else None
-        self.train_data = PackedMemmapDataset(self.data_cfg.train_path, self.data_cfg.seq_len)
+        self.train_data = self._build_train_data()
         self.val_data = PackedMemmapDataset(self.data_cfg.val_path, self.data_cfg.seq_len)
         self.output_dir = ensure_dir(self.train_cfg.output_dir)
         scaler_enabled = self.device.type == "cuda" and autocast_dtype(self.train_cfg.precision, self.device) == torch.float16
@@ -71,6 +71,16 @@ class Trainer:
         self.start_step = 0
         if self.train_cfg.resume_from_checkpoint:
             self.start_step = self._resume(self.train_cfg.resume_from_checkpoint)
+
+    def _build_train_data(self):
+        """Use a weighted DataMixture when data.sources is set, else a single packed dataset."""
+        from nanoforge.data.mixture import build_mixture_from_config
+
+        mixture = build_mixture_from_config(self.data_cfg, self.data_cfg.seq_len, self.train_cfg.seed)
+        if mixture is not None:
+            get_logger("training.trainer").info("training data mixture: %s", mixture.describe())
+            return mixture
+        return PackedMemmapDataset(self.data_cfg.train_path, self.data_cfg.seq_len)
 
     def _make_writer(self):
         if not self.train_cfg.tensorboard:
@@ -142,6 +152,8 @@ class Trainer:
 
     @torch.no_grad()
     def generate_sample(self, step: int) -> dict[str, float]:
+        if not getattr(self.model_cfg, "is_causal", True):
+            return {}  # sampling only meaningful for generative tasks
         tokenizer = load_tokenizer(self.data_cfg.tokenizer_type, self.data_cfg.tokenizer_path)
         was_training = self.model.training
         self.model.eval()

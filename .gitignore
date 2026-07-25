@@ -98,3 +98,10 @@ generated/
 # Environment variables
 .env
 .env.local
+
+# Claude / AI tooling — not for distribution
+CLAUDE.md
+.claude/
+opencode.json
+package.json
+package-lock.json

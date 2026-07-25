@@ -1,4 +1,6 @@
 
+mod cleaning;
+
 use pyo3::prelude::*;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -684,5 +686,6 @@ fn nanoforge_tokenizers(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<ByteLevelBpeTokenizer>()?;
     module.add_function(wrap_pyfunction!(sanitize_utf8, module)?)?;
     module.add_function(wrap_pyfunction!(encode_byte_text, module)?)?;
+    cleaning::register(module)?;
     Ok(())
 }

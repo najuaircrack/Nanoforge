@@ -1,0 +1,73 @@
+# small-base — ~125M params, single high-end GPU (24GB)
+# General-purpose pretraining base model. GPT-2 medium class, modern internals.
+
+model:
+  vocab_size: 32000
+  max_seq_len: 4096
+  d_model: 768
+  n_layers: 12
+  n_heads: 12
+  n_kv_heads: 4           # GQA
+  ffn_hidden_mult: 2.67
+  dropout: 0.0
+  rope_theta: 1000000.0
+  norm_eps: 1.0e-5
+  tie_embeddings: true
+  activation: swiglu
+  normalization: rmsnorm
+  position_embedding: rope
+  attention_backend: sdpa
+  ffn_type: swiglu
+  block_type: transformer
+  gradient_checkpointing: true
+  lora_rank: 0
+  moe: null
+
+training:
+  run_name: small-base
+  output_dir: runs/small-base
+  seed: 1337
+  max_steps: 100000
+  batch_size: 256
+  micro_batch_size: 8
+  grad_accum_steps: 32
+  learning_rate: 6.0e-4
+  min_learning_rate: 6.0e-5
+  warmup_ratio: 0.02
+  optimizer: adamw
+  scheduler: cosine
+  weight_decay: 0.1
+  betas: [0.9, 0.95]
+  eps: 1.0e-8
+  grad_clip: 1.0
+  precision: bf16
+  gradient_checkpointing: true
+  eval_interval: 1000
+  eval_steps: 100
+  save_interval: 2000
+  log_interval: 20
+  health_interval: 20
+  early_stopping_patience: 20
+  ema_decay: 0.0
+  tensorboard: true
+  wandb: false
+  distributed_backend: none
+
+data:
+  train_path: data/packed/YOUR_DATASET/train.bin
+  val_path: data/packed/YOUR_DATASET/val.bin
+  tokenizer_type: bpe
+  tokenizer_path: data/tokenizers/YOUR_TOKENIZER.json
+  seq_len: 4096
+  mode: generative
+  loss_masking: none
+  num_workers: 4
+  prefetch_factor: 4
+  pin_memory: true
+
+inference:
+  max_new_tokens: 512
+  temperature: 0.7
+  top_k: 50
+  top_p: 0.95
+  repetition_penalty: 1.1

@@ -1,10 +1,17 @@
 # Nanoforge
 
 Nanoforge is a compact, from-scratch transformer framework for training and running
-small-to-medium decoder-only language models on local hardware (CPU or a single GPU).
+transformer models on local hardware (CPU or a single GPU). It is built on **PyTorch**
+(`torch >= 2.2`) — there is no TensorFlow or JAX anywhere in the stack — with an optional
+**Rust** performance layer (via PyO3/maturin) for hot loops like tokenizer training.
+
+The model core is a **task-agnostic transformer backbone with pluggable output heads**, so
+the same body can be trained as a causal LM / chatbot, a masked LM, a sequence or token
+classifier, or a reward model — it is *not* locked to a decoder-only GPT clone. The Python
+layer is the orchestration and config surface; Rust is the performance path.
 
 It is built for **learning, experimentation, and rapid prototyping** — the whole stack
-(model, tokenizers, data pipeline, training loop, inference, CLI) is meant to stay small
+(model, tokenizers, data pipeline, training loop, inference, CLI/TUI) is meant to stay small
 enough to read and hack. It is *not* a production framework like vLLM, DeepSpeed, or
 Hugging Face Transformers.
 
@@ -66,27 +73,41 @@ Optional extras (install what you use):
 
 ## 60-second quickstart
 
-The fastest path uses the dependency-free **byte tokenizer** (vocab 260) — no tokenizer
-training needed.
+The fastest path is `auto-train`, which trains a tokenizer, packs your data, writes a
+CPU-friendly config, and starts training — in one command. Point it at any text/JSONL/chat
+data (a JSONL file with a `messages: [{role, content}]` field is treated as chat):
 
 ```bash
-# 1. Pack some raw text/JSONL into token memmaps
-nanoforge prepare --input data/raw --tokenizer byte --out data/packed/tiny
+# One shot: tokenizer -> pack -> config -> train (chat model, assistant-only masking)
+nanoforge auto-train --input data/raw/chat.jsonl --name mychat \
+    --mode chat --tokenizer bpe --vocab-size 32000 --seq-len 512 \
+    --ram 16GB --max-steps 3000 --dashboard
 
-# 2. Train (add --dashboard for a live browser view)
-nanoforge train --config configs/tiny.yaml
+# Then chat with / generate from the result
+nanoforge chat     --checkpoint runs/mychat/best.pt
+nanoforge generate --checkpoint runs/mychat/best.pt --prompt "Explain RoPE in one line."
+```
 
-# 3. Chat or generate
-nanoforge chat --checkpoint runs/tiny/best.pt
-nanoforge generate --checkpoint runs/tiny/best.pt --prompt "Once upon a time"
+Prefer the manual pipeline (or the dependency-free **byte tokenizer**, vocab 260, no training)?
+
+```bash
+nanoforge prepare --input data/raw --tokenizer byte --out data/packed/demo
+nanoforge train   --config configs/nano-debug.yaml     # or small-base / chat-sft / moe-large
+```
+
+Watch a run live in the browser dashboard or the terminal UI:
+
+```bash
+nanoforge dashboard --run runs/mychat      # browser
+nanoforge tui       --run runs/mychat      # terminal (Textual; pip install -e .[tui])
 ```
 
 Inspect the framework itself:
 
 ```bash
-nanoforge registries                    # list registered components
-nanoforge validate-config --config configs/tiny.yaml
-nanoforge params --config configs/tiny.yaml
+nanoforge registries                       # list registered components (heads, losses, ...)
+nanoforge validate-config --config configs/nano-debug.yaml
+nanoforge params          --config configs/nano-debug.yaml
 ```
 
 For a complete tutorial that trains a tiny chat model which remembers your name and says
@@ -98,7 +119,13 @@ For a complete tutorial that trains a tiny chat model which remembers your name 
 ## Features
 
 **Model architecture**
-- GPT-style decoder-only transformer, pre-norm, tied embeddings, residual scaling
+- Task-agnostic transformer **backbone** + pluggable **task heads** (`task_type` in config):
+  - `causal_lm` / `chat` / `code_generation` / `instruction_following` — autoregressive LM
+  - `masked_lm` — BERT-style bidirectional (attention becomes non-causal automatically)
+  - `sequence_classification`, `token_classification` — pooled / per-token classifiers
+  - `reward_modeling` / `value_estimation` — scalar reward head (pairwise or MSE loss)
+  - (image/audio/seq2seq heads are registered as stubs — see Limitations)
+- GPT-style pre-norm transformer, tied embeddings, residual scaling
 - Grouped-Query / Multi-Query Attention (via `n_kv_heads`)
 - RoPE (with linear / dynamic / YaRN-style scaling) and ALiBi position embeddings
 - Sliding-window attention
@@ -128,6 +155,13 @@ For a complete tutorial that trains a tiny chat model which remembers your name 
 
 **Inference**
 - Streaming generation and an interactive chat CLI (applies the chat template)
+- **Real turn-based chat, not raw autocompletion**: a model trained in `chat` mode learns
+  the `<|system|>` / `<|user|>` / `<|assistant|>` format with **assistant-only loss masking**
+  (loss is computed only on the assistant's tokens), and generation **stops at the next role
+  boundary** (`<|user|>` / `<|system|>` / `<|endoftext|>`) — so it answers as an assistant and
+  hands the turn back instead of continuing the whole transcript. (Response *quality* still
+  depends on model size and training budget — a tiny model trained briefly will be coherent in
+  shape but weak in content.)
 - Sampling: temperature, top-k, top-p, min-p, repetition / frequency / presence penalties,
   no-repeat-ngram, Mirostat (v2-style)
 - Preset modes: `balanced`, `chat`, `creative`, `coding`, `deterministic`, `low_memory`,
@@ -149,11 +183,45 @@ including honest notes on which pieces are experimental or partial.
 
 ---
 
+## Performance layer (Rust)
+
+Nanoforge keeps orchestration and modelling in Python (PyTorch) but pushes CPU-bound,
+embarrassingly-parallel hot loops into an optional **Rust** extension
+(`native/nanoforge-tokenizers/`, built with PyO3 + `maturin`, using `rayon` for
+multithreading and `lto = "thin"`). The extension is **optional** — every Rust path has a
+pure-Python fallback, so the framework runs without a Rust toolchain.
+
+```bash
+pip install -e ".[native]"          # installs maturin
+cd native/nanoforge-tokenizers
+maturin develop --release           # builds the extension into your venv
+nanoforge tokenizer-status          # confirms native acceleration is active
+```
+
+**In Rust today**
+- Byte-level BPE tokenizer *training* (merge-pair heap, parallel word-frequency counting)
+- Parallel batch encoding/decoding
+
+**Good candidates to move into Rust next** (currently pure Python, and the CPU bottlenecks):
+- **Data packing** (`data/packing.py`) — tokenize + pack into binary shards; the single most
+  expensive preprocessing step and trivially parallel across documents.
+- **Cleaning & dedup** (`data/cleaning.py`) — UTF-8 normalization, hashing-based dedup,
+  language filtering over large corpora.
+- **Memmap dataset iteration / shard sampling** (`data/dataset.py`) — hot path during
+  training; a Rust iterator would cut Python per-batch overhead.
+- **Format streaming** (`data/formats.py`) — JSONL/CSV/Parquet record extraction.
+
+Model math (attention, matmuls) stays in PyTorch — that already dispatches to optimized
+C++/CUDA kernels, so rewriting it in Rust would be slower, not faster. Rust is for the
+data-and-tokenizer path, not the tensor path.
+
+---
+
 ## Project layout
 
 ```text
 Nanoforge/
-├── configs/               # YAML training configs (tiny, cpu-tiny, nano-chat, ...)
+├── configs/               # YAML training configs (nano-debug, small-base, chat-sft, moe-large)
 ├── docs/                  # documentation (this set)
 ├── scripts/               # helper scripts (data generation, conversion, checks)
 ├── tests/                 # pytest suite
@@ -162,14 +230,15 @@ Nanoforge/
 │   ├── cli.py             # command-line interface (entry point: `nanoforge`)
 │   ├── config.py          # dataclass config system + YAML loader
 │   ├── registry.py        # component registries + plugin discovery
-│   ├── model/             # transformer, attention, rope, norms, moe, lora, ...
+│   ├── model/             # backbone, task heads, attention, rope, norms, moe, lora, ...
 │   ├── data/              # formats, cleaning, tokenizers, packing, dataset, modes
 │   ├── training/          # trainer, optimizers, schedulers, checkpoint, health
 │   ├── generation/        # inference engine + sampling
 │   ├── evaluation/        # checkpoint metrics
 │   ├── export/            # onnx + gguf manifest
 │   ├── server.py          # FastAPI inference server
-│   └── dashboard.py       # live training dashboard
+│   ├── dashboard.py       # live training / inference / data web dashboard
+│   └── tui.py             # full-scope terminal UI (Textual)
 └── runs/                  # training outputs (checkpoints, metrics) — gitignored
 ```
 
