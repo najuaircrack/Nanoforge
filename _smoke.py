@@ -4,7 +4,7 @@ mods = [
     "nanoforge.cli",
     "nanoforge.config",
     "nanoforge.tui",
-    "nanoforge.dashboard",
+    "nanoforge.webapp",
     "nanoforge.imports",
     "nanoforge.server",
     "nanoforge.progress",

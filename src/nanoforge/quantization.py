@@ -20,7 +20,13 @@ def apply_quantization(model: torch.nn.Module, backend: str = "none", **kwargs) 
     if key in {"int8", "dynamic_int8", "cpu_int8"}:
         return dynamic_quantize_cpu(model)
     if key in {"int4", "gptq", "awq"}:
-        return prepare_weight_only_quantization(model, bits=4)
+        raise NotImplementedError(
+            f"Quantization backend '{backend}' is not implemented natively. "
+            "Nanoforge does not ship int4/GPTQ/AWQ kernels. Export the model to GGUF "
+            "(`nanoforge export --format gguf`) and quantize with llama.cpp, or run an "
+            "external GPTQ/AWQ toolchain on the exported weights. Use backend='int8' for "
+            "built-in dynamic CPU quantization."
+        )
     if key == "gguf":
         return mark_gguf_export_compatible(model)
     raise ValueError(f"Unknown quantization backend '{backend}'.")
@@ -31,20 +37,6 @@ def dynamic_quantize_cpu(model: torch.nn.Module) -> torch.nn.Module:
 
     quant = getattr(torch, "ao", torch).quantization
     return quant.quantize_dynamic(model.cpu().eval(), {torch.nn.Linear}, dtype=torch.qint8)
-
-
-def prepare_weight_only_quantization(model: torch.nn.Module, bits: int = 4) -> torch.nn.Module:
-    """Attach metadata for external GPTQ/AWQ style weight-only passes.
-
-    PyTorch does not ship a universal int4 transformer quantizer. Nanoforge keeps this hook
-    explicit so low-memory runtimes can detect intent and route to external kernels.
-    """
-
-    if bits not in {4, 8}:
-        raise ValueError("Weight-only quantization supports 4 or 8 bits.")
-    model.eval()
-    setattr(model, "nanoforge_quantization", QuantizationConfig(backend=f"int{bits}", dtype=f"int{bits}"))
-    return model
 
 
 def mark_gguf_export_compatible(model: torch.nn.Module) -> torch.nn.Module:

@@ -1,8 +1,9 @@
 import { useEffect, useRef, useState } from 'react'
-import { Send, Loader2, Bot, ChevronDown } from 'lucide-react'
+import { Send, Loader2, Bot, ChevronDown, Database, Sliders, Sparkles } from 'lucide-react'
 import ReactMarkdown from 'react-markdown'
 import { useQuery } from '@tanstack/react-query'
 import { get, post } from '../lib/api'
+import { Slider } from '../lib/ui'
 
 type Msg = { role: 'user' | 'assistant'; content: string }
 
@@ -16,6 +17,21 @@ export default function Chat() {
   const [busy, setBusy] = useState(false)
   const [status, setStatus] = useState('')
   const [showPicker, setShowPicker] = useState(false)
+  // Generation params
+  const [maxTokens, setMaxTokens] = useState(512)
+  const [temperature, setTemperature] = useState(0.8)
+  const [topK, setTopK] = useState(50)
+  const [showParams, setShowParams] = useState(false)
+  // RAG index state
+  const [ragLoaded, setRagLoaded] = useState('')
+  const [ragPath, setRagPath] = useState('')
+  const [ragBusy, setRagBusy] = useState(false)
+  const [showRag, setShowRag] = useState(false)
+  // Personal-facts index state (retrieve + templated answer, bypasses the model)
+  const [factsLoaded, setFactsLoaded] = useState('')
+  const [factsPath, setFactsPath] = useState('')
+  const [factsBusy, setFactsBusy] = useState(false)
+  const [showFacts, setShowFacts] = useState(false)
   const endRef = useRef<HTMLDivElement>(null)
   const taRef = useRef<HTMLTextAreaElement>(null)
 
@@ -27,7 +43,43 @@ export default function Chat() {
     get('/api/chat/status').then(r => {
       if (r.loaded) { setLoaded(r.loaded); localStorage.setItem(STORAGE_KEY, r.loaded) }
     }).catch(() => {})
+    get('/api/rag/status').then(r => {
+      if (r.loaded) { setRagLoaded(r.loaded); setRagPath(r.loaded) }
+    }).catch(() => {})
+    get('/api/facts/status').then(r => {
+      if (r.loaded) { setFactsLoaded(r.loaded); setFactsPath(r.loaded) }
+    }).catch(() => {})
   }, [])
+
+  async function loadRag() {
+    const path = ragPath.trim()
+    if (!path) return
+    setRagBusy(true)
+    const r = await post('/api/rag/load', { path })
+    setRagBusy(false)
+    if (r.ok) { setRagLoaded(path); setShowRag(false) }
+    else setStatus(`RAG error: ${r.error}`)
+  }
+
+  async function unloadRag() {
+    await post('/api/rag/unload', {})
+    setRagLoaded(''); setShowRag(false)
+  }
+
+  async function loadFacts() {
+    const path = factsPath.trim()
+    if (!path) return
+    setFactsBusy(true)
+    const r = await post('/api/facts/load', { path })
+    setFactsBusy(false)
+    if (r.ok) { setFactsLoaded(path); setShowFacts(false) }
+    else setStatus(`Facts error: ${r.error}`)
+  }
+
+  async function unloadFacts() {
+    await post('/api/facts/unload', {})
+    setFactsLoaded(''); setShowFacts(false)
+  }
 
   useEffect(() => { endRef.current?.scrollIntoView({ behavior: 'smooth' }) }, [msgs])
 
@@ -65,7 +117,9 @@ export default function Chat() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           messages: history.map(m => [m.role, m.content]),
-          max_new_tokens: 512,
+          max_new_tokens: maxTokens,
+          temperature,
+          top_k: topK,
         }),
       })
       const reader = res.body!.getReader()
@@ -205,8 +259,9 @@ export default function Chat() {
               }}
             />
 
-            {/* Bottom bar: model picker + send */}
+            {/* Bottom bar: model picker + RAG pill + send */}
             <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
               {/* Model pill — Claude.ai style */}
               <div style={{ position: 'relative' }} onClick={e => e.stopPropagation()}>
                 <button onClick={() => setShowPicker(s => !s)} style={{
@@ -253,6 +308,151 @@ export default function Chat() {
                     }
                   </div>
                 )}
+              </div>
+
+              {/* RAG index pill */}
+              <div style={{ position: 'relative' }} onClick={e => e.stopPropagation()}>
+                <button onClick={() => setShowRag(s => !s)} style={{
+                  display: 'flex', alignItems: 'center', gap: 6,
+                  padding: '5px 10px', borderRadius: 20,
+                  border: '1px solid var(--color-line-2)',
+                  background: showRag ? 'var(--color-surface-3)' : 'transparent',
+                  color: ragLoaded ? 'var(--color-ink-2)' : 'var(--color-ink-3)',
+                  cursor: 'pointer', fontSize: 12, fontFamily: 'var(--font-mono)',
+                  maxWidth: 200, overflow: 'hidden',
+                }}>
+                  {ragBusy
+                    ? <Loader2 size={11} className="spin" />
+                    : <Database size={11} style={{ flexShrink: 0, color: ragLoaded ? 'var(--color-pos)' : 'var(--color-ink-3)' }} />
+                  }
+                  <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                    {ragLoaded ? ragLoaded.split(/[\\/]/).pop() : 'No index'}
+                  </span>
+                </button>
+
+                {showRag && (
+                  <div style={{
+                    position: 'absolute', bottom: 'calc(100% + 8px)', left: 0, zIndex: 50,
+                    background: 'var(--color-surface-2)', border: '1px solid var(--color-line-2)',
+                    borderRadius: 12, padding: 10, minWidth: 300,
+                    boxShadow: '0 -8px 32px rgba(0,0,0,0.4)',
+                    display: 'flex', flexDirection: 'column', gap: 8,
+                  }}>
+                    <div style={{ fontSize: 11, color: 'var(--color-ink-3)', fontWeight: 600, letterSpacing: '0.04em', textTransform: 'uppercase' }}>RAG Index</div>
+                    <input
+                      value={ragPath}
+                      onChange={e => setRagPath(e.target.value)}
+                      placeholder="Path to index directory…"
+                      style={{
+                        border: '1px solid var(--color-line-2)', borderRadius: 8, padding: '6px 10px',
+                        background: 'var(--color-surface-3)', color: 'var(--color-ink)',
+                        fontFamily: 'var(--font-mono)', fontSize: 12, outline: 'none', width: '100%',
+                      }}
+                    />
+                    <div style={{ display: 'flex', gap: 6 }}>
+                      <button onClick={loadRag} disabled={ragBusy || !ragPath.trim()} style={{
+                        flex: 1, padding: '6px 0', borderRadius: 8, border: 'none', cursor: 'pointer',
+                        background: 'var(--color-accent)', color: 'var(--color-accent-ink)', fontSize: 12,
+                      }}>Load</button>
+                      {ragLoaded && (
+                        <button onClick={unloadRag} style={{
+                          padding: '6px 12px', borderRadius: 8, border: '1px solid var(--color-line-2)',
+                          background: 'transparent', color: 'var(--color-ink-3)', cursor: 'pointer', fontSize: 12,
+                        }}>Unload</button>
+                      )}
+                    </div>
+                  </div>
+                )}
+              </div>
+
+              {/* Facts index pill — answers personal questions from a facts KB,
+                  bypassing the model on a confident retrieval hit */}
+              <div style={{ position: 'relative' }} onClick={e => e.stopPropagation()}>
+                <button onClick={() => setShowFacts(s => !s)} style={{
+                  display: 'flex', alignItems: 'center', gap: 6,
+                  padding: '5px 10px', borderRadius: 20,
+                  border: '1px solid var(--color-line-2)',
+                  background: showFacts ? 'var(--color-surface-3)' : 'transparent',
+                  color: factsLoaded ? 'var(--color-ink-2)' : 'var(--color-ink-3)',
+                  cursor: 'pointer', fontSize: 12, fontFamily: 'var(--font-mono)',
+                  maxWidth: 200, overflow: 'hidden',
+                }}>
+                  {factsBusy
+                    ? <Loader2 size={11} className="spin" />
+                    : <Sparkles size={11} style={{ flexShrink: 0, color: factsLoaded ? 'var(--color-pos)' : 'var(--color-ink-3)' }} />
+                  }
+                  <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                    {factsLoaded ? factsLoaded.split(/[\\/]/).pop() : 'No facts'}
+                  </span>
+                </button>
+
+                {showFacts && (
+                  <div style={{
+                    position: 'absolute', bottom: 'calc(100% + 8px)', left: 0, zIndex: 50,
+                    background: 'var(--color-surface-2)', border: '1px solid var(--color-line-2)',
+                    borderRadius: 12, padding: 10, minWidth: 300,
+                    boxShadow: '0 -8px 32px rgba(0,0,0,0.4)',
+                    display: 'flex', flexDirection: 'column', gap: 8,
+                  }}>
+                    <div style={{ fontSize: 11, color: 'var(--color-ink-3)', fontWeight: 600, letterSpacing: '0.04em', textTransform: 'uppercase' }}>Facts KB</div>
+                    <div style={{ fontSize: 11, color: 'var(--color-ink-3)', lineHeight: 1.4 }}>
+                      Personal questions are answered directly from this index, bypassing the model.
+                    </div>
+                    <input
+                      value={factsPath}
+                      onChange={e => setFactsPath(e.target.value)}
+                      placeholder="Path to facts index directory…"
+                      style={{
+                        border: '1px solid var(--color-line-2)', borderRadius: 8, padding: '6px 10px',
+                        background: 'var(--color-surface-3)', color: 'var(--color-ink)',
+                        fontFamily: 'var(--font-mono)', fontSize: 12, outline: 'none', width: '100%',
+                      }}
+                    />
+                    <div style={{ display: 'flex', gap: 6 }}>
+                      <button onClick={loadFacts} disabled={factsBusy || !factsPath.trim()} style={{
+                        flex: 1, padding: '6px 0', borderRadius: 8, border: 'none', cursor: 'pointer',
+                        background: 'var(--color-accent)', color: 'var(--color-accent-ink)', fontSize: 12,
+                      }}>Load</button>
+                      {factsLoaded && (
+                        <button onClick={unloadFacts} style={{
+                          padding: '6px 12px', borderRadius: 8, border: '1px solid var(--color-line-2)',
+                          background: 'transparent', color: 'var(--color-ink-3)', cursor: 'pointer', fontSize: 12,
+                        }}>Unload</button>
+                      )}
+                    </div>
+                  </div>
+                )}
+              </div>
+
+              {/* Generation params pill */}
+              <div style={{ position: 'relative' }} onClick={e => e.stopPropagation()}>
+                <button onClick={() => setShowParams(s => !s)} style={{
+                  display: 'flex', alignItems: 'center', gap: 6,
+                  padding: '5px 10px', borderRadius: 20,
+                  border: '1px solid var(--color-line-2)',
+                  background: showParams ? 'var(--color-surface-3)' : 'transparent',
+                  color: 'var(--color-ink-2)',
+                  cursor: 'pointer', fontSize: 12, fontFamily: 'var(--font-mono)',
+                }}>
+                  <Sliders size={11} style={{ flexShrink: 0 }} />
+                  <span>temp {temperature.toFixed(2)}</span>
+                </button>
+
+                {showParams && (
+                  <div style={{
+                    position: 'absolute', bottom: 'calc(100% + 8px)', left: 0, zIndex: 50,
+                    background: 'var(--color-surface-2)', border: '1px solid var(--color-line-2)',
+                    borderRadius: 12, padding: 14, minWidth: 300,
+                    boxShadow: '0 -8px 32px rgba(0,0,0,0.4)',
+                    display: 'flex', flexDirection: 'column', gap: 14,
+                  }}>
+                    <div style={{ fontSize: 11, color: 'var(--color-ink-3)', fontWeight: 600, letterSpacing: '0.04em', textTransform: 'uppercase' }}>Generation</div>
+                    <Slider label="Temperature" value={temperature} min={0} max={2} step={0.05} onChange={setTemperature} />
+                    <Slider label="Top-K" value={topK} min={0} max={200} step={1} onChange={v => setTopK(Math.round(v))} />
+                    <Slider label="Max new tokens" value={maxTokens} min={16} max={4096} step={16} onChange={v => setMaxTokens(Math.round(v))} />
+                  </div>
+                )}
+              </div>
               </div>
 
               {/* Send button */}

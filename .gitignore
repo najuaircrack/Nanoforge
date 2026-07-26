@@ -5,6 +5,7 @@ __pycache__/
 *.pyd
 *.so
 
+.agents/
 # Virtual environments
 .venv/
 venv/
@@ -105,3 +106,15 @@ CLAUDE.md
 opencode.json
 package.json
 package-lock.json
+skills-lock.json
+
+# ── Personal / private "nashwa" artifacts — NOT for the open-source repo ──
+# The nashwa* work is a private style-clone + personal facts KB. Keep the
+# reusable framework (rag/, personal.py, generic scripts) public, but never
+# publish the personal configs, data, indexes, or throwaway probe scripts.
+configs/nashwa-*.yaml
+scripts/*nashwa*.py
+data/facts/
+data/rag/
+data/persona*
+data/chat/

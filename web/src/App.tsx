@@ -1,24 +1,26 @@
 import { BrowserRouter, Routes, Route, NavLink, useLocation } from 'react-router-dom'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { LayoutDashboard, MessageSquare, Database, Cpu, FileCode2, Box, Activity } from 'lucide-react'
+import { LayoutDashboard, MessageSquare, Database, Cpu, FileCode2, Box, Activity, SlidersHorizontal } from 'lucide-react'
 import Dashboard from './pages/Dashboard'
 import Chat from './pages/Chat'
 import Data from './pages/Data'
 import Train from './pages/Train'
 import Configs from './pages/Configs'
+import ConfigBuilder from './pages/ConfigBuilder'
 import Models from './pages/Models'
 import System from './pages/System'
 
 const qc = new QueryClient({ defaultOptions: { queries: { retry: 1, staleTime: 5000 } } })
 
 const NAV = [
-  { to: '/',        icon: LayoutDashboard, label: 'Dashboard' },
-  { to: '/train',   icon: Cpu,             label: 'Train'     },
-  { to: '/chat',    icon: MessageSquare,   label: 'Chat'      },
-  { to: '/data',    icon: Database,        label: 'Data'      },
-  { to: '/configs', icon: FileCode2,       label: 'Configs'   },
-  { to: '/models',  icon: Box,             label: 'Models'    },
-  { to: '/system',  icon: Activity,        label: 'System'    },
+  { to: '/',        icon: LayoutDashboard,   label: 'Dashboard' },
+  { to: '/train',   icon: Cpu,               label: 'Train'     },
+  { to: '/builder', icon: SlidersHorizontal, label: 'Builder'   },
+  { to: '/chat',    icon: MessageSquare,     label: 'Chat'      },
+  { to: '/data',    icon: Database,          label: 'Data'      },
+  { to: '/configs', icon: FileCode2,         label: 'Configs'   },
+  { to: '/models',  icon: Box,               label: 'Models'    },
+  { to: '/system',  icon: Activity,          label: 'System'    },
 ]
 
 function Sidebar() {
@@ -100,6 +102,7 @@ export default function App() {
           <Routes>
             <Route path="/"        element={<Dashboard />} />
             <Route path="/train"   element={<Train />} />
+            <Route path="/builder" element={<ConfigBuilder />} />
             <Route path="/chat"    element={<Chat />} />
             <Route path="/data"    element={<Data />} />
             <Route path="/configs" element={<Configs />} />

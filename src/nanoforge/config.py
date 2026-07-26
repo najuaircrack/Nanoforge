@@ -119,6 +119,10 @@ class TrainConfig:
     wandb: bool = False
     compile: bool = False
     device: str = "auto"
+    # Knowledge distillation (optional): set teacher_checkpoint to enable.
+    teacher_checkpoint: str | None = None
+    distill_alpha: float = 0.5
+    distill_temperature: float = 2.0
 
     def __post_init__(self) -> None:
         self.betas = tuple(self.betas)  # type: ignore[assignment]
@@ -138,6 +142,10 @@ class DataConfig:
     loss_masking: str = "auto"
     assistant_only_loss: bool = False
     prompt_template: str | None = None
+    # True for chat models trained from an export that has no system turn. Such
+    # models are hurt by an out-of-distribution system prompt at inference, so the
+    # CLI/server suppress the default system prompt for them (see cli.py).
+    no_system_prompt: bool = False
     dataset_weights: dict[str, float] | None = None
     streaming: bool = False
     tokenizer_batch_size: int = 256

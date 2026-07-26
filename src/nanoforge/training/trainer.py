@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import math
 import signal
+import threading
 import time
 from pathlib import Path
+from typing import Any
 
 import torch
 from tqdm import tqdm, trange
@@ -17,6 +19,11 @@ from nanoforge.model.transformer import build_model
 from nanoforge.profiling import estimate_model_profile
 from nanoforge.progress import JsonlMetricLogger
 from nanoforge.training.checkpoint import AsyncCheckpointSaver, load_checkpoint, restore_rng_state
+from nanoforge.training.distributed import (
+    discover_env,
+    init_process_group,
+    wrap_model,
+)
 from nanoforge.training.health import TrainingHealthMonitor
 from nanoforge.training.schedulers import create_scheduler
 from nanoforge.training.utils import (
@@ -38,12 +45,26 @@ class Trainer:
         self.train_cfg = config.training
         self.model_cfg = config.model
         self.data_cfg = config.data
+        self._stop_requested = False
         if self.train_cfg.low_memory:
             set_low_memory_env()
         seed_everything(self.train_cfg.seed)
+        self.dist_env = discover_env()
+        if self.dist_env.enabled:
+            init_process_group(self.dist_env)
         self.device = resolve_device(self.train_cfg.device)
+        if self.dist_env.enabled and self.device.type == "cuda":
+            self.device = torch.device("cuda", self.dist_env.local_rank)
+        self.is_main_process = self.dist_env.is_main
         self.model_cfg.gradient_checkpointing = self.train_cfg.gradient_checkpointing
         self.model = build_model(config).to(self.device)
+        self.model = wrap_model(
+            self.model,
+            self.dist_env,
+            self.train_cfg.distributed_backend,
+            precision=self.train_cfg.precision,
+            gradient_checkpointing=self.train_cfg.gradient_checkpointing,
+        )
         if self.train_cfg.compile and hasattr(torch, "compile"):
             self.model = torch.compile(self.model)  # type: ignore[assignment]
         self.optimizer = configure_named_optimizer(
@@ -71,6 +92,16 @@ class Trainer:
         self.start_step = 0
         if self.train_cfg.resume_from_checkpoint:
             self.start_step = self._resume(self.train_cfg.resume_from_checkpoint)
+
+    @property
+    def unwrapped_model(self):
+        """The underlying model, unwrapping DDP/FSDP/torch.compile wrappers.
+
+        Custom methods like ``estimate_num_params`` live on the original module, not
+        on the distributed wrapper, so reach through ``.module`` when present.
+        """
+        model = self.model
+        return getattr(model, "module", model)
 
     def _build_train_data(self):
         """Use a weighted DataMixture when data.sources is set, else a single packed dataset."""
@@ -113,7 +144,10 @@ class Trainer:
 
     def _resume(self, checkpoint_path: str | Path) -> int:
         payload = load_checkpoint(checkpoint_path, map_location=self.device)
-        self.model.load_state_dict(payload["model"], strict=True)
+        # Load into the unwrapped module so DDP/FSDP's ``module.`` key prefix does
+        # not break strict loading, and so plain (non-distributed) checkpoints load
+        # into a distributed run and vice versa.
+        self.unwrapped_model.load_state_dict(payload["model"], strict=True)
         if payload.get("optimizer") is not None:
             self.optimizer.load_state_dict(payload["optimizer"])
         restore_rng_state(payload.get("rng"))
@@ -128,6 +162,11 @@ class Trainer:
     def _autocast(self):
         dtype = autocast_dtype(self.train_cfg.precision, self.device)
         return torch.autocast(device_type=self.device.type, dtype=dtype, enabled=dtype is not None)
+
+    def _forward_loss(self, x: torch.Tensor, y: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Compute loss and return (loss, logits). Override in subclasses for custom objectives."""
+        out = self.model(x, labels=y)
+        return out.loss, out.logits
 
     @torch.no_grad()
     def evaluate(self) -> tuple[float, float]:
@@ -211,6 +250,14 @@ class Trainer:
             "sample/tokens": float(len(generated)),
         }
 
+    def request_stop(self) -> None:
+        """Request a graceful stop from another thread (e.g. the live TUI).
+
+        The training loop checks ``self._stop_requested`` at each step boundary and
+        will checkpoint to ``interrupt.pt`` before exiting. Safe to call repeatedly.
+        """
+        self._stop_requested = True
+
     def train(self) -> None:
         self.model.train()
 
@@ -264,7 +311,7 @@ class Trainer:
             {
                 "run/max_steps": self.train_cfg.max_steps,
                 "run/total_tokens": total_tokens,
-                "run/parameters": self.model.estimate_num_params(),
+                "run/parameters": self.unwrapped_model.estimate_num_params(),
                 **{
                     f"profile/{key}": value
                     for key, value in estimate_model_profile(
@@ -288,7 +335,7 @@ class Trainer:
                 logger.warning("saving interrupt checkpoint at step %s", step)
                 self.checkpoints.save(
                     self.output_dir / "interrupt.pt",
-                    self.model,
+                    self.unwrapped_model,
                     self.optimizer,
                     self.config,
                     step,
@@ -308,13 +355,13 @@ class Trainer:
             for _ in range(self.train_cfg.grad_accum_steps):
                 x, y = self._batch("train", self.train_cfg.micro_batch_size)
                 with self._autocast():
-                    out = self.model(x, labels=y)
-                    loss = out.loss / self.train_cfg.grad_accum_steps
+                    loss_full, step_logits = self._forward_loss(x, y)
+                    loss = loss_full / self.train_cfg.grad_accum_steps
                 if not torch.isfinite(loss.detach()):
                     skip_step = True
                     skip_reason = "nonfinite_loss"
                     break
-                last_logits = out.logits.detach()
+                last_logits = step_logits.detach()
                 self.scaler.scale(loss).backward()
                 total_loss += float(loss.detach().cpu())  # loss is already the per-token mean
             grad_norm_before = 0.0
@@ -402,7 +449,7 @@ class Trainer:
                     self._log({"checkpoint/best_val_loss": best_val}, step, event="checkpoint")
                     self.checkpoints.save(
                         self.output_dir / "best.pt",
-                        self.model,
+                        self.unwrapped_model,
                         self.optimizer,
                         self.config,
                         step,
@@ -417,7 +464,7 @@ class Trainer:
             if step > 0 and step % self.train_cfg.save_interval == 0:
                 self.checkpoints.save(
                     self.output_dir / f"step-{step}.pt",
-                    self.model,
+                    self.unwrapped_model,
                     self.optimizer,
                     self.config,
                     step,
@@ -432,7 +479,7 @@ class Trainer:
         if not interrupted:
             self.checkpoints.save(
                 self.output_dir / "last.pt",
-                self.model,
+                self.unwrapped_model,
                 self.optimizer,
                 self.config,
                 self.train_cfg.max_steps,
@@ -457,6 +504,69 @@ class Trainer:
 def train_from_config(path: str | Path) -> None:
     cfg = load_config(path)
     Trainer(cfg).train()
+
+
+def run_training_with_optional_tui(path: str | Path, no_tui: bool = False) -> None:
+    """Train from a config, auto-launching the live terminal UI on an interactive TTY.
+
+    When stdout is a real terminal (and textual is installed and ``--no-tui`` /
+    ``NANOFORGE_NO_TUI`` are not set), training runs in a background thread while a
+    live metrics board owns the main thread. Detaching the board (``q``) leaves
+    training running headless; ``s`` requests a graceful stop. In any non-interactive
+    context (pipes, the web job runner, CI) this is exactly equivalent to
+    ``train_from_config`` — the plain tqdm progress bar.
+    """
+    import os
+    import sys
+
+    disabled = no_tui or os.environ.get("NANOFORGE_NO_TUI", "") not in ("", "0", "false", "False")
+    interactive = bool(getattr(sys.stdout, "isatty", lambda: False)())
+    cfg = load_config(path)
+
+    if disabled or not interactive:
+        Trainer(cfg).train()
+        return
+
+    try:
+        from nanoforge.tui import launch_training_tui
+    except Exception:
+        # textual missing or import failure — fall back to headless training.
+        Trainer(cfg).train()
+        return
+
+    logger = get_logger("training.trainer")
+    trainer = Trainer(cfg)
+    state: dict[str, Any] = {"error": None, "done": False}
+
+    def _run():
+        try:
+            trainer.train()
+        except Exception as exc:  # surfaced after the UI detaches
+            state["error"] = exc
+            logger.exception("training thread failed: %s", exc)
+        finally:
+            state["done"] = True
+
+    worker = threading.Thread(target=_run, name="nanoforge-train", daemon=True)
+    worker.start()
+
+    def _stop():
+        trainer.request_stop()
+
+    try:
+        launch_training_tui(
+            str(trainer.output_dir),
+            stop_callback=_stop,
+            done_flag=lambda: state["done"],
+        )
+    finally:
+        # UI detached: if training is still going, keep the process alive until it
+        # finishes so the run completes and checkpoints are written.
+        if not state["done"]:
+            print("Live UI detached — training continues in the background. Ctrl-C to stop.")
+            worker.join()
+    if state["error"] is not None:
+        raise state["error"]
 
 
 def _repetition_score(ids: list[int], n: int = 3) -> float:

@@ -19,7 +19,8 @@ src/nanoforge/
 ├── registry.py         # typed component registries + plugin discovery
 ├── progress.py         # JSONL metric logging + sanitization
 ├── server.py           # FastAPI inference server
-├── dashboard.py        # live training dashboard (reads metrics.jsonl)
+├── tui.py              # live terminal training UI (reads metrics.jsonl)
+├── webapp.py           # React SPA + FastAPI web UI (`nanoforge web`)
 ├── model/
 │   ├── transformer.py  # NanoforgeForCausalLM + TransformerBlock
 │   ├── attention.py    # CausalSelfAttention, GQA/MQA, KV cache
@@ -47,7 +48,7 @@ src/nanoforge/
 ├── evaluation/metrics.py  # loss, perplexity, token accuracy
 └── export/
     ├── onnx.py         # ONNX (logits-only graph)
-    └── gguf.py         # GGUF metadata manifest (not a binary .gguf)
+    └── gguf.py         # binary GGUF v3 export (llama.cpp-compatible)
 ```
 
 Configs live in `configs/`, helper scripts in `scripts/`, the pytest suite in `tests/`, and
@@ -272,13 +273,14 @@ The callable receives `ALL_REGISTRIES` and registers new components into it.
 ## Export and quantization
 
 - **ONNX** (`export/onnx.py`): real, logits-only graph (no KV cache).
-- **GGUF** (`export/gguf.py`): writes a JSON **manifest** for external converter tooling —
-  not a binary `.gguf` file.
+- **GGUF** (`export/gguf.py`): writes a real binary `.gguf` file (GGUF v3,
+  llama.cpp-compatible), not a JSON manifest.
 - **Quantization** (`quantization.py`): `int8` dynamic CPU quantization is real; `int4`,
-  `gptq`, `awq`, and `gguf` are metadata hooks only (no actual weight quantization).
+  `gptq`, and `awq` raise `NotImplementedError` with guidance (export to GGUF + llama.cpp,
+  or an external GPTQ/AWQ toolchain) rather than a fake no-op.
 
-`distillation.py` and `preferences.py` (DPO) contain correct standalone functions but are
-**not wired** into any CLI or trainer path.
+`distillation.py` and `preferences.py` (DPO) are wired into the trainers and CLI via the
+`distill` and `dpo` commands.
 
 ---
 
@@ -298,7 +300,7 @@ compiler toolchain.
 Low-risk places to extend:
 
 - Dataset formats in `data/formats.py`; cleaning filters in `data/cleaning.py`.
-- Optimizers in `training/optimizers.py`; metrics in `training/trainer.py` + `dashboard.py`.
+- Optimizers in `training/optimizers.py`; metrics in `training/trainer.py` + `tui.py`.
 - Sampling methods in `generation/sampling.py`; evaluation tasks in `evaluation/`.
 - Config presets in `configs/`. New components via a registry (or an external plugin).
 

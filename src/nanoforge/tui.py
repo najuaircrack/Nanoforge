@@ -1,20 +1,26 @@
 """
 Nanoforge TUI — full-scope terminal UI using Textual.
 
+Two entry points:
+  * ``launch_tui(run_dir)``          — full multi-screen app (``nanoforge tui``).
+  * ``launch_training_tui(run_dir)`` — monitor-only live board, auto-opened by
+    ``nanoforge train`` on an interactive TTY (see trainer.run_training_with_optional_tui).
+
 Install: pip install -e .[tui]
-Launch:  nanoforge tui [--run runs/my-run]
 """
 from __future__ import annotations
 
 import json
+import math
 import threading
+import time
 from pathlib import Path
+from typing import Any, Callable
 
 try:
     from textual.app import App, ComposeResult
     from textual.binding import Binding
-    from textual.containers import Container, Horizontal, ScrollableContainer, Vertical
-    from textual.reactive import reactive
+    from textual.containers import Container, Grid, Horizontal, Vertical
     from textual.screen import Screen
     from textual.widgets import (
         Button,
@@ -24,19 +30,16 @@ try:
         Input,
         Label,
         Log,
-        ProgressBar,
         Select,
         Sparkline,
         Static,
-        TabbedContent,
-        TabPane,
         TextArea,
     )
     _TEXTUAL_OK = True
 except ImportError:
     _TEXTUAL_OK = False
     # Fallbacks so the module imports without the optional [tui] extra.
-    # launch_tui() raises a helpful error via _require_textual() before use.
+    # The launch functions raise a helpful error via _require_textual() before use.
     App = Screen = object  # type: ignore
     ComposeResult = object  # type: ignore
 
@@ -44,22 +47,22 @@ except ImportError:
         def __init__(self, *args, **kwargs):
             pass
 
-    def reactive(*args, **kwargs):  # type: ignore
-        return None
-
 
 def _require_textual():
     if not _TEXTUAL_OK:
         raise RuntimeError("Install TUI extras: pip install -e .[tui]  (requires textual>=0.50)")
 
 
-# ── Helpers ────────────────────────────────────────────────────────────────────
+# ── Metric ingestion ────────────────────────────────────────────────────────────
 
-def _read_metrics(run_dir: Path, limit: int = 500) -> list[dict]:
+def _read_rows(run_dir: Path, limit: int = 4000) -> list[dict]:
     p = run_dir / "metrics.jsonl"
     if not p.exists():
         return []
-    lines = p.read_text(encoding="utf-8").splitlines()[-limit:]
+    try:
+        lines = p.read_text(encoding="utf-8").splitlines()[-limit:]
+    except OSError:
+        return []
     rows = []
     for line in lines:
         try:
@@ -69,50 +72,328 @@ def _read_metrics(run_dir: Path, limit: int = 500) -> list[dict]:
     return rows
 
 
+class MetricStore:
+    """Folds the namespaced JSONL metric stream into a live display state.
+
+    The trainer writes one row per event (train/eval/health/skip/start/...), each
+    carrying a *subset* of the namespaced keys (``train/loss``, ``val/loss``,
+    ``health/logit_entropy`` …). We keep the last non-null value seen per key,
+    plus per-step history for sparklines, and compute derived metrics (ETA,
+    progress, mean throughput, loss delta, skipped-step count).
+    """
+
+    #: sparkline histories we maintain
+    _HIST_KEYS = ("train/loss", "val/loss", "train/grad_norm", "train/tokens_per_sec", "health/logit_entropy")
+
+    def __init__(self) -> None:
+        self.latest: dict[str, Any] = {}
+        self.hist: dict[str, list[float]] = {k: [] for k in self._HIST_KEYS}
+        self.step: int = 0
+        self.first_time: float | None = None
+        self.last_time: float | None = None
+        self.skipped: int = 0
+        self._prev_loss: float | None = None
+        self.loss_delta: float = float("nan")
+        self.skip_reason: str = ""
+        self.run_name: str = ""
+
+    def ingest(self, rows: list[dict]) -> None:
+        # Recompute from scratch each poll: cheap for a few thousand rows and keeps
+        # sparkline history and counters exact even if the file was reset/rotated.
+        self.latest.clear()
+        for k in self.hist:
+            self.hist[k] = []
+        self.step = 0
+        self.first_time = self.last_time = None
+        self.skipped = 0
+        self._prev_loss = None
+        self.loss_delta = float("nan")
+        self.skip_reason = ""
+
+        for row in rows:
+            t = row.get("time")
+            if isinstance(t, (int, float)):
+                self.first_time = t if self.first_time is None else self.first_time
+                self.last_time = t
+            event = row.get("event")
+            if event == "skip":
+                self.skipped += 1
+                self.skip_reason = str(row.get("train/skip_reason", self.skip_reason))
+            if isinstance(row.get("step"), (int, float)):
+                self.step = max(self.step, int(row["step"]))
+            for key, value in row.items():
+                if key in ("time", "event"):
+                    continue
+                if value is None:
+                    continue
+                if isinstance(value, float) and math.isnan(value):
+                    continue
+                self.latest[key] = value
+            # Histories: only from rows that actually carry the key
+            if event in ("train", None):
+                for hk in self.hist:
+                    v = row.get(hk)
+                    if isinstance(v, (int, float)) and math.isfinite(float(v)):
+                        self.hist[hk].append(float(v))
+            # Loss delta between last two train-loss observations
+            tl = row.get("train/loss")
+            if isinstance(tl, (int, float)) and math.isfinite(float(tl)):
+                if self._prev_loss is not None:
+                    self.loss_delta = float(tl) - self._prev_loss
+                self._prev_loss = float(tl)
+
+    # ── derived ──
+    def get(self, key: str, default: Any = None) -> Any:
+        return self.latest.get(key, default)
+
+    @property
+    def elapsed(self) -> float:
+        if self.first_time is None or self.last_time is None:
+            return 0.0
+        return max(0.0, self.last_time - self.first_time)
+
+    @property
+    def max_steps(self) -> int:
+        return int(self.latest.get("run/max_steps", 0) or 0)
+
+    @property
+    def progress(self) -> float:
+        ms = self.max_steps
+        return (self.step / ms) if ms else 0.0
+
+    @property
+    def eta(self) -> float:
+        if self.step <= 0 or not self.max_steps:
+            return float("nan")
+        rate = self.elapsed / self.step
+        return rate * max(0, self.max_steps - self.step)
+
+    @property
+    def mean_tokens_per_sec(self) -> float:
+        toks = self.latest.get("train/tokens_seen")
+        if isinstance(toks, (int, float)) and self.elapsed > 0:
+            return float(toks) / self.elapsed
+        return float("nan")
+
+
+# ── formatting helpers ──────────────────────────────────────────────────────────
+
+def _fmt(v: Any, decimals: int = 4) -> str:
+    if v is None or (isinstance(v, float) and math.isnan(v)):
+        return "—"
+    if isinstance(v, bool):
+        return "yes" if v else "no"
+    if isinstance(v, float):
+        if v != 0 and (abs(v) < 1e-3 or abs(v) >= 1e6):
+            return f"{v:.2e}"
+        return f"{v:.{decimals}f}"
+    return str(v)
+
+
+def _fmt_int(v: Any) -> str:
+    if v is None or (isinstance(v, float) and math.isnan(v)):
+        return "—"
+    try:
+        return f"{int(v):,}"
+    except (TypeError, ValueError):
+        return str(v)
+
+
+def _fmt_compact(v: Any) -> str:
+    """Human-compact large numbers: 1.2M, 3.4B, 12.3k."""
+    if v is None or (isinstance(v, float) and math.isnan(v)):
+        return "—"
+    try:
+        n = float(v)
+    except (TypeError, ValueError):
+        return str(v)
+    for scale, suf in ((1e12, "T"), (1e9, "B"), (1e6, "M"), (1e3, "k")):
+        if abs(n) >= scale:
+            return f"{n / scale:.2f}{suf}"
+    return f"{n:.0f}"
+
+
+def _fmt_pct(v: float) -> str:
+    if v is None or (isinstance(v, float) and math.isnan(v)):
+        return "—"
+    return f"{v * 100:.1f}%"
+
+
+def _fmt_dur(seconds: float) -> str:
+    if seconds is None or (isinstance(seconds, float) and (math.isnan(seconds) or math.isinf(seconds))):
+        return "—"
+    seconds = int(seconds)
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f"{h}h{m:02d}m"
+    if m:
+        return f"{m}m{s:02d}s"
+    return f"{s}s"
+
+
 def _scan_checkpoints(run_dir: Path) -> list[Path]:
     return sorted(run_dir.glob("*.pt"), key=lambda p: p.stat().st_mtime)
 
 
-def _fmt(v, decimals: int = 4) -> str:
-    if v is None:
-        return "—"
-    if isinstance(v, float):
-        return f"{v:.{decimals}f}"
-    return str(v)
+# ── The 30-metric live board ─────────────────────────────────────────────────────
+
+# (label, key-or-callable, formatter, css-accent). Callables receive the MetricStore.
+_BOARD: list[tuple[str, list[tuple[str, Any, Callable[[Any], str]]]]] = [
+    ("PROGRESS", [
+        ("Step", lambda s: s.step, _fmt_int),
+        ("Max steps", lambda s: s.max_steps, _fmt_int),
+        ("Progress", lambda s: s.progress, _fmt_pct),
+        ("Elapsed", lambda s: s.elapsed, _fmt_dur),
+        ("ETA", lambda s: s.eta, _fmt_dur),
+        ("Tokens seen", "train/tokens_seen", _fmt_compact),
+        ("Tokens total", "run/total_tokens", _fmt_compact),
+    ]),
+    ("LOSS", [
+        ("Train loss", "train/loss", lambda v: _fmt(v, 4)),
+        ("Val loss", "val/loss", lambda v: _fmt(v, 4)),
+        ("Best val", "val/best_loss", lambda v: _fmt(v, 4)),
+        ("Loss Δ", lambda s: s.loss_delta, lambda v: _fmt(v, 4)),
+        ("Perplexity", "val/perplexity", lambda v: _fmt(v, 2)),
+        ("Loss mean(32)", "health/loss_recent_mean", lambda v: _fmt(v, 4)),
+    ]),
+    ("OPTIMIZATION", [
+        ("LR", "train/lr", lambda v: _fmt(v, 6)),
+        ("Grad norm", "train/grad_norm", lambda v: _fmt(v, 3)),
+        ("Grad pre-clip", "train/grad_norm_before_clip", lambda v: _fmt(v, 3)),
+        ("Grad post-clip", "train/grad_norm_after_clip", lambda v: _fmt(v, 3)),
+        ("Loss scale", "train/loss_scale", lambda v: _fmt(v, 1)),
+        ("Skipped steps", lambda s: s.skipped, _fmt_int),
+        ("Grad med(32)", "health/grad_norm_recent_median", lambda v: _fmt(v, 3)),
+    ]),
+    ("THROUGHPUT", [
+        ("Tokens/sec", "train/tokens_per_sec", lambda v: _fmt(v, 0)),
+        ("Step time", "train/step_time_sec", lambda v: _fmt(v, 3)),
+        ("Mean tok/s", lambda s: s.mean_tokens_per_sec, lambda v: _fmt(v, 0)),
+    ]),
+    ("HEALTH", [
+        ("Logit entropy", "health/logit_entropy", lambda v: _fmt(v, 3)),
+        ("Opt nonfinite", "health/optimizer_nonfinite_tensors", _fmt_int),
+        ("Opt state elems", "health/optimizer_state_elements", _fmt_compact),
+        ("Parameters", "run/parameters", _fmt_compact),
+    ]),
+    ("MEMORY / MODEL", [
+        ("CUDA alloc MB", "memory/cuda_allocated_mb", lambda v: _fmt(v, 1)),
+        ("CUDA resv MB", "memory/cuda_reserved_mb", lambda v: _fmt(v, 1)),
+        ("Train FLOP/tok", "profile/train_flops_per_token", _fmt_compact),
+        ("KV cache MB", "profile/kv_cache_memory_mb", lambda v: _fmt(v, 1)),
+    ]),
+]
+
+
+class MetricTile(Static):
+    """A single label/value cell in the board."""
+
+    def __init__(self, label: str, tile_id: str) -> None:
+        super().__init__(id=tile_id, classes="tile")
+        self._label = label
+        self.update_value("—")
+
+    def update_value(self, value: str) -> None:
+        self.update(f"[dim]{self._label}[/dim]\n[b]{value}[/b]")
+
+
+class LiveBoard(Container):
+    """The full live metric board: tiles + sparklines + checkpoint list."""
+
+    def __init__(self, run_dir: Path, store: MetricStore | None = None) -> None:
+        super().__init__()
+        self._run_dir = run_dir
+        self._store = store or MetricStore()
+        # stable id per (group, label)
+        self._tile_ids: dict[tuple[str, str], str] = {}
+        n = 0
+        for group, items in _BOARD:
+            for label, _key, _fmt_fn in items:
+                self._tile_ids[(group, label)] = f"tile-{n}"
+                n += 1
+
+    def compose(self) -> ComposeResult:
+        yield Label("", id="board-title")
+        with Vertical(id="spark-row"):
+            with Horizontal(classes="spark-line"):
+                yield Label("Train loss", classes="spark-label")
+                yield Sparkline([], id="sp-loss", summary_function=min)
+                yield Label("Val loss", classes="spark-label")
+                yield Sparkline([], id="sp-val", summary_function=min)
+            with Horizontal(classes="spark-line"):
+                yield Label("Grad norm", classes="spark-label")
+                yield Sparkline([], id="sp-grad", summary_function=max)
+                yield Label("Tok/s", classes="spark-label")
+                yield Sparkline([], id="sp-tps", summary_function=max)
+        for group, items in _BOARD:
+            yield Label(group, classes="group-title")
+            grid = Grid(classes="tile-grid")
+            grid.styles.grid_size_columns = min(len(items), 7)
+            with grid:
+                for label, _key, _fmt_fn in items:
+                    yield MetricTile(label, self._tile_ids[(group, label)])
+        yield Label("Checkpoints", classes="group-title")
+        ck = DataTable(id="ck-tbl")
+        ck.add_columns("File", "Size MB", "Modified")
+        yield ck
+
+    def refresh_from(self, store: MetricStore) -> None:
+        self._store = store
+        title = f"[b]{store.run_name or self._run_dir.name}[/b]  ·  step [b]{store.step:,}[/b]/{store.max_steps:,}"
+        if store.skip_reason:
+            title += f"  ·  [yellow]last skip: {store.skip_reason}[/yellow]"
+        try:
+            self.query_one("#board-title", Label).update(title)
+        except Exception:
+            return
+        for group, items in _BOARD:
+            for label, key, fmt_fn in items:
+                if callable(key):
+                    raw = key(store)
+                else:
+                    raw = store.get(key)
+                try:
+                    tile = self.query_one(f"#{self._tile_ids[(group, label)]}", MetricTile)
+                    tile.update_value(fmt_fn(raw))
+                except Exception:
+                    pass
+        # Sparklines
+        for sid, hk in (("#sp-loss", "train/loss"), ("#sp-val", "val/loss"),
+                        ("#sp-grad", "train/grad_norm"), ("#sp-tps", "train/tokens_per_sec")):
+            data = store.hist.get(hk, [])
+            if data:
+                try:
+                    self.query_one(sid, Sparkline).data = data[-160:]
+                except Exception:
+                    pass
+        # Checkpoints
+        try:
+            ck = self.query_one("#ck-tbl", DataTable)
+            ck.clear()
+            for p in reversed(_scan_checkpoints(self._run_dir)):
+                st = p.stat()
+                ck.add_row(p.name, f"{st.st_size / 1e6:.1f}",
+                           time.strftime("%H:%M:%S", time.localtime(st.st_mtime)))
+        except Exception:
+            pass
 
 
 # ── Screens ────────────────────────────────────────────────────────────────────
 
 class TrainingScreen(Screen):
-    """Live training monitor: loss sparkline, metrics table, checkpoint list."""
+    """Live training monitor board (used inside the full multi-screen app)."""
 
     BINDINGS = [Binding("r", "refresh", "Refresh")]
 
     def __init__(self, run_dir: Path):
         super().__init__()
         self._run_dir = run_dir
-        self._rows: list[dict] = []
+        self._store = MetricStore()
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
-        with Horizontal():
-            with Vertical(id="train-left"):
-                yield Label(f"Run: {self._run_dir.name}", id="run-label")
-                yield Label("Train loss", classes="stat-label")
-                yield Sparkline([], id="loss-spark", summary_function=min)
-                yield Label("Val loss", classes="stat-label")
-                yield Sparkline([], id="val-spark", summary_function=min)
-                yield Label("Grad norm", classes="stat-label")
-                yield Sparkline([], id="grad-spark", summary_function=max)
-            with Vertical(id="train-right"):
-                yield Label("Recent steps", classes="stat-label")
-                tbl = DataTable(id="metrics-tbl")
-                tbl.add_columns("Step", "Loss", "Val Loss", "LR", "Grad Norm", "Tok/s")
-                yield tbl
-                yield Label("Checkpoints", classes="stat-label")
-                ck_tbl = DataTable(id="ck-tbl")
-                ck_tbl.add_columns("File", "Size MB")
-                yield ck_tbl
+        yield LiveBoard(self._run_dir, self._store)
         yield Footer()
 
     def on_mount(self) -> None:
@@ -120,44 +401,17 @@ class TrainingScreen(Screen):
         self._poll()
 
     def _poll(self) -> None:
-        # Runs on the event-loop thread (set_interval). Do the file read in a
-        # worker thread and marshal the UI update back with call_from_thread.
         def _do():
-            self._rows = _read_metrics(self._run_dir)
-            self.app.call_from_thread(self._update_ui)
+            rows = _read_rows(self._run_dir)
+            self._store.ingest(rows)
+            self.app.call_from_thread(self._update)
         threading.Thread(target=_do, daemon=True).start()
 
-    def _update_ui(self) -> None:
-        rows = self._rows
-        if not rows:
-            return
-        # Sparklines
-        losses = [r["loss"] for r in rows if "loss" in r and r.get("loss") is not None]
-        val_losses = [r["val_loss"] for r in rows if r.get("val_loss") is not None]
-        grads = [r["grad_norm"] for r in rows if r.get("grad_norm") is not None]
-        if losses:
-            self.query_one("#loss-spark", Sparkline).data = losses[-120:]
-        if val_losses:
-            self.query_one("#val-spark", Sparkline).data = val_losses[-60:]
-        if grads:
-            self.query_one("#grad-spark", Sparkline).data = grads[-120:]
-        # Metrics table
-        tbl = self.query_one("#metrics-tbl", DataTable)
-        tbl.clear()
-        for r in rows[-30:][::-1]:
-            tbl.add_row(
-                str(r.get("step", "?")),
-                _fmt(r.get("loss")),
-                _fmt(r.get("val_loss")),
-                _fmt(r.get("lr"), 6),
-                _fmt(r.get("grad_norm")),
-                _fmt(r.get("tokens_per_sec"), 0),
-            )
-        # Checkpoints
-        ck_tbl = self.query_one("#ck-tbl", DataTable)
-        ck_tbl.clear()
-        for p in _scan_checkpoints(self._run_dir):
-            ck_tbl.add_row(p.name, f"{p.stat().st_size / 1e6:.1f}")
+    def _update(self) -> None:
+        try:
+            self.query_one(LiveBoard).refresh_from(self._store)
+        except Exception:
+            pass
 
     def action_refresh(self) -> None:
         self._poll()
@@ -312,9 +566,9 @@ class DataScreen(Screen):
         log.write_line(f"Profiling {path}…")
         def _do():
             try:
-                from nanoforge.data.profiler import DatasetProfiler
-                prof = DatasetProfiler().profile(path)
-                self.app.call_from_thread(log.write_line, str(vars(prof) if hasattr(prof, "__dict__") else prof))
+                from nanoforge.data.profiler import profile_dataset
+                prof = profile_dataset([path])
+                self.app.call_from_thread(log.write_line, json.dumps(prof.to_dict(), indent=2, default=str))
             except Exception as exc:
                 self.app.call_from_thread(log.write_line, f"Error: {exc}")
         threading.Thread(target=_do, daemon=True).start()
@@ -401,15 +655,13 @@ class SystemScreen(Screen):
     def _update(self, cpu: float, ram: float, vm) -> None:
         cpu_spark = self.query_one("#cpu-spark", Sparkline)
         ram_spark = self.query_one("#ram-spark", Sparkline)
-        cpu_spark.data = list(cpu_spark.data or []) + [cpu]
-        ram_spark.data = list(ram_spark.data or []) + [ram]
+        cpu_spark.data = (list(cpu_spark.data or []) + [cpu])[-160:]
+        ram_spark.data = (list(ram_spark.data or []) + [ram])[-160:]
         self.query_one("#sys-text", Static).update(
             f"CPU: {cpu:.1f}%  RAM: {ram:.2f}/{vm.total/1e9:.2f} GB  "
             f"({vm.percent:.1f}% used)"
         )
 
-
-# ── Launch / Train Screen ──────────────────────────────────────────────────────
 
 class LaunchScreen(Screen):
     """Start a training run, pipeline, or auto-train from the TUI."""
@@ -451,23 +703,24 @@ class LaunchScreen(Screen):
         self.app.call_from_thread(status.update, f"Starting {mode}…")
 
         def _do():
-            import subprocess, sys
+            import subprocess
+            import sys
+            # --no-tui: we already have a UI; don't let the child spawn another.
             cmd = [sys.executable, "-m", "nanoforge", mode, "--config", config]
+            if mode == "train":
+                cmd.append("--no-tui")
             self.app.call_from_thread(log.write_line, f"$ {' '.join(cmd)}")
             try:
                 proc = subprocess.Popen(
-                    cmd,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    text=True,
-                    bufsize=1,
+                    cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    text=True, bufsize=1,
                 )
                 for line in proc.stdout:
                     self.app.call_from_thread(log.write_line, line.rstrip())
                 proc.wait()
                 self.app.call_from_thread(
                     status.update,
-                    f"{'✓ done' if proc.returncode == 0 else f'✗ exit {proc.returncode}'}"
+                    "✓ done" if proc.returncode == 0 else f"✗ exit {proc.returncode}"
                 )
             except Exception as exc:
                 self.app.call_from_thread(status.update, f"Error: {exc}")
@@ -475,30 +728,43 @@ class LaunchScreen(Screen):
         threading.Thread(target=_do, daemon=True).start()
 
 
-# ── Main App ───────────────────────────────────────────────────────────────────
+# ── Shared CSS ───────────────────────────────────────────────────────────────────
+
+_CSS = """
+Screen { background: $surface; }
+#train-left { width: 35%; padding: 1; }
+#train-right { width: 65%; padding: 1; }
+#inf-top { height: 3; }
+#inf-params { height: 3; }
+#inf-input { height: 8; }
+#inf-output { height: 1fr; }
+#cfg-left { width: 30%; padding: 1; }
+#cfg-right { width: 70%; padding: 1; }
+#cfg-editor { height: 1fr; }
+#launch-wrap { padding: 1; }
+#launch-log { height: 1fr; }
+.stat-label { color: $text-muted; text-style: bold; margin-top: 1; }
+DataTable { height: auto; max-height: 12; }
+Log { height: 1fr; border: solid $primary; }
+Sparkline { height: 3; width: 1fr; margin: 0 1; }
+#board-title { padding: 0 1; height: 1; }
+.group-title { color: $accent; text-style: bold; margin: 1 1 0 1; }
+.spark-line { height: 3; }
+.spark-label { width: 12; content-align: left middle; color: $text-muted; }
+.tile-grid { height: auto; grid-gutter: 1; padding: 0 1; }
+.tile {
+    height: 3; padding: 0 1; content-align: left top;
+    border: round $panel-lighten-2; background: $panel;
+}
+"""
+
+
+# ── Full multi-screen app ────────────────────────────────────────────────────────
 
 class NanoforgeApp(App):
     """Nanoforge TUI — full-scope terminal interface."""
 
-    CSS = """
-    Screen { background: $surface; }
-    #train-left { width: 35%; padding: 1; }
-    #train-right { width: 65%; padding: 1; }
-    #inf-top { height: 3; }
-    #inf-params { height: 3; }
-    #inf-input { height: 8; }
-    #inf-output { height: 1fr; }
-    #cfg-left { width: 30%; padding: 1; }
-    #cfg-right { width: 70%; padding: 1; }
-    #cfg-editor { height: 1fr; }
-    #launch-wrap { padding: 1; }
-    #launch-log { height: 1fr; }
-    .stat-label { color: $text-muted; text-style: bold; margin-top: 1; }
-    DataTable { height: 1fr; }
-    Log { height: 1fr; border: solid $primary; }
-    Sparkline { height: 5; }
-    """
-
+    CSS = _CSS
     BINDINGS = [
         Binding("1", "switch_screen('launch')", "Launch"),
         Binding("2", "switch_screen('training')", "Monitor"),
@@ -526,6 +792,78 @@ class NanoforgeApp(App):
         self.switch_screen(name)
 
 
+# ── Monitor-only app (auto-launched beside `nanoforge train`) ─────────────────────
+
+class TrainingMonitorApp(App):
+    """Single-screen live board that tails ``metrics.jsonl`` for an active run.
+
+    ``q`` detaches the UI (training keeps running headless); ``s`` requests a
+    graceful stop of the attached trainer (checkpoints, then exits) if one was
+    provided.
+    """
+
+    CSS = _CSS
+    BINDINGS = [
+        Binding("q", "quit", "Detach (keep training)"),
+        Binding("s", "stop_training", "Stop training"),
+        Binding("r", "refresh", "Refresh"),
+    ]
+
+    def __init__(self, run_dir: str, stop_callback: Callable[[], None] | None = None,
+                 done_flag: Callable[[], bool] | None = None):
+        super().__init__()
+        self._run_dir = Path(run_dir)
+        self._store = MetricStore()
+        self._stop_callback = stop_callback
+        self._done_flag = done_flag
+
+    def compose(self) -> ComposeResult:
+        yield Header(show_clock=True)
+        yield LiveBoard(self._run_dir, self._store)
+        yield Footer()
+
+    def on_mount(self) -> None:
+        self.title = "Nanoforge · live training"
+        self.set_interval(1.5, self._poll)
+        self._poll()
+
+    def _poll(self) -> None:
+        def _do():
+            rows = _read_rows(self._run_dir)
+            self._store.ingest(rows)
+            self.app.call_from_thread(self._update)
+        threading.Thread(target=_do, daemon=True).start()
+
+    def _update(self) -> None:
+        try:
+            self.query_one(LiveBoard).refresh_from(self._store)
+        except Exception:
+            pass
+        # Auto-exit shortly after training reports completion.
+        if self._done_flag is not None and self._done_flag():
+            self.set_timer(2.0, self.exit)
+
+    def action_stop_training(self) -> None:
+        if self._stop_callback is not None:
+            self._stop_callback()
+            self.notify("Stop requested — trainer will checkpoint and exit.", severity="warning")
+
+    def action_refresh(self) -> None:
+        self._poll()
+
+
+# ── Entry points ─────────────────────────────────────────────────────────────────
+
 def launch_tui(run_dir: str = "runs/nanoforge") -> None:
     _require_textual()
     NanoforgeApp(run_dir=run_dir).run()
+
+
+def launch_training_tui(
+    run_dir: str,
+    stop_callback: Callable[[], None] | None = None,
+    done_flag: Callable[[], bool] | None = None,
+) -> None:
+    """Run the monitor-only live board. Blocks until the user detaches (q)."""
+    _require_textual()
+    TrainingMonitorApp(run_dir, stop_callback=stop_callback, done_flag=done_flag).run()

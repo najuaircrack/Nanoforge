@@ -158,6 +158,49 @@ def cmd_prepare(args: argparse.Namespace) -> None:
         progress.close()
 
 
+def cmd_rag_index(args: argparse.Namespace) -> None:
+    from nanoforge.rag.indexer import build_index
+
+    engine = None
+    if args.backend == "model":
+        if not args.checkpoint:
+            raise SystemExit("--checkpoint is required when --backend model is used")
+        from nanoforge.generation.engine import GenerationEngine
+        engine = GenerationEngine.from_checkpoint(args.checkpoint, device=args.device)
+
+    progress = None
+    cb = None
+    if not args.no_progress:
+        from tqdm import tqdm
+        progress = tqdm(desc="rag-index", unit="chunks", dynamic_ncols=True)
+
+        def cb(n: int) -> None:
+            progress.update(max(0, n - progress.n))
+
+    store = build_index(
+        input_paths=_paths(args.input),
+        out_dir=Path(args.out),
+        backend=args.backend,
+        max_chunk_chars=args.max_chunk_chars,
+        overlap_chars=args.overlap_chars,
+        text_key=args.text_key,
+        text_columns=args.text_column or [],
+        batch_size=args.batch_size,
+        max_docs=args.max_docs,
+        idf_fit_limit=args.idf_fit_limit,
+        progress_callback=cb,
+        engine=engine,
+        st_model=args.st_model,
+        tfidf_vocab=args.vocab_size,
+    )
+    if progress is not None:
+        progress.close()
+    print(f"indexed: {store.meta.num_docs} chunks")
+    print(f"out:     {args.out}")
+    print(f"backend: {store.meta.backend}")
+    print(f"dim:     {store.meta.dim}")
+
+
 def cmd_inspect_dataset(args: argparse.Namespace) -> None:
     from nanoforge.data.formats import inspect_dataset
 
@@ -337,39 +380,32 @@ def cmd_pretrain(args: argparse.Namespace) -> None:
     Trainer(cfg).train()
 
 
+def cmd_dpo(args: argparse.Namespace) -> None:
+    """Direct Preference Optimization fine-tuning."""
+    from nanoforge.config import load_config
+    from nanoforge.training.dpo_trainer import DPOTrainer
+
+    cfg = load_config(args.config)
+    DPOTrainer(cfg, args.data, beta=args.beta, reference_checkpoint=args.reference).train()
+
+
+def cmd_distill(args: argparse.Namespace) -> None:
+    """Knowledge distillation training."""
+    from nanoforge.config import load_config
+    from nanoforge.training.distillation_trainer import DistillationTrainer
+
+    cfg = load_config(args.config)
+    if args.teacher:
+        cfg.training.teacher_checkpoint = args.teacher
+    DistillationTrainer(cfg).train()
+
+
 def cmd_train(args: argparse.Namespace) -> None:
-    if args.dashboard:
-        import threading
-        import webbrowser
+    # A live terminal UI auto-launches when stdout is an interactive TTY (unless
+    # disabled). When piped/redirected it stays headless with the plain tqdm bar.
+    from nanoforge.training.trainer import run_training_with_optional_tui
 
-        from nanoforge.config import load_config
-        from nanoforge.dashboard import serve_dashboard
-        from nanoforge.progress import reset_metric_file
-
-        cfg = load_config(args.config)
-        reset_metric_file(Path(cfg.training.output_dir) / "metrics.jsonl", backup=True)
-        url = f"http://{args.dashboard_host}:{args.dashboard_port}"
-        thread = threading.Thread(
-            target=serve_dashboard,
-            args=(cfg.training.output_dir, args.dashboard_host, args.dashboard_port),
-            daemon=True,
-        )
-        thread.start()
-        print(f"dashboard: {url}")
-        try:
-            webbrowser.open(url)
-        except Exception:
-            pass
-
-    from nanoforge.training.trainer import train_from_config
-
-    train_from_config(args.config)
-
-
-def cmd_dashboard(args: argparse.Namespace) -> None:
-    from nanoforge.dashboard import serve_dashboard
-
-    serve_dashboard(args.run, args.host, args.port)
+    run_training_with_optional_tui(args.config, no_tui=getattr(args, "no_tui", False))
 
 
 def cmd_web(args: argparse.Namespace) -> None:
@@ -429,6 +465,21 @@ def cmd_chat(args: argparse.Namespace) -> None:
         args.mode = "chat"
     engine = _load_generation_engine(args)
     system = args.system if args.system is not None else _default_system_prompt(engine)
+
+    # Optional personal-facts layer: answer known factual questions from a small
+    # retrieval KB before falling through to the (tiny) model. See rag/personal.py.
+    answerer = None
+    if getattr(args, "facts", None):
+        from nanoforge.rag.personal import PersonalAnswerer
+
+        answerer = PersonalAnswerer.load(
+            args.facts, engine=engine, threshold=args.facts_threshold
+        )
+        if answerer is None:
+            print(f"[facts] could not load index at {args.facts} — continuing without it")
+        else:
+            print(f"[facts] loaded personal KB from {args.facts}")
+
     print("Nanoforge chat. Press Ctrl+C or submit an empty prompt to exit.")
     if system:
         print(f"[system] {system}")
@@ -438,6 +489,11 @@ def cmd_chat(args: argparse.Namespace) -> None:
             if not prompt:
                 return
             print("assistant> ", end="", flush=True)
+            # Personal question with a confident KB hit -> answer directly.
+            fact = answerer.answer(prompt) if answerer is not None else None
+            if fact is not None:
+                print(fact)
+                continue
             # This pipeline packs each assistant turn conditioned on the system
             # prompt + most recent user turn (see data/modes._chat_prefix), so we
             # condition inference the same way to match training.
@@ -455,11 +511,18 @@ def cmd_chat(args: argparse.Namespace) -> None:
 
 def _default_system_prompt(engine) -> str | None:
     cfg = getattr(engine, "config", None)
-    if cfg is not None and getattr(cfg.data, "mode", "") == "chat":
-        # Must match the system prompt the model was trained on exactly, and stay
-        # short: the boundary packer truncates long prefixes (see data/modes).
-        return "You are Nano, Najwan's assistant."
-    return None
+    if cfg is None or getattr(cfg.data, "mode", "") != "chat":
+        return None
+    # Chat models trained from an export with no system turn are hurt by an
+    # out-of-distribution system prompt: feeding one measurably degrades
+    # coherence. Config marks these with data.no_system_prompt.
+    if getattr(cfg.data, "no_system_prompt", False):
+        return None
+    # Otherwise use the model's configured system prompt, if any. Must match what
+    # the model was trained on, and stay short: the boundary packer truncates long
+    # prefixes (see data/modes).
+    prompt = getattr(cfg.data, "prompt_template", None)
+    return prompt if isinstance(prompt, str) and prompt.strip() else None
 
 
 def _load_generation_engine(args: argparse.Namespace):
@@ -640,29 +703,6 @@ def cmd_auto_train(args: argparse.Namespace) -> None:
         return
     print("[4/4] training")
 
-    if args.dashboard:
-        import threading
-        import webbrowser
-
-        from nanoforge.config import load_config
-        from nanoforge.dashboard import serve_dashboard
-        from nanoforge.progress import reset_metric_file
-
-        cfg = load_config(config_path)
-        reset_metric_file(Path(cfg.training.output_dir) / "metrics.jsonl", backup=True)
-        url = f"http://{args.dashboard_host}:{args.dashboard_port}"
-        thread = threading.Thread(
-            target=serve_dashboard,
-            args=(cfg.training.output_dir, args.dashboard_host, args.dashboard_port),
-            daemon=True,
-        )
-        thread.start()
-        print(f"dashboard: {url}")
-        try:
-            webbrowser.open(url)
-        except Exception:
-            pass
-
     from nanoforge.training.trainer import train_from_config
 
     train_from_config(config_path)
@@ -675,7 +715,6 @@ def cmd_serve(args: argparse.Namespace) -> None:
 
 
 def cmd_export(args: argparse.Namespace) -> None:
-    from nanoforge.export.gguf import write_gguf_manifest
     from nanoforge.export.onnx import export_onnx
     from nanoforge.generation.engine import GenerationEngine
     from nanoforge.training.checkpoint import load_checkpoint
@@ -684,8 +723,9 @@ def cmd_export(args: argparse.Namespace) -> None:
         engine = GenerationEngine.from_checkpoint(args.checkpoint, device=args.device)
         export_onnx(engine.model, args.out)
     else:
-        payload = load_checkpoint(args.checkpoint, map_location="cpu")
-        write_gguf_manifest(payload["config"], args.checkpoint, args.out)
+        from nanoforge.export.gguf import export_gguf
+        engine = GenerationEngine.from_checkpoint(args.checkpoint, device="cpu")
+        export_gguf(engine.model, engine.config, args.out, dtype=getattr(args, "dtype", "f32"))
 
 
 def cmd_benchmark(args: argparse.Namespace) -> None:
@@ -795,9 +835,6 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--config-out")
     p.add_argument("--no-progress", action="store_true")
     p.add_argument("--no-train", action="store_true", help="Run tokenizer/config/data prep only.")
-    p.add_argument("--dashboard", action="store_true", help="Start the live web dashboard beside training.")
-    p.add_argument("--dashboard-host", default="127.0.0.1")
-    p.add_argument("--dashboard-port", type=int, default=7860)
     p.set_defaults(func=cmd_auto_train)
 
     p = sub.add_parser("import", help="Register an external GGUF, ONNX, SafeTensors, or HuggingFace model.")
@@ -848,6 +885,24 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-progress", action="store_true")
     p.add_argument("--text-column", action="append", help="Structured text column(s) to use. Can be repeated.")
     p.set_defaults(func=cmd_prepare)
+
+    p = sub.add_parser("rag-index", help="Build a RAG vector index from documents.")
+    p.add_argument("--input", nargs="+", required=True)
+    p.add_argument("--out", required=True)
+    p.add_argument("--backend", choices=["tfidf", "model", "sentence-transformers"], default="tfidf")
+    p.add_argument("--checkpoint", default=None, help="Checkpoint path (required for --backend model).")
+    p.add_argument("--device", default="auto")
+    p.add_argument("--st-model", default="all-MiniLM-L6-v2")
+    p.add_argument("--max-chunk-chars", type=int, default=512)
+    p.add_argument("--overlap-chars", type=int, default=64)
+    p.add_argument("--text-key", default="text")
+    p.add_argument("--text-column", action="append", help="Structured text column(s) to use. Can be repeated.")
+    p.add_argument("--batch-size", type=int, default=64)
+    p.add_argument("--max-docs", type=int, default=None)
+    p.add_argument("--idf-fit-limit", type=int, default=100_000)
+    p.add_argument("--vocab-size", type=int, default=16_384)
+    p.add_argument("--no-progress", action="store_true")
+    p.set_defaults(func=cmd_rag_index)
 
     p = sub.add_parser("inspect-dataset", help="Inspect formats, fields, and warnings for input data.")
     p.add_argument("--input", nargs="+", required=True)
@@ -936,9 +991,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("train", help="Train from YAML config.")
     p.add_argument("--config", required=True)
-    p.add_argument("--dashboard", action="store_true", help="Start the live web dashboard beside training.")
-    p.add_argument("--dashboard-host", default="127.0.0.1")
-    p.add_argument("--dashboard-port", type=int, default=7860)
+    p.add_argument("--no-tui", action="store_true", help="Disable the live terminal UI even on an interactive TTY.")
     p.set_defaults(func=cmd_train)
 
     p = sub.add_parser("pipeline", help="Run a multi-stage training recipe (e.g. pretrain -> SFT -> DPO).")
@@ -952,11 +1005,17 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--resume", help="Resume model weights from a checkpoint.")
     p.set_defaults(func=cmd_pretrain)
 
-    p = sub.add_parser("dashboard", help="Run a live browser dashboard for a training run.")
-    p.add_argument("--run", default="runs/tiny")
-    p.add_argument("--host", default="127.0.0.1")
-    p.add_argument("--port", type=int, default=7860)
-    p.set_defaults(func=cmd_dashboard)
+    p = sub.add_parser("dpo", help="Fine-tune with Direct Preference Optimization.")
+    p.add_argument("--config", required=True, help="Training config YAML.")
+    p.add_argument("--data", required=True, help="JSONL file with 'chosen' and 'rejected' fields.")
+    p.add_argument("--beta", type=float, default=0.1, help="KL regularisation coefficient (default 0.1).")
+    p.add_argument("--reference", help="Optional separate reference checkpoint (default: frozen copy of initial policy).")
+    p.set_defaults(func=cmd_dpo)
+
+    p = sub.add_parser("distill", help="Train a student model with knowledge distillation from a teacher.")
+    p.add_argument("--config", required=True, help="Training config YAML (set teacher_checkpoint inside, or use --teacher).")
+    p.add_argument("--teacher", help="Override config.training.teacher_checkpoint.")
+    p.set_defaults(func=cmd_distill)
 
     p = sub.add_parser("tui", help="Launch the full-scope terminal UI.")
     p.add_argument("--run", default="runs/nanoforge", help="Run directory to monitor.")
@@ -998,6 +1057,19 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--repetition-threshold", type=float, default=0.85)
         p.add_argument("--stop-token", action="append")
         p.add_argument("--system", default=None, help="System prompt for chat mode (overrides the default).")
+        p.add_argument(
+            "--facts",
+            default=None,
+            help="Path to a personal-facts RAG index (built from a question->answer "
+            "facts file; see docs). When set, personal questions are answered from "
+            "the facts KB before the model.",
+        )
+        p.add_argument(
+            "--facts-threshold",
+            type=float,
+            default=0.5,
+            help="Minimum retrieval similarity to answer from facts (else defer to the model).",
+        )
         p.add_argument("--mirostat", action="store_true")
         p.add_argument("--beams", type=int, default=1)
         p.set_defaults(func=func)
@@ -1009,11 +1081,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--device", default="auto")
     p.set_defaults(func=cmd_serve)
 
-    p = sub.add_parser("export", help="Export ONNX or GGUF manifest.")
+    p = sub.add_parser("export", help="Export model to GGUF (binary) or ONNX format.")
     p.add_argument("--checkpoint", required=True)
     p.add_argument("--out", required=True)
     p.add_argument("--format", choices=["onnx", "gguf"], required=True)
     p.add_argument("--device", default="cpu")
+    p.add_argument("--dtype", choices=["f32", "f16"], default="f32", help="Tensor dtype for GGUF export.")
     p.set_defaults(func=cmd_export)
 
     p = sub.add_parser("benchmark", help="Benchmark forward pass throughput.")

@@ -73,6 +73,7 @@ class GenerationEngine:
         stop_ids: set[int] | None = None,
         stop_sequences: list[list[int]] | None = None,
         interrupt: Callable[[], bool] | None = None,
+        min_new_tokens: int = 0,
     ) -> Iterator[int]:
         ids = torch.tensor([input_ids], dtype=torch.long, device=self.device)
         caches: list[KVCache] | None = None
@@ -107,6 +108,19 @@ class GenerationEngine:
             # history makes byte-level greedy decoding ban common characters that
             # already appear in the system/user text, producing garbled output.
             history = ids[0, len(input_ids):]
+            # Before ``min_new_tokens`` tokens have been emitted, forbid the
+            # model from ending the turn: a chat model trained on very short
+            # replies can otherwise put most of its mass on EOS at step 0 and
+            # return an empty string. We mask EOS/stop logits to -inf so the
+            # model is forced to say something first.
+            if step < min_new_tokens:
+                forbid = set()
+                if eos_id is not None:
+                    forbid.add(eos_id)
+                if stop_ids:
+                    forbid.update(stop_ids)
+                if forbid:
+                    out.logits[..., -1, list(forbid)] = float("-inf")
             token = sample_next(out.logits, history, sampling, miro)
             next_id = int(token.item())
             ids = torch.cat([ids, token], dim=1)
@@ -148,6 +162,7 @@ class GenerationEngine:
         max_new_tokens: int = 256,
         sampling: SamplingConfig | None = None,
         stop_tokens: list[str] | None = None,
+        min_new_tokens: int = 0,
     ) -> Iterator[str]:
         sampling = sampling or SamplingConfig()
         input_ids = self.tokenizer.encode(prompt, add_bos=True, add_eos=False)
@@ -162,6 +177,7 @@ class GenerationEngine:
             self.tokenizer.eos_id,
             stop_ids,
             stop_sequences,
+            min_new_tokens=min_new_tokens,
         ):
             buffer.append(token_id)
             text = self.tokenizer.decode(buffer)
@@ -217,11 +233,21 @@ class GenerationEngine:
         max_new_tokens: int = 256,
         sampling: SamplingConfig | None = None,
         system: str | None = None,
+        min_new_tokens: int = 1,
     ) -> Iterator[str]:
-        """Stream an assistant reply for a role-tagged conversation history."""
+        """Stream an assistant reply for a role-tagged conversation history.
+
+        ``min_new_tokens`` defaults to 1 so a chat model that has learned very
+        short replies cannot return an empty turn by emitting EOS immediately.
+        """
         sampling = sampling or SamplingConfig(mode="chat")
         prompt = self.build_chat_prompt(messages, system=system)
-        yield from self.stream(prompt, max_new_tokens=max_new_tokens, sampling=sampling)
+        yield from self.stream(
+            prompt,
+            max_new_tokens=max_new_tokens,
+            sampling=sampling,
+            min_new_tokens=min_new_tokens,
+        )
 
     async def astream(
         self,

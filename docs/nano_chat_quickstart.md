@@ -1,7 +1,7 @@
 # Nano chat model — quickstart
 
 A tiny (~3.5M param) byte-level chat model trained from scratch with Nanoforge.
-It greets you, remembers the user's name (Najwan), answers a handful of basic
+It greets you, remembers the user's name, answers a handful of basic
 facts, and says **"I'm sorry, I don't know that."** for anything outside its
 training set.
 
@@ -29,7 +29,7 @@ python scripts/make_chat_data.py
   --seq-len 256 --val-fraction 0.02
 
 # 3. Train (~20 min on CPU, 1200 steps)
-.venv/Scripts/python.exe -m nanoforge.cli train --config configs/nano-chat.yaml
+.venv/Scripts/python.exe -m nanoforge.cli train --config configs/chat25m.yaml
 ```
 
 ## Chat with it

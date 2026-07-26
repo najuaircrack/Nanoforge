@@ -95,7 +95,7 @@ The byte-tokenizer smoke path skips step 1 entirely:
 
 ```powershell
 nanoforge prepare --input data/raw --tokenizer byte --out data/packed/tiny
-nanoforge train --config configs/tiny.yaml
+nanoforge train --config configs/small-base.yaml
 ```
 
 ---
@@ -110,8 +110,8 @@ nanoforge prepare ^
   --tokenizer native-bpe --tokenizer-path data/tokenizers/story-bpe.json ^
   --mode generative --loss-masking none --seq-len 1024 --out data/packed/story
 
-nanoforge train --config configs/stories-18m.yaml
-nanoforge generate --checkpoint runs/stories-18m/best.pt --mode creative --prompt "The old city was quiet"
+nanoforge train --config configs/nano-debug.yaml
+nanoforge generate --checkpoint runs/nano-debug/best.pt --mode creative --prompt "The old city was quiet"
 ```
 
 ### Chat (UltraChat / ShareGPT / `messages` rows)
@@ -208,9 +208,11 @@ generator.
 
 ## Monitoring
 
-Add `--dashboard` to `train` (or run `nanoforge dashboard --run runs/<name>`) for a live
-browser view of train/val loss, perplexity, gradient norm, learning rate, and throughput at
-`http://127.0.0.1:7860`.
+Watch a run live with the terminal UI that auto-launches on `nanoforge train` in an
+interactive terminal — it shows train/val loss, perplexity, gradient norm, learning rate,
+and throughput. Training continues headless if you quit it or pipe output; disable it with
+`--no-tui` or `NANOFORGE_NO_TUI=1`. For a browser view, run `nanoforge web --run runs/<name>`
+(defaults to `http://127.0.0.1:7860`).
 
 Evaluate a finished checkpoint:
 

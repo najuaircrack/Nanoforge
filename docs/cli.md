@@ -16,7 +16,7 @@ Windows uses `^` for line continuation in the examples below; Linux/macOS use `\
 - [Dataset tooling](#dataset-tooling): `inspect-dataset`, `validate-dataset`, `clean-dataset`, `deduplicate-dataset`, `convert-dataset`
 - [Tokenizers](#tokenizers): `train-tokenizer`, `tokenizer-status`, `tokenizer-report`, `benchmark-tokenizer`
 - [Data packing](#data-packing): `prepare`
-- [Training](#training): `auto-train`, `train`, `dashboard`
+- [Training](#training): `auto-train`, `train`
 - [Inference](#inference): `generate`, `chat`, `serve`
 - [Import external models](#import-external-models): `import`
 - [Export & evaluation](#export--evaluation): `export`, `evaluate`, `benchmark`, `profile-config`
@@ -33,7 +33,7 @@ Estimate a model's parameter count from a config.
 | `--config` | required | Path to a YAML config. |
 
 ```bash
-nanoforge params --config configs/tiny.yaml
+nanoforge params --config configs/small-base.yaml
 ```
 
 ### `registries`
@@ -56,7 +56,7 @@ Load a config and validate its registry-backed keys (fails fast on bad values).
 | `--config` | required | Path to a YAML config. |
 
 ```bash
-nanoforge validate-config --config configs/nano-chat.yaml
+nanoforge validate-config --config configs/chat25m.yaml
 ```
 
 ### `new-config`
@@ -265,7 +265,7 @@ masking, writes a CPU-friendly config, and starts training. See
 Key flags (run `nanoforge auto-train --help` for all): `--input` (required), `--name`
 (required), `--mode` (`auto` by default), `--tokenizer` (`native-bpe` by default),
 `--vocab-size`, `--text-column`, `--seq-len`, `--max-steps`, `--ram`, `--speed`,
-`--no-train` (setup only), `--dashboard`. Outputs go to `data/tokenizers/<name>*`,
+`--no-train` (setup only). Outputs go to `data/tokenizers/<name>*`,
 `data/packed/<name>`, `configs/<name>.yaml`, and `runs/<name>`.
 
 ```bash
@@ -274,34 +274,28 @@ nanoforge auto-train --input data/raw --name ultrachat-18m --mode chat \
 ```
 
 ### `train`
-Train from an existing YAML config.
+Train from an existing YAML config. On an interactive terminal this auto-launches a live
+terminal UI showing ~30 training/eval metrics; training continues headless if you quit it
+or pipe output.
 
 | Flag | Default | Description |
 | --- | --- | --- |
 | `--config` | required | Path to a YAML config. |
-| `--dashboard` | off | Launch the live web dashboard alongside training. |
-| `--dashboard-host` | `127.0.0.1` | Dashboard bind host. |
-| `--dashboard-port` | `7860` | Dashboard port. |
+| `--no-tui` | off | Disable the live terminal UI even on an interactive TTY (or set `NANOFORGE_NO_TUI=1`). |
 
 ```bash
-nanoforge train --config configs/tiny.yaml --dashboard
+nanoforge train --config configs/small-base.yaml
 ```
 
-### `dashboard`
-Serve the live dashboard for an existing run directory (reads `metrics.jsonl`).
-
-| Flag | Default | Description |
-| --- | --- | --- |
-| `--run` | `runs/tiny` | Run directory to visualize. |
-| `--host` | `127.0.0.1` | Bind host. |
-| `--port` | `7860` | Port. |
+To watch a run live, use the auto-launched terminal UI (disable with `--no-tui` or
+`NANOFORGE_NO_TUI=1`), or serve the web UI for a run directory:
 
 ```bash
-nanoforge dashboard --run runs/tiny
+nanoforge web --run runs/small-base
 ```
 
 Tracks train/val loss, perplexity, gradient norm (pre/post clip), learning rate, and
-throughput at `http://127.0.0.1:7860`.
+throughput.
 
 ---
 
@@ -394,7 +388,7 @@ nanoforge chat --model my-gguf --mode chat
 ## Export & evaluation
 
 ### `export`
-Export a checkpoint to ONNX or a GGUF metadata manifest.
+Export a checkpoint to ONNX or a binary GGUF file.
 
 | Flag | Default | Description |
 | --- | --- | --- |
@@ -403,11 +397,11 @@ Export a checkpoint to ONNX or a GGUF metadata manifest.
 | `--format` | required | `onnx` or `gguf`. |
 | `--device` | `cpu` | Export device. |
 
-> `onnx` writes a logits-only graph. `gguf` writes a JSON manifest for converter tooling,
-> not a binary `.gguf` file.
+> `onnx` writes a logits-only graph. `gguf` writes a binary llama.cpp-compatible GGUF v3
+> file.
 
 ```bash
-nanoforge export --checkpoint runs/tiny/best.pt --format onnx --out exports/tiny.onnx
+nanoforge export --checkpoint runs/small-base/best.pt --format onnx --out exports/small-base.onnx
 ```
 
 ### `evaluate`
@@ -436,7 +430,7 @@ Benchmark forward-pass throughput for a config.
 | `--device` | `auto` | Device. |
 
 ```bash
-nanoforge benchmark --config configs/tiny.yaml --batch-size 4 --steps 50
+nanoforge benchmark --config configs/small-base.yaml --batch-size 4 --steps 50
 ```
 
 ### `profile-config`
@@ -450,5 +444,5 @@ Estimate parameters, FLOPs, and memory analytically from a config (no training r
 | `--bytes-per-param` | `2` | Bytes/param for the memory estimate. |
 
 ```bash
-nanoforge profile-config --config configs/code-110m.yaml --batch-size 8 --seq-len 2048
+nanoforge profile-config --config configs/small-base.yaml --batch-size 8 --seq-len 2048
 ```

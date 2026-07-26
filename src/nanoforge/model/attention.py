@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import math
 from copy import copy
 from dataclasses import dataclass
@@ -11,6 +12,39 @@ from torch.nn import functional as F
 from nanoforge.config import ModelConfig
 from nanoforge.model.lora import LoRALinear
 from nanoforge.model.rope import RotaryEmbedding, apply_rotary
+
+_log = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# flash-attn availability probe (done once at import time)
+# ---------------------------------------------------------------------------
+try:
+    from flash_attn import flash_attn_func as _flash_attn_func  # type: ignore[import]
+    from flash_attn import flash_attn_varlen_func as _flash_attn_varlen_func  # type: ignore[import]
+    _FLASH_ATTN_AVAILABLE = True
+except ImportError:
+    _flash_attn_func = None
+    _flash_attn_varlen_func = None
+    _FLASH_ATTN_AVAILABLE = False
+
+
+_FLASH_WARNED = False
+
+
+def _flash_attn_forward(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    dropout_p: float,
+    causal: bool,
+) -> torch.Tensor:
+    """Call flash_attn_func with (batch, seq, heads, head_dim) layout."""
+    # flash_attn expects [batch, seq, heads, head_dim]
+    q = q.transpose(1, 2)
+    k = k.transpose(1, 2)
+    v = v.transpose(1, 2)
+    out = _flash_attn_func(q, k, v, dropout_p=dropout_p, causal=causal)
+    return out.transpose(1, 2)  # back to [batch, heads, seq, head_dim]
 
 
 @dataclass
@@ -157,7 +191,21 @@ class CausalSelfAttention(nn.Module):
         k_full = repeat_kv(k, self.kv_repeat)
         v_full = repeat_kv(v, self.kv_repeat)
 
-        if self.use_flash and hasattr(F, "scaled_dot_product_attention"):
+        if self.use_flash and _FLASH_ATTN_AVAILABLE and self.config.position_embedding != "alibi":
+            # Real FlashAttention kernel path (requires flash-attn package + CUDA)
+            is_causal_attn = getattr(self.config, 'is_causal', True)
+            dropout_p = self.config.dropout if self.training else 0.0
+            y = _flash_attn_forward(q, k_full, v_full, dropout_p=dropout_p, causal=is_causal_attn and kv_len == seq_len)
+        elif self.use_flash and hasattr(F, "scaled_dot_product_attention"):
+            global _FLASH_WARNED
+            if not _FLASH_WARNED and self.config.attention_backend in {"flash", "flash_v2", "flash_v3"}:
+                _log.warning(
+                    "flash-attn package not installed or CUDA unavailable; "
+                    "falling back to torch SDPA for backend '%s'. "
+                    "Install flash-attn for real FlashAttention kernels.",
+                    self.config.attention_backend,
+                )
+                _FLASH_WARNED = True
             is_causal_attn = getattr(self.config, 'is_causal', True)
             is_simple_causal = (
                 is_causal_attn
@@ -198,6 +246,11 @@ class CausalSelfAttention(nn.Module):
 
 
 class ChunkedCausalSelfAttention(CausalSelfAttention):
+    """Sliding-window (1024) preset over the standard SDPA kernel.
+
+    Note: this is a windowed-attention approximation, not a true chunked-attention kernel.
+    """
+
     def __init__(self, config: ModelConfig):
         cfg = copy(config)
         cfg.sliding_window = cfg.sliding_window or min(cfg.max_seq_len, 1024)
@@ -205,6 +258,11 @@ class ChunkedCausalSelfAttention(CausalSelfAttention):
 
 
 class SparseCausalSelfAttention(CausalSelfAttention):
+    """Sliding-window (512) preset over the standard SDPA kernel.
+
+    Note: dense SDPA restricted to a local window, not a true sparse-attention kernel.
+    """
+
     def __init__(self, config: ModelConfig):
         cfg = copy(config)
         cfg.sliding_window = cfg.sliding_window or min(cfg.max_seq_len, 512)
@@ -212,6 +270,11 @@ class SparseCausalSelfAttention(CausalSelfAttention):
 
 
 class HybridLocalGlobalCausalAttention(CausalSelfAttention):
+    """Sliding-window (2048) preset over the standard SDPA kernel.
+
+    Note: a single local window, not an alternating local/global attention schedule.
+    """
+
     def __init__(self, config: ModelConfig):
         cfg = copy(config)
         cfg.sliding_window = cfg.sliding_window or min(cfg.max_seq_len, 2048)
@@ -219,6 +282,11 @@ class HybridLocalGlobalCausalAttention(CausalSelfAttention):
 
 
 class PagedCausalSelfAttention(CausalSelfAttention):
+    """Standard SDPA with a full-length window.
+
+    Note: the KV cache is contiguous, not paged; this is not a PagedAttention kernel.
+    """
+
     def __init__(self, config: ModelConfig):
         cfg = copy(config)
         cfg.sliding_window = cfg.sliding_window or cfg.max_seq_len

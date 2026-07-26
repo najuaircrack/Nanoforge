@@ -63,7 +63,7 @@ Optional extras (install what you use):
 | --- | --- |
 | `tokenizers` | HuggingFace BPE / WordPiece / SentencePiece tokenizers |
 | `data` | Parquet / Arrow / `datasets` / WebDataset ingestion |
-| `serve` | FastAPI inference server and live dashboard |
+| `serve` | FastAPI inference server and the web UI |
 | `logging` | TensorBoard and Weights & Biases logging |
 | `export` | ONNX export and ONNX Runtime inference |
 | `native` | `maturin`, to build the optional Rust tokenizer extension |
@@ -81,7 +81,7 @@ data (a JSONL file with a `messages: [{role, content}]` field is treated as chat
 # One shot: tokenizer -> pack -> config -> train (chat model, assistant-only masking)
 nanoforge auto-train --input data/raw/chat.jsonl --name mychat \
     --mode chat --tokenizer bpe --vocab-size 32000 --seq-len 512 \
-    --ram 16GB --max-steps 3000 --dashboard
+    --ram 16GB --max-steps 3000
 
 # Then chat with / generate from the result
 nanoforge chat     --checkpoint runs/mychat/best.pt
@@ -95,11 +95,16 @@ nanoforge prepare --input data/raw --tokenizer byte --out data/packed/demo
 nanoforge train   --config configs/nano-debug.yaml     # or small-base / chat-sft / moe-large
 ```
 
-Watch a run live in the browser dashboard or the terminal UI:
+Running `nanoforge train` in an interactive terminal automatically launches a live
+terminal UI with ~30 training/eval metrics (loss, val, perplexity, grad norm, LR,
+throughput, tokens seen, ETA, health, memory). Training continues headless if you quit
+it or pipe the output; disable it explicitly with `--no-tui` or `NANOFORGE_NO_TUI=1`.
+
+Watch a run live in the browser, or attach the terminal UI to any run directory:
 
 ```bash
-nanoforge dashboard --run runs/mychat      # browser
-nanoforge tui       --run runs/mychat      # terminal (Textual; pip install -e .[tui])
+nanoforge web --run runs/mychat            # browser — the full web UI (React SPA + FastAPI)
+nanoforge tui --run runs/mychat            # terminal (Textual; pip install -e .[tui])
 ```
 
 Inspect the framework itself:
@@ -142,7 +147,7 @@ For a complete tutorial that trains a tiny chat model which remembers your name 
 - Schedulers: cosine, linear, constant — with warmup
 - EMA, early stopping, grad clipping, NaN/Inf skip + rollback, health monitoring
 - Robust checkpointing (atomic writes, integrity hash, config sidecar, async saves)
-- TensorBoard / W&B logging and a built-in live web dashboard
+- TensorBoard / W&B logging, a live terminal UI on `train`, and a full web UI (`web`)
 
 **Tokenization**
 - Byte tokenizer (vocab 260, deterministic, no training)
@@ -237,8 +242,9 @@ Nanoforge/
 │   ├── evaluation/        # checkpoint metrics
 │   ├── export/            # onnx + gguf manifest
 │   ├── server.py          # FastAPI inference server
-│   ├── dashboard.py       # live training / inference / data web dashboard
-│   └── tui.py             # full-scope terminal UI (Textual)
+│   ├── webapp.py          # web UI backend (FastAPI) serving the React SPA
+│   ├── web_dist/          # built React SPA (the web UI)
+│   └── tui.py             # terminal UI (Textual) — live on `train`, or `tui`/`web`
 └── runs/                  # training outputs (checkpoints, metrics) — gitignored
 ```
 
@@ -246,14 +252,16 @@ Nanoforge/
 
 ## Limitations
 
-- No distributed training yet (FSDP / DeepSpeed / tensor parallel are roadmap items).
-- GGUF "export" writes a JSON manifest, not a binary `.gguf` file.
-- int4 / GPTQ / AWQ quantization are metadata hooks only; int8 dynamic (CPU) is real.
-- Speculative decoding, paged attention, and NTK RoPE scaling are **not** implemented
+- Single-node multi-GPU FSDP / DDP work under `torchrun`; multi-node, DeepSpeed ZeRO-3,
+  tensor parallel and pipeline parallel are roadmap items.
+- FlashAttention uses the real `flash_attn` kernel when installed, else falls back to
+  PyTorch SDPA (with a one-time warning); `chunked`/`sparse`/`paged`/`hybrid_local_global`
+  are honest windowed-SDPA presets, not bespoke kernels.
+- int4 / GPTQ / AWQ quantization raise `NotImplementedError` with guidance (export to
+  GGUF + llama.cpp, or an external GPTQ/AWQ toolchain); int8 dynamic (CPU) is real.
+- Speculative decoding and NTK RoPE scaling are **not** implemented
   (see [docs/roadmap.md](docs/roadmap.md)).
-- Distillation and DPO loss functions exist as standalone utilities but are not wired into
-  the training CLI.
-- The dashboard is a local single-run viewer, not a multi-user experiment tracker.
+- The web UI is a local single-run/experiment viewer, not a multi-user experiment tracker.
 
 ## Disclaimer
 

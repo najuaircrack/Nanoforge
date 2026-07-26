@@ -1,17 +1,8 @@
-import { useState } from 'react'
+import { useRef, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
-import { Zap, Download, RefreshCw } from 'lucide-react'
+import { Zap, Download, RefreshCw, Upload } from 'lucide-react'
 import { get, post, fmtBytes } from '../lib/api'
-import { Card, CardTitle, PageHeader, Button, Field, LogBox, Empty } from '../lib/ui'
-
-const DATASETS = [
-  { id: 'openwebtext',  name: 'OpenWebText',  size: '~40 GB',  desc: 'Web text corpus' },
-  { id: 'tinystories',  name: 'TinyStories',  size: '~2 GB',   desc: 'Simple children stories' },
-  { id: 'the-pile',     name: 'The Pile',     size: '~800 GB', desc: 'Diverse text corpus' },
-  { id: 'code-parrot',  name: 'CodeParrot',   size: '~50 GB',  desc: 'GitHub code' },
-  { id: 'alpaca',       name: 'Alpaca',       size: '~50 MB',  desc: 'Instruction-following data' },
-  { id: 'dolly',        name: 'Dolly 15k',    size: '~13 MB',  desc: 'Instruction dataset' },
-]
+import { Card, CardTitle, PageHeader, Button, Field, LogBox, Empty, Tabs } from '../lib/ui'
 
 type Tab = 'browse' | 'download' | 'process'
 
@@ -28,12 +19,38 @@ export default function Data() {
   const [procMode, setProcMode] = useState('auto')
   const [procTokenizer, setProcTokenizer] = useState('byte')
   const [procSeqLen, setProcSeqLen] = useState(512)
+  const [uploading, setUploading] = useState(false)
+  const [uploadMsg, setUploadMsg] = useState('')
+  const fileRef = useRef<HTMLInputElement>(null)
 
   const { data: fileData, refetch } = useQuery({
     queryKey: ['data-list', root],
     queryFn: () => get('/api/data/list', { root }),
   })
   const files: any[] = fileData?.files ?? []
+
+  const { data: catalogData } = useQuery({ queryKey: ['data-catalog'], queryFn: () => get('/api/data/catalog') })
+  const datasets: any[] = catalogData?.catalog ?? []
+
+  async function uploadFiles(list: FileList | null) {
+    if (!list || list.length === 0) return
+    setUploading(true); setUploadMsg('')
+    let done = 0
+    for (const file of Array.from(list)) {
+      const fd = new FormData()
+      fd.append('file', file)
+      fd.append('subdir', 'uploads')
+      try {
+        const r = await fetch('/api/data/upload', { method: 'POST', body: fd }).then(r => r.json())
+        if (r.ok) done++
+        else setUploadMsg(`Error: ${r.error}`)
+      } catch (e: any) {
+        setUploadMsg(`Error: ${e.message}`)
+      }
+    }
+    setUploading(false)
+    if (done > 0) { setUploadMsg(`✓ Uploaded ${done} file${done > 1 ? 's' : ''} to data/uploads/`); refetch() }
+  }
 
   async function profileFile(path: string) {
     setProfiling(true); setProfile(null)
@@ -72,28 +89,14 @@ export default function Data() {
   }
 
   const TABS: { id: Tab; label: string }[] = [
-    { id: 'browse', label: 'Browse' },
+    { id: 'browse', label: 'Browse & Upload' },
     { id: 'download', label: 'Download' },
     { id: 'process', label: 'Process' },
   ]
 
   return (
     <div style={{ padding: 28 }}>
-      <PageHeader
-        title="Data"
-        right={
-          <div style={{ display: 'flex', gap: 2, background: 'var(--color-surface-2)', padding: 3, borderRadius: 10, border: '1px solid var(--color-line)' }}>
-            {TABS.map(t => (
-              <button key={t.id} onClick={() => setTab(t.id)} style={{
-                padding: '6px 14px', borderRadius: 8, border: 'none', cursor: 'pointer',
-                fontSize: 13, fontWeight: 500,
-                background: tab === t.id ? 'var(--color-accent)' : 'transparent',
-                color: tab === t.id ? 'var(--color-accent-ink)' : 'var(--color-ink-2)',
-              }}>{t.label}</button>
-            ))}
-          </div>
-        }
-      />
+      <PageHeader title="Data" right={<Tabs tabs={TABS} active={tab} onChange={setTab} />} />
 
       {tab === 'browse' && (
         <div style={{ display: 'grid', gridTemplateColumns: '1fr 340px', gap: 14 }}>
@@ -108,7 +111,25 @@ export default function Data() {
             <div style={{ display: 'flex', gap: 8, marginBottom: 12 }}>
               <input value={root} onChange={e => setRoot(e.target.value)} className="input" placeholder="data root" style={{ flex: 1 }} />
             </div>
-            <div style={{ display: 'flex', flexDirection: 'column', gap: 3, maxHeight: 480, overflow: 'auto' }}>
+
+            {/* Upload dropzone */}
+            <div
+              onDragOver={e => e.preventDefault()}
+              onDrop={e => { e.preventDefault(); uploadFiles(e.dataTransfer.files) }}
+              onClick={() => fileRef.current?.click()}
+              style={{
+                border: '1px dashed var(--color-line-2)', borderRadius: 10, padding: '16px',
+                textAlign: 'center', cursor: 'pointer', marginBottom: 12,
+                background: 'var(--color-surface-2)', color: 'var(--color-ink-2)',
+                display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8, fontSize: 13,
+              }}>
+              <Upload size={15} />
+              {uploading ? 'Uploading…' : 'Drop files here or click to upload → data/uploads/'}
+              <input ref={fileRef} type="file" multiple hidden onChange={e => uploadFiles(e.target.files)} />
+            </div>
+            {uploadMsg && <div style={{ fontSize: 12, marginBottom: 10, color: uploadMsg.startsWith('✓') ? 'var(--color-pos)' : 'var(--color-neg)' }}>{uploadMsg}</div>}
+
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 3, maxHeight: 440, overflow: 'auto' }}>
               {files.length === 0 && <Empty>No files found in "{root}"</Empty>}
               {files.map(f => (
                 <div key={f.path} onClick={() => { setSelected(f.path); profileFile(f.path) }}
@@ -146,7 +167,7 @@ export default function Data() {
       {tab === 'download' && (
         <div>
           <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 12, marginBottom: 16 }}>
-            {DATASETS.map(d => (
+            {datasets.map(d => (
               <Card key={d.id} pad={18}>
                 <div style={{ fontWeight: 600, fontSize: 14, marginBottom: 3 }}>{d.name}</div>
                 <div style={{ fontSize: 12, color: 'var(--color-ink-2)', marginBottom: 2 }}>{d.desc}</div>
@@ -183,7 +204,7 @@ export default function Data() {
                 </select>
               </Field>
               <Field label={`Seq len: ${procSeqLen}`}>
-                <input type="range" min={128} max={4096} step={128} value={procSeqLen} onChange={e => setProcSeqLen(+e.target.value)} style={{ width: '100%' }} />
+                <input type="range" min={128} max={4096} step={128} value={procSeqLen} onChange={e => setProcSeqLen(+e.target.value)} style={{ width: '100%', accentColor: 'var(--color-accent)' }} />
               </Field>
               <Button onClick={runProcess} disabled={jobRunning || !procInput} variant="primary" icon={<Zap size={13} />}>
                 {jobRunning ? 'Processing...' : 'Process'}

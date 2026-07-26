@@ -164,23 +164,17 @@ def register_builtin_components() -> None:
         return
     _BUILTINS_REGISTERED = True
 
-    for name in ["sdpa", "flash", "flash_v2", "flash_v3", "manual", "sliding_window"]:
-        ATTENTION_BACKENDS.register(
-            name,
-            "nanoforge.model.attention:CausalSelfAttention",
-            version="1",
-            replace=True,
-            status="available",
-        )
-    ATTENTION_BACKENDS.register("chunked", "nanoforge.model.attention:ChunkedCausalSelfAttention", version="1", replace=True)
-    ATTENTION_BACKENDS.register("sparse", "nanoforge.model.attention:SparseCausalSelfAttention", version="1", replace=True)
-    ATTENTION_BACKENDS.register(
-        "hybrid_local_global",
-        "nanoforge.model.attention:HybridLocalGlobalCausalAttention",
-        version="1",
-        replace=True,
-    )
-    ATTENTION_BACKENDS.register("paged", "nanoforge.model.attention:PagedCausalSelfAttention", version="1", replace=True)
+    ATTENTION_BACKENDS.register("sdpa", "nanoforge.model.attention:CausalSelfAttention", version="1", replace=True, status="available")
+    ATTENTION_BACKENDS.register("manual", "nanoforge.model.attention:CausalSelfAttention", version="1", replace=True, status="available")
+    ATTENTION_BACKENDS.register("sliding_window", "nanoforge.model.attention:CausalSelfAttention", version="1", replace=True, status="available")
+    # flash/flash_v2/flash_v3: use real flash-attn kernel when installed, else SDPA with warning
+    for name in ["flash", "flash_v2", "flash_v3"]:
+        ATTENTION_BACKENDS.register(name, "nanoforge.model.attention:CausalSelfAttention", version="1", replace=True, status="requires_flash_attn")
+    # chunked/sparse/paged: SDPA with sliding-window presets (not true sparse/paged kernels)
+    ATTENTION_BACKENDS.register("chunked", "nanoforge.model.attention:ChunkedCausalSelfAttention", version="1", replace=True, status="sdpa_with_window")
+    ATTENTION_BACKENDS.register("sparse", "nanoforge.model.attention:SparseCausalSelfAttention", version="1", replace=True, status="sdpa_with_window")
+    ATTENTION_BACKENDS.register("hybrid_local_global", "nanoforge.model.attention:HybridLocalGlobalCausalAttention", version="1", replace=True, status="sdpa_with_window")
+    ATTENTION_BACKENDS.register("paged", "nanoforge.model.attention:PagedCausalSelfAttention", version="1", replace=True, status="sdpa_with_window")
 
     FFN_BACKENDS.register("swiglu", "nanoforge.model.moe:FeedForward", version="1", replace=True)
     FFN_BACKENDS.register("geglu", "nanoforge.model.moe:FeedForward", version="1", replace=True)
@@ -199,7 +193,7 @@ def register_builtin_components() -> None:
     )
 
     NORMALIZATIONS.register("rmsnorm", "nanoforge.model.norms:RMSNorm", version="1", replace=True)
-    NORMALIZATIONS.register("layernorm", "torch.nn:LayerNorm", version="1", replace=True)
+    NORMALIZATIONS.register("layernorm", "nanoforge.model.norms:LayerNorm", version="1", replace=True)
 
     ACTIVATIONS.register("silu", "nanoforge.model.activations:silu", version="1", replace=True)
     ACTIVATIONS.register("gelu", "nanoforge.model.activations:gelu", version="1", replace=True)

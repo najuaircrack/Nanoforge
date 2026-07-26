@@ -1,26 +1,10 @@
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass
 from typing import Iterator
 
 from nanoforge.generation.engine import GenerationEngine
 from nanoforge.generation.sampling import SamplingConfig
-
-
-@dataclass
-class CompletionRequest:
-    prompt: str
-    max_new_tokens: int = 256
-    temperature: float = 0.8
-    top_k: int | None = 50
-    top_p: float | None = 0.95
-    repetition_penalty: float = 1.0
-    stream: bool = False
-    mode: str = "balanced"
-    frequency_penalty: float = 0.0
-    presence_penalty: float = 0.0
-    stop: list[str] | None = None
 
 
 def create_app(engine: GenerationEngine):
