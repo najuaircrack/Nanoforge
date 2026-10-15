@@ -19,6 +19,9 @@ CPU strategy, limitations, and staged platform plan.
   optional Rust tokenizer extension with Python fallbacks.
 - Generation, chat, sampling, KV caching, local FastAPI serving, RAG primitives, DPO/distillation
   experiments, GGUF/ONNX export, and a React local studio.
+- A bounded coding-agent backend with repository inspection, hash-checked patches, fixed-profile
+  tests, approvals, budgets, cancellation, replay traces, and deterministic FIM formatting for
+  code-specialist training.
 
 ## Install
 
@@ -128,6 +131,10 @@ learn broad knowledge. Prefer:
 
 The audit explains why this is the practical route and which pieces Nanoforge still needs to make
 it first-class.
+
+For the coding-agent direction, read [`docs/coding-agent-architecture.md`](docs/coding-agent-architecture.md).
+The repository tools intentionally refuse arbitrary model-generated shell commands; write and test
+actions require explicit capabilities and approval.
 
 ## Web studio
 

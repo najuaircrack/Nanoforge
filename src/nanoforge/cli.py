@@ -843,7 +843,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--name", required=True)
     p.add_argument(
         "--mode",
-        choices=["auto", "generative", "chat", "instruct", "completion", "code", "reasoning"],
+        choices=["auto", "generative", "chat", "instruct", "completion", "code", "fim", "reasoning"],
         default="auto",
     )
     p.add_argument(
@@ -910,7 +910,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--jsonl-text-key", default="text")
     p.add_argument(
         "--mode",
-        choices=["auto", "generative", "chat", "instruct", "completion", "code", "reasoning", "hybrid"],
+        choices=["auto", "generative", "chat", "instruct", "completion", "code", "fim", "reasoning", "hybrid"],
         default="auto",
     )
     p.add_argument(

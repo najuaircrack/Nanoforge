@@ -308,6 +308,17 @@ The current Phase 1 slice now provides:
 The phase intentionally does not claim semantic grounding, tool execution, release thresholds, or
 general intelligence. Those remain later phases.
 
+### Phase 1A — coding-agent boundary (implemented slice)
+
+The next product direction is coding-focused. The first backend slice now provides bounded
+repository inspection, expected-hash patching, a fixed pytest profile, structured tool schemas,
+capability/approval checks, budgets, cancellation checks, trace events, dry-run replay, and FIM
+formatting for code-specialist data. See `docs/coding-agent-architecture.md`.
+
+This is not yet a frontier coding model, imported-model adapter, or hardened OS sandbox. The next
+coding slices are repository snapshot/dependency packing, coding-case evaluation, model-specific
+FIM/chat/action adapters, and an explicit process/container sandbox.
+
 ### Phase 2 — CPU quality path
 
 Add model presets based on measured parameter/activation budgets; fix effective-batch semantics;
@@ -407,3 +418,25 @@ Primary sources consulted for this audit:
 
 These sources support design decisions; they do not prove that Nanoforge implements their
 algorithms. Every future claim must be tied to a local test, benchmark, or artifact.
+
+## Coding-agent direction (current next slice)
+
+The product direction is now explicitly coding-agent focused. See
+[`coding-agent-architecture.md`](coding-agent-architecture.md) for the detailed design and
+research notes.
+
+The repository now contains a backend-only bounded agent interface under `src/nanoforge/agent/`:
+
+- repository-relative list/read/search tools;
+- expected-hash atomic patching;
+- one fixed, allowlisted pytest profile;
+- schema validation and duplicate-safe tool registration;
+- capability and approval checks;
+- step/tool-call/wall-clock budgets;
+- cancellation checks;
+- bounded outputs and trace events;
+- dry-run replay.
+
+This is deliberately not presented as a frontier model or hardened OS sandbox. The next work is
+to add coding-case evaluation, imported-model action adapters, FIM-aware tokenizer validation,
+repository snapshot/dependency packing, and then an explicit OS/container execution boundary.

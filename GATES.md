@@ -39,3 +39,8 @@ Scope: restore a reproducible project foundation, document the current architect
   CHECK: python -m ruff check .
   EXPECT: All checks passed!
   EVIDENCE: pending
+
+- [ ] G9: coding-agent repository tools enforce schemas, workspace confinement, approvals, and bounded tests
+  CHECK: python -m pytest -q tests/test_agent_harness.py tests/test_repository_tools.py tests/test_fim.py
+  EXPECT: 9 passed
+  EVIDENCE: pending

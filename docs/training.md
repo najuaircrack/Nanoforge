@@ -9,6 +9,11 @@ Nanoforge trains three main styles:
 - **chat** — role-based conversations, assistant-only labels.
 - **instruct** — instruction/response pairs, completion-only labels.
 
+For coding-specialist experiments, `mode: fim` applies deterministic fill-in-the-middle
+formatting with `<|fim_prefix|>`, `<|fim_suffix|>`, and `<|fim_middle|>` sentinels. Use a real
+code tokenizer that preserves those sentinels as dedicated tokens; byte-tokenizer FIM is only a
+pipeline smoke test.
+
 For Windows 11 CPU-only training with ~8 GB RAM, a good starting point is `native-bpe`,
 `vocab_size=8000`, `seq_len=512` for chat/instruct, `seq_len=1024` for generative text —
 or the dependency-free `byte` tokenizer for the smallest experiments.

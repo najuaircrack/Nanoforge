@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
+from nanoforge.data.fim import transform_fim_text
 from nanoforge.data.formats import DatasetRecord
 from nanoforge.data.tokenizer import TokenizerLike
 
@@ -64,6 +65,13 @@ def encode_training_record(
 ) -> EncodedTrainingRecord:
     actual_mode = infer_record_mode(record, mode)
     policy = resolve_loss_masking(actual_mode, loss_masking)
+    if actual_mode == "fim":
+        transformed = transform_fim_text(record.text)
+        ids = tokenizer.encode(transformed, add_bos=add_bos, add_eos=add_eos)
+        labels = list(ids)
+        if labels:
+            labels[0] = -100
+        return EncodedTrainingRecord(ids=ids, labels=labels, mode=actual_mode, loss_masking="none")
     if policy == "assistant_only":
         ids, labels = _encode_role_masked(record.text, tokenizer, add_bos=add_bos, add_eos=add_eos)
     elif policy == "completion_only":
