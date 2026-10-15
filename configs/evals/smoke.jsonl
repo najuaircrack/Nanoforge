@@ -1,0 +1,4 @@
+{"id":"exact-001","type":"exact_match","prompt":"What is 2 + 2?","expected":"4","generation":{"mode":"deterministic","max_new_tokens":8},"tags":["smoke"]}
+{"id":"json-001","type":"structured","prompt":"Return JSON with name=Nanoforge.","expected":{"name":"Nanoforge"},"generation":{"mode":"deterministic","max_new_tokens":32},"tags":["smoke"]}
+{"id":"tool-001","type":"tool_call","prompt":"Call weather with city London.","expected":{"name":"weather","arguments":{"city":"London"}},"generation":{"mode":"deterministic","max_new_tokens":32},"tags":["agent"]}
+{"id":"ground-001","type":"grounding","prompt":"Answer using the evidence and cite it.","context":[{"id":"doc-1","text":"Nanoforge is local-first."}],"expected":{"required_citations":["doc-1"],"required_substrings":["local-first"]},"generation":{"mode":"deterministic","max_new_tokens":32},"tags":["retrieval"]}

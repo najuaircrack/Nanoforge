@@ -24,3 +24,18 @@ Scope: restore a reproducible project foundation, document the current architect
 
 - [ ] G5: current project checks are rerun and every failure is recorded honestly
   EVIDENCE: pending
+
+- [ ] G6: checkpoint and run manifests are written without changing legacy checkpoint loading
+  CHECK: python -m pytest -q tests/test_artifacts.py tests/test_training_reliability.py
+  EXPECT: 8 passed
+  EVIDENCE: pending
+
+- [ ] G7: task-suite checks preserve passed, failed, and errored cases in versioned reports
+  CHECK: python -m pytest -q tests/test_task_suite.py tests/test_cli_evaluation.py
+  EXPECT: 4 passed
+  EVIDENCE: pending
+
+- [ ] G8: the complete Python quality gate remains green after Phase 1 integration
+  CHECK: python -m ruff check .
+  EXPECT: All checks passed!
+  EVIDENCE: pending

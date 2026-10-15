@@ -10,6 +10,7 @@ from typing import Any
 import torch
 from tqdm import tqdm, trange
 
+from nanoforge.artifacts import RunManifestWriter
 from nanoforge.config import NanoforgeConfig, load_config
 from nanoforge.data.dataset import PackedMemmapDataset, make_torch_batch
 from nanoforge.data.tokenizer import load_tokenizer
@@ -79,6 +80,29 @@ class Trainer:
         self.train_data = self._build_train_data()
         self.val_data = PackedMemmapDataset(self.data_cfg.val_path, self.data_cfg.seq_len)
         self.output_dir = ensure_dir(self.train_cfg.output_dir)
+        self.run_manifest = RunManifestWriter(
+            self.output_dir,
+            self.train_cfg.run_name,
+            self.config,
+            device=str(self.device),
+        )
+        self.run_manifest.update(
+            data={
+                "train_path": self.data_cfg.train_path,
+                "val_path": self.data_cfg.val_path,
+                "seq_len": self.data_cfg.seq_len,
+                "mode": self.data_cfg.mode,
+                "loss_masking": self.data_cfg.loss_masking,
+            },
+            tokenizer={
+                "type": self.data_cfg.tokenizer_type,
+                "path": self.data_cfg.tokenizer_path,
+            },
+            model={
+                "parameter_count": sum(parameter.numel() for parameter in self.model.parameters()),
+                "training_mode": "from_scratch",
+            },
+        )
         scaler_enabled = self.device.type == "cuda" and autocast_dtype(self.train_cfg.precision, self.device) == torch.float16
         try:
             self.scaler = torch.amp.GradScaler("cuda", enabled=scaler_enabled)
@@ -487,6 +511,18 @@ class Trainer:
                 self.ema.state_dict() if self.ema else None,
             )
         self.checkpoints.close()
+        for checkpoint_path in sorted(self.output_dir.glob("*.pt")):
+            try:
+                self.run_manifest.add_checkpoint(checkpoint_path)
+            except (OSError, ValueError, RuntimeError):
+                # A provenance failure must not hide a completed training checkpoint.
+                get_logger("training.trainer").warning(
+                    "could not attach checkpoint manifest for %s", checkpoint_path, exc_info=True
+                )
+        self.run_manifest.finish(
+            "interrupted" if interrupted else "completed",
+            resources={"final_step": final_step, "best_val_loss": best_val},
+        )
         for sig, handler in previous_handlers:
             try:
                 signal.signal(sig, handler)
@@ -503,7 +539,12 @@ class Trainer:
 
 def train_from_config(path: str | Path) -> None:
     cfg = load_config(path)
-    Trainer(cfg).train()
+    trainer = Trainer(cfg)
+    try:
+        trainer.train()
+    except Exception as exc:
+        trainer.run_manifest.finish("failed", provenance={"error": f"{type(exc).__name__}: {exc}"})
+        raise
 
 
 def run_training_with_optional_tui(path: str | Path, no_tui: bool = False) -> None:

@@ -11,6 +11,7 @@ from typing import Any
 import numpy as np
 import torch
 
+from nanoforge.artifacts import content_fingerprint, write_artifact_manifest
 from nanoforge.config import NanoforgeConfig, save_config
 from nanoforge.registry import registry_snapshot
 
@@ -120,6 +121,18 @@ def write_checkpoint_payload(
         encoding="utf-8",
     )
     save_config(config, path.with_suffix(".yaml"))
+    write_artifact_manifest(
+        path,
+        artifact_kind="checkpoint",
+        metadata={
+            "checkpoint_schema_version": CHECKPOINT_SCHEMA_VERSION,
+            "step": step,
+            "val_loss": val_loss,
+            "config_fingerprint": content_fingerprint(config),
+            "parameter_count": sum(parameter.numel() for parameter in payload["model"].values()),
+        },
+        provenance={"paths_are_relative": True},
+    )
 
 
 def _clone_state(value: Any) -> Any:

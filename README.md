@@ -90,6 +90,19 @@ nanoforge evaluate \
 nanoforge chat --checkpoint runs/local-specialist/best.pt --mode chat
 ```
 
+For repeatable behavior checks, use a JSONL task suite. This creates a versioned report with all
+outputs and failures instead of relying on training loss alone:
+
+```bash
+nanoforge evaluate-suite \
+  --suite configs/evals/smoke.jsonl \
+  --checkpoint runs/local-specialist/best.pt \
+  --out reports/evaluations/local-specialist
+```
+
+Training runs now write `run.manifest.json`, and checkpoints write additive `.manifest.json`
+sidecars containing reproducibility and provenance information.
+
 For a dependency-free smoke path:
 
 ```bash

@@ -19,7 +19,7 @@ Windows uses `^` for line continuation in the examples below; Linux/macOS use `\
 - [Training](#training): `auto-train`, `train`
 - [Inference](#inference): `generate`, `chat`, `serve`
 - [Import external models](#import-external-models): `import`
-- [Export & evaluation](#export--evaluation): `export`, `evaluate`, `benchmark`, `profile-config`
+- [Export & evaluation](#export--evaluation): `export`, `evaluate`, `evaluate-suite`, `benchmark`, `profile-config`
 
 ---
 
@@ -418,6 +418,34 @@ Evaluate a checkpoint on packed validation data: loss, perplexity, token accurac
 ```bash
 nanoforge evaluate --checkpoint runs/tiny/best.pt --data data/packed/tiny/val.bin --batches 20
 ```
+
+### `evaluate-suite`
+Run a model against a deterministic JSONL task suite. The command writes a versioned
+`report.json`, all-case `cases.jsonl`, and failed/error cases in `failures.jsonl`. Tool-call cases
+are validated but never executed.
+
+| Flag | Default | Description |
+| --- | --- | --- |
+| `--suite` | required | JSONL suite containing `id`, `type`, and `prompt`. |
+| `--checkpoint` / `--model` | exactly one required | Nanoforge checkpoint or imported model. |
+| `--out` | required | Output directory or `report.json` path. |
+| `--device` | `auto` | Device for the selected model. |
+| `--seed` | `1337` | Evaluation seed recorded in the report. |
+
+Supported Phase 1 types are `exact_match`, `structured`, `tool_call`, and `grounding`. Grounding
+is deliberately lexical/citation checking; it is not a semantic faithfulness score.
+
+```bash
+nanoforge evaluate-suite \
+  --suite configs/evals/smoke.jsonl \
+  --checkpoint runs/tiny/best.pt \
+  --out reports/evaluations/tiny
+```
+
+Every saved checkpoint also has an additive `<checkpoint>.manifest.json` sidecar. Training runs
+write `run.manifest.json` with config, environment, model/data identity, status, resources, and
+linked checkpoint artifacts. Existing `.pt`, `.hash`, `.meta.json`, and YAML sidecars remain
+backward-compatible.
 
 ### `benchmark`
 Benchmark forward-pass throughput for a config.

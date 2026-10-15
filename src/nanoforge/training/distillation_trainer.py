@@ -43,6 +43,12 @@ class DistillationTrainer(Trainer):
         self.teacher.eval()
         self._alpha = config.training.distill_alpha
         self._temperature = config.training.distill_temperature
+        self.run_manifest.update(
+            provenance={
+                "teacher_checkpoint": teacher_ckpt,
+                "teacher_type": "checkpoint" if teacher_ckpt else "student_initial_copy",
+            }
+        )
         self._logger.info("distillation: alpha=%.2f temperature=%.1f", self._alpha, self._temperature)
 
     def _forward_loss(self, x: torch.Tensor, y: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:

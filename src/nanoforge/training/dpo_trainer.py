@@ -10,6 +10,7 @@ import torch
 from torch import nn
 from tqdm import trange
 
+from nanoforge.artifacts import RunManifestWriter
 from nanoforge.config import NanoforgeConfig, load_config
 from nanoforge.data.tokenizer import load_tokenizer
 from nanoforge.logging_utils import get_logger
@@ -126,6 +127,20 @@ class DPOTrainer:
             self.train_cfg.eps,
         )
         self.output_dir = ensure_dir(self.train_cfg.output_dir)
+        self.run_manifest = RunManifestWriter(
+            self.output_dir,
+            self.train_cfg.run_name,
+            self.config,
+            device=str(self.device),
+        )
+        self.run_manifest.update(
+            data={"preference_data": str(self.preference_data), "seq_len": self.data_cfg.seq_len},
+            model={
+                "parameter_count": sum(parameter.numel() for parameter in self.model.parameters()),
+                "training_mode": "dpo",
+            },
+            provenance={"reference_checkpoint": str(reference_checkpoint) if reference_checkpoint else None},
+        )
         self.metric_logger = JsonlMetricLogger(self.output_dir / "metrics.jsonl", reset=True)
         self.checkpoints = AsyncCheckpointSaver(self.train_cfg.async_checkpoint)
 
@@ -225,9 +240,17 @@ class DPOTrainer:
             self.config, self.train_cfg.max_steps, None, None,
         )
         self.checkpoints.close()
+        for checkpoint_path in sorted(self.output_dir.glob("*.pt")):
+            self.run_manifest.add_checkpoint(checkpoint_path)
+        self.run_manifest.finish("completed", resources={"final_step": self.train_cfg.max_steps})
         self._log({"dpo/best_loss": best_loss}, self.train_cfg.max_steps, event="done")
 
 
 def dpo_from_config(config_path: str | Path, preference_data: str | Path, beta: float = 0.1) -> None:
     cfg = load_config(config_path)
-    DPOTrainer(cfg, preference_data, beta=beta).train()
+    trainer = DPOTrainer(cfg, preference_data, beta=beta)
+    try:
+        trainer.train()
+    except Exception as exc:
+        trainer.run_manifest.finish("failed", provenance={"error": f"{type(exc).__name__}: {exc}"})
+        raise

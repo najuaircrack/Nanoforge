@@ -760,6 +760,46 @@ def cmd_evaluate(args: argparse.Namespace) -> None:
         print(f"{key}: {value:,.4f}" if isinstance(value, float) else f"{key}: {value}")
 
 
+def cmd_evaluate_suite(args: argparse.Namespace) -> None:
+    from nanoforge.evaluation.suite import (
+        evaluate_task_suite,
+        load_task_suite,
+        write_evaluation_report,
+    )
+
+    suite = load_task_suite(args.suite)
+    engine = _load_generation_engine(args)
+    model_metadata: dict[str, object] = {"source": args.checkpoint or args.model}
+    if args.checkpoint:
+        from nanoforge.artifacts import load_artifact_manifest
+
+        try:
+            manifest = load_artifact_manifest(args.checkpoint)
+            model_metadata.update(
+                {
+                    "artifact_id": manifest.artifact_id,
+                    "content_fingerprint": manifest.content_fingerprint,
+                    "artifact_kind": manifest.artifact_kind,
+                }
+            )
+        except FileNotFoundError:
+            model_metadata["manifest"] = None
+    report = evaluate_task_suite(
+        suite,
+        engine,
+        model_metadata=model_metadata,
+        device=args.device,
+        seed=args.seed,
+    )
+    paths = write_evaluation_report(report, args.out)
+    print(f"suite: {report.suite_id}")
+    print(f"passed: {report.summary['passed']}/{report.summary['total']}")
+    print(f"failed: {report.summary['failed']}")
+    print(f"errors: {report.summary['errors']}")
+    for name, path in paths.items():
+        print(f"{name}: {path}")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="nanoforge")
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -1109,6 +1149,16 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--batches", type=int, default=20)
     p.add_argument("--device", default="auto")
     p.set_defaults(func=cmd_evaluate)
+
+    p = sub.add_parser("evaluate-suite", help="Evaluate a model against a JSONL task suite.")
+    p.add_argument("--suite", required=True, help="JSONL task suite.")
+    source = p.add_mutually_exclusive_group(required=True)
+    source.add_argument("--checkpoint", help="Nanoforge checkpoint path.")
+    source.add_argument("--model", help="Imported model name, path, or HuggingFace id.")
+    p.add_argument("--out", required=True, help="Output directory or report.json path.")
+    p.add_argument("--device", default="auto")
+    p.add_argument("--seed", type=int, default=1337)
+    p.set_defaults(func=cmd_evaluate_suite)
 
     return parser
 

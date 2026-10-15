@@ -29,6 +29,8 @@ def test_checkpoint_hash_and_schema_roundtrip(tmp_path):
     assert payload["step"] == 3
     assert "rng" in payload
     assert "registry" in payload
+    manifest = path.with_suffix(".pt.manifest.json")
+    assert manifest.exists()
 
 
 def test_health_monitor_reports_entropy_and_optimizer_stats():

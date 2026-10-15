@@ -219,3 +219,24 @@ Evaluate a finished checkpoint:
 ```powershell
 nanoforge evaluate --checkpoint runs/tiny/best.pt --data data/packed/tiny/val.bin --batches 20
 ```
+
+## Reproducibility manifests and task suites
+
+Completed Nanoforge and DPO runs write `run.manifest.json` beside their metrics and checkpoints.
+Each checkpoint also writes `<name>.pt.manifest.json`. These are additive provenance artifacts;
+old checkpoints remain loadable without them. Manifests record the config fingerprint, model/data
+paths, tokenizer identity, environment, status, resource fields, and linked checkpoint IDs.
+
+For behavior-level checks, create a synthetic JSONL suite and run:
+
+```bash
+nanoforge evaluate-suite \
+  --suite configs/evals/smoke.jsonl \
+  --checkpoint runs/mychat/best.pt \
+  --out reports/evaluations/mychat
+```
+
+The report preserves every generated output, latency, pass/fail/error status, and checker details.
+Use `tool_call` cases to validate structured actions without executing tools. Use `grounding`
+cases for explicit citation and evidence-substring checks only; they do not claim semantic
+faithfulness.

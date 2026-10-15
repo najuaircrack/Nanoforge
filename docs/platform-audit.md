@@ -282,7 +282,7 @@ must be explicit capabilities.
 
 This is the order that minimizes rework and gives a useful product after each slice.
 
-### Phase 0 — foundation and truthfulness (current slice)
+### Phase 0 — foundation and truthfulness (completed)
 
 - Restore package/docs/license/ignore files and keep frontend/Rust lockfiles visible.
 - Record the actual architecture and limitations in this document.
@@ -293,14 +293,20 @@ This is the order that minimizes rework and gives a useful product after each sl
 **Exit evidence:** clean checkout installs, Python tests run, web build/lint are reproducible when
 dependencies are installed, native tests are reproducible, and all failures are recorded.
 
-### Phase 1 — artifact and evaluation spine
+### Phase 1 — artifact and evaluation spine (implemented)
 
-Add `ArtifactManifest` and `RunManifest` schemas with migrations, fingerprints, environment data,
-split policy, tokenizer metadata, and resource metrics. Add a task-suite runner with JSONL cases,
-exact-match/structured/tool-call/grounding checks, generation snapshots, and failure reports.
+The current Phase 1 slice now provides:
 
-**Exit evidence:** a tiny fixture can run end to end and produce a report that identifies the
-model, data, code revision, metrics, latency, peak memory, and failures.
+- additive versioned artifact manifests with content fingerprints and atomic writes;
+- run manifests for base training, DPO, and distillation provenance;
+- checkpoint manifest sidecars without changing checkpoint payload schema 2;
+- JSONL task suites with exact-match, structured JSON, tool-call, and lexical grounding checks;
+- complete case snapshots, latency, explicit generator errors, aggregate summaries, and report
+  files (`report.json`, `cases.jsonl`, `failures.jsonl`);
+- `nanoforge evaluate-suite` for Nanoforge and imported model engines.
+
+The phase intentionally does not claim semantic grounding, tool execution, release thresholds, or
+general intelligence. Those remain later phases.
 
 ### Phase 2 — CPU quality path
 
