@@ -18,7 +18,7 @@ import json
 import os
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Iterable, Iterator
+from typing import Iterable
 
 import numpy as np
 

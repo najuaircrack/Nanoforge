@@ -1,50 +1,62 @@
 # Contributing to Nanoforge
 
-Thanks for your interest in Nanoforge. This guide covers local setup, the test/lint
-workflow, and how to open a pull request.
+Nanoforge is moving from a compact transformer experiment into a local-first platform for
+training, adapting, evaluating, and safely running small agent models. Keep changes narrow,
+observable, and reproducible.
 
 ## Development setup
 
-Nanoforge targets Python 3.10–3.12. Create a virtual environment and install the package
-in editable mode with the dev extras:
+Nanoforge targets Python 3.10–3.12; `.python-version` records the default development runtime.
 
 ```bash
 python -m venv .venv
-# Windows (Git Bash): source .venv/Scripts/activate
-# macOS/Linux:        source .venv/bin/activate
-pip install -e ".[dev]"
+# Windows: .venv\Scripts\activate
+# Linux/macOS: source .venv/bin/activate
+python -m pip install -e ".[dev]"
 ```
 
-The `dev` extra pulls in `pytest` and `ruff`. For data/tokenizer/serving work, install the
-matching extras (`.[data]`, `.[tokenizers]`, `.[serve]`) or `.[all]`.
-
-## Tests and linting
-
-Run both before opening a PR — CI runs the same commands on py3.10/3.11/3.12:
+The web application has its own lockfile and toolchain:
 
 ```bash
-ruff check .
-pytest -q
+cd web
+npm ci
+npm run build
+npm run lint
 ```
 
-Configuration for both lives in `pyproject.toml` (`[tool.ruff]` / `[tool.ruff.lint]` and
-`[tool.pytest.ini_options]`). Tests that need `torch` skip automatically when it isn't
-installed, so a minimal `.[dev]` environment still collects green.
+## Checks
 
-## Pull request flow
+Run the focused offline project check from the repository root:
 
-1. Branch off `main`.
-2. Keep changes focused; match the surrounding code style (ruff enforces import order and
-   pycodestyle rules; line length is advisory).
-3. Add or update tests for behavior changes. New dataset shapes should get a case in
-   `tests/test_profiler.py` or `tests/test_formats_detection.py`.
-4. Update `CHANGELOG.md` under `## [Unreleased]`.
-5. Ensure `ruff check .` and `pytest -q` pass, then open the PR against `main`.
+```bash
+make test
+```
+
+The underlying checks are:
+
+```bash
+python -m ruff check .
+python -m pytest -q
+```
+
+When changing the web app, also run `npm run build` and `npm run lint` from `web/`.
+
+## Change rules
+
+1. Read `AGENTS.md` and the relevant architecture document before editing.
+2. Add a regression test for behavior changes, especially data masking, checkpoint loading,
+   generation stopping, tool execution, or security boundaries.
+3. Do not commit datasets, model weights, private conversations, indexes, caches, or secrets.
+4. Do not describe placeholder or fallback implementations as production backends.
+5. Record user-visible changes in `CHANGELOG.md` and update the relevant workflow documentation.
+6. Run the smallest meaningful check after each working step; keep unrelated failures visible.
 
 ## Project layout
 
-- `src/nanoforge/` — package (data pipeline, model, training, generation, serving).
-- `configs/` — training/inference configs.
-- `scripts/` — standalone diagnostics and dataset tooling (not imported by the package).
-- `tests/` — pytest suite.
-- `docs/` — user-facing guides.
+- `src/nanoforge/` — Python package and public runtime APIs.
+- `web/` — React/Vite local studio.
+- `configs/` — checked-in, portable configuration examples.
+- `docs/` — architecture, workflows, platform audit, and roadmap.
+- `native/` — optional Rust preprocessing/tokenizer extension.
+- `tests/` — executable behavior checks.
+- `scripts/` — small, documented developer utilities only.

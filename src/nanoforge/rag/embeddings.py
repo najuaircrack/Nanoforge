@@ -12,7 +12,6 @@ so cosine similarity reduces to a dot product at query time.
 from __future__ import annotations
 
 import hashlib
-import math
 from typing import TYPE_CHECKING, Iterable, Protocol, runtime_checkable
 
 import numpy as np

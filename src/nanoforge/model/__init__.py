@@ -1,11 +1,11 @@
+from nanoforge.model.heads import CausalLMOutput, ModelOutput
 from nanoforge.model.transformer import (
+    NanoforgeBackbone,
     NanoforgeForCausalLM,
     NanoforgeModel,
-    NanoforgeBackbone,
     TokenEmbedding,
     build_model,
 )
-from nanoforge.model.heads import ModelOutput, CausalLMOutput
 
 __all__ = [
     "NanoforgeForCausalLM",
@@ -16,4 +16,3 @@ __all__ = [
     "ModelOutput",
     "CausalLMOutput",
 ]
-

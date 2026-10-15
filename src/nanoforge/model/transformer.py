@@ -8,8 +8,18 @@ from torch import nn
 
 from nanoforge.config import ModelConfig, NanoforgeConfig
 from nanoforge.model.attention import KVCache
-from nanoforge.model.heads import CausalLMHead, ModelOutput, CausalLMOutput  # noqa: F401 (re-export)
-from nanoforge.registry import ATTENTION_BACKENDS, FFN_BACKENDS, NORMALIZATIONS, TASK_HEADS, TRANSFORMER_BLOCKS
+from nanoforge.model.heads import (  # noqa: F401 (re-export)
+    CausalLMHead,
+    CausalLMOutput,
+    ModelOutput,
+)
+from nanoforge.registry import (
+    ATTENTION_BACKENDS,
+    FFN_BACKENDS,
+    NORMALIZATIONS,
+    TASK_HEADS,
+    TRANSFORMER_BLOCKS,
+)
 
 
 class TokenEmbedding(nn.Module):

@@ -1,273 +1,166 @@
 # Nanoforge
 
-Nanoforge is a compact, from-scratch transformer framework for training and running
-transformer models on local hardware (CPU or a single GPU). It is built on **PyTorch**
-(`torch >= 2.2`) — there is no TensorFlow or JAX anywhere in the stack — with an optional
-**Rust** performance layer (via PyO3/maturin) for hot loops like tokenizer training.
+Nanoforge is a local-first Python/PyTorch toolkit evolving into a platform for training,
+adapting, evaluating, and safely running small agentic AI systems on CPU, one GPU, or a small
+distributed job.
 
-The model core is a **task-agnostic transformer backbone with pluggable output heads**, so
-the same body can be trained as a causal LM / chatbot, a masked LM, a sequence or token
-classifier, or a reward model — it is *not* locked to a decoder-only GPT clone. The Python
-layer is the orchestration and config surface; Rust is the performance path.
+**Important:** the current repository is a compact transformer toolkit plus a partial web studio.
+It is not yet a complete agent harness or a replacement for a modern pretrained model. Read
+[`docs/platform-audit.md`](docs/platform-audit.md) for the honest capability map, research-backed
+CPU strategy, limitations, and staged platform plan.
 
-It is built for **learning, experimentation, and rapid prototyping** — the whole stack
-(model, tokenizers, data pipeline, training loop, inference, CLI/TUI) is meant to stay small
-enough to read and hack. It is *not* a production framework like vLLM, DeepSpeed, or
-Hugging Face Transformers.
+## What exists
 
-> [!WARNING]
-> Nanoforge is pre-alpha experimental software. Expect incomplete features, unstable APIs,
-> rough edges, and evolving checkpoint formats. Parts of the code and docs were
-> AI-assisted. Use it to learn and tinker, not for anything you depend on.
-
----
-
-## Documentation
-
-| Doc | What's in it |
-| --- | --- |
-| [docs/cli.md](docs/cli.md) | Every CLI command, its flags, and a runnable example. |
-| [docs/configuration.md](docs/configuration.md) | Full YAML config schema — every field and default. |
-| [docs/training.md](docs/training.md) | Training workflows: auto-train, manual pipeline, recipes, health checks. |
-| [docs/architecture.md](docs/architecture.md) | How the model, data pipeline, and training loop work internally. |
-| [docs/nano_chat_quickstart.md](docs/nano_chat_quickstart.md) | End-to-end tutorial: train a tiny byte-level chat model from scratch. |
-| [docs/roadmap.md](docs/roadmap.md) | Planned/future work (not yet implemented). |
-
----
+- Streaming dataset inspection, validation, cleaning, deduplication, tokenizer reporting, and
+  fixed-sequence packing with chat/instruction label masking.
+- A configurable PyTorch transformer with GQA/MQA, RoPE, tied embeddings, SwiGLU/GEGLU, LoRA,
+  optional MoE, gradient checkpointing, checkpoint integrity, and CPU/GPU training.
+- BPE/WordPiece/SentencePiece adapters, a dependency-free byte tokenizer for smoke tests, and an
+  optional Rust tokenizer extension with Python fallbacks.
+- Generation, chat, sampling, KV caching, local FastAPI serving, RAG primitives, DPO/distillation
+  experiments, GGUF/ONNX export, and a React local studio.
 
 ## Install
 
-Requires Python 3.10+.
+Nanoforge supports Python 3.10–3.12; the default is recorded in `.python-version`.
 
 ```bash
 python -m venv .venv
-# Windows:        .venv\Scripts\activate
-# Linux/macOS:    source .venv/bin/activate
-
-pip install -e .            # core (torch, numpy, pyyaml, tqdm)
-pip install -e ".[all]"     # everything (tokenizers, data, serve, logging, export, dev)
+# Windows PowerShell: .venv\Scripts\Activate.ps1
+# Linux/macOS:        source .venv/bin/activate
+python -m pip install -e ".[dev]"
 ```
 
-**CPU-only note (Windows / Git Bash):** install the CPU torch wheel from PyTorch's index
-first, then the rest:
+Optional capabilities:
 
 ```bash
-python -m pip install torch numpy --index-url https://download.pytorch.org/whl/cpu
-python -m pip install pyyaml tqdm tokenizers
-python -m pip install -e . --no-deps
+python -m pip install -e ".[tokenizers,data,serve,tui,logging,export]"
 ```
 
-Optional extras (install what you use):
+For CPU-only PyTorch, install the appropriate CPU wheel from the PyTorch index before installing
+Nanoforge. Do not commit downloaded data, model weights, caches, or private indexes.
 
-| Extra | Enables |
-| --- | --- |
-| `tokenizers` | HuggingFace BPE / WordPiece / SentencePiece tokenizers |
-| `data` | Parquet / Arrow / `datasets` / WebDataset ingestion |
-| `serve` | FastAPI inference server and the web UI |
-| `logging` | TensorBoard and Weights & Biases logging |
-| `export` | ONNX export and ONNX Runtime inference |
-| `native` | `maturin`, to build the optional Rust tokenizer extension |
-| `dev` | `pytest`, `ruff` |
-
----
-
-## 60-second quickstart
-
-The fastest path is `auto-train`, which trains a tokenizer, packs your data, writes a
-CPU-friendly config, and starts training — in one command. Point it at any text/JSONL/chat
-data (a JSONL file with a `messages: [{role, content}]` field is treated as chat):
+## Verify the checkout
 
 ```bash
-# One shot: tokenizer -> pack -> config -> train (chat model, assistant-only masking)
-nanoforge auto-train --input data/raw/chat.jsonl --name mychat \
-    --mode chat --tokenizer bpe --vocab-size 32000 --seq-len 512 \
-    --ram 16GB --max-steps 3000
-
-# Then chat with / generate from the result
-nanoforge chat     --checkpoint runs/mychat/best.pt
-nanoforge generate --checkpoint runs/mychat/best.pt --prompt "Explain RoPE in one line."
+make test
 ```
 
-Prefer the manual pipeline (or the dependency-free **byte tokenizer**, vocab 260, no training)?
+This runs `python -m ruff check .` and `python -m pytest -q`. If the web files changed:
 
 ```bash
-nanoforge prepare --input data/raw --tokenizer byte --out data/packed/demo
-nanoforge train   --config configs/nano-debug.yaml     # or small-base / chat-sft / moe-large
+cd web
+npm ci
+npm run build
+npm run lint
 ```
 
-Running `nanoforge train` in an interactive terminal automatically launches a live
-terminal UI with ~30 training/eval metrics (loss, val, perplexity, grad norm, LR,
-throughput, tokens seen, ETA, health, memory). Training continues headless if you quit
-it or pipe the output; disable it explicitly with `--no-tui` or `NANOFORGE_NO_TUI=1`.
-
-Watch a run live in the browser, or attach the terminal UI to any run directory:
+If Rust files changed:
 
 ```bash
-nanoforge web --run runs/mychat            # browser — the full web UI (React SPA + FastAPI)
-nanoforge tui --run runs/mychat            # terminal (Textual; pip install -e .[tui])
-```
-
-Inspect the framework itself:
-
-```bash
-nanoforge registries                       # list registered components (heads, losses, ...)
-nanoforge validate-config --config configs/nano-debug.yaml
-nanoforge params          --config configs/nano-debug.yaml
-```
-
-For a complete tutorial that trains a tiny chat model which remembers your name and says
-"I don't know" for unknown questions, see
-[docs/nano_chat_quickstart.md](docs/nano_chat_quickstart.md).
-
----
-
-## Features
-
-**Model architecture**
-- Task-agnostic transformer **backbone** + pluggable **task heads** (`task_type` in config):
-  - `causal_lm` / `chat` / `code_generation` / `instruction_following` — autoregressive LM
-  - `masked_lm` — BERT-style bidirectional (attention becomes non-causal automatically)
-  - `sequence_classification`, `token_classification` — pooled / per-token classifiers
-  - `reward_modeling` / `value_estimation` — scalar reward head (pairwise or MSE loss)
-  - (image/audio/seq2seq heads are registered as stubs — see Limitations)
-- GPT-style pre-norm transformer, tied embeddings, residual scaling
-- Grouped-Query / Multi-Query Attention (via `n_kv_heads`)
-- RoPE (with linear / dynamic / YaRN-style scaling) and ALiBi position embeddings
-- Sliding-window attention
-- KV cache for fast incremental decoding
-- Attention via PyTorch SDPA (with a manual fallback path)
-- RMSNorm and LayerNorm
-- SwiGLU / GEGLU feed-forward, plus optional Mixture-of-Experts (with load-balancing loss)
-- LoRA-capable projection layers
-- `transformer` and `parallel_residual` (GPT-NeoX style) blocks
-
-**Training**
-- Mixed precision (bf16/fp16/fp32), gradient accumulation, gradient checkpointing
-- Optimizers: AdamW, Lion, Adafactor, SophiaG
-- Schedulers: cosine, linear, constant — with warmup
-- EMA, early stopping, grad clipping, NaN/Inf skip + rollback, health monitoring
-- Robust checkpointing (atomic writes, integrity hash, config sidecar, async saves)
-- TensorBoard / W&B logging, a live terminal UI on `train`, and a full web UI (`web`)
-
-**Tokenization**
-- Byte tokenizer (vocab 260, deterministic, no training)
-- HuggingFace BPE / WordPiece / SentencePiece / Unigram
-- Pure-Python byte-level BPE fallback + optional native Rust byte/BPE backend
-- Streaming, schema-aware ingestion: text, JSON(L), CSV/TSV, YAML, XML, SQLite, Parquet,
-  Arrow, ZIP/TAR archives, HTTP, and Hugging Face streaming refs
-- Boundary-aware chat/instruct packing with assistant-only / completion-only label masks
-- Dataset inspect / validate / clean / deduplicate / convert CLIs
-
-**Inference**
-- Streaming generation and an interactive chat CLI (applies the chat template)
-- **Real turn-based chat, not raw autocompletion**: a model trained in `chat` mode learns
-  the `<|system|>` / `<|user|>` / `<|assistant|>` format with **assistant-only loss masking**
-  (loss is computed only on the assistant's tokens), and generation **stops at the next role
-  boundary** (`<|user|>` / `<|system|>` / `<|endoftext|>`) — so it answers as an assistant and
-  hands the turn back instead of continuing the whole transcript. (Response *quality* still
-  depends on model size and training budget — a tiny model trained briefly will be coherent in
-  shape but weak in content.)
-- Sampling: temperature, top-k, top-p, min-p, repetition / frequency / presence penalties,
-  no-repeat-ngram, Mirostat (v2-style)
-- Preset modes: `balanced`, `chat`, `creative`, `coding`, `deterministic`, `low_memory`,
-  `high_quality`
-- Beam search, prefix caching, EOS/role-boundary and runaway-repetition stopping
-- Import & run external models: GGUF (`llama-cpp-python`), HuggingFace / SafeTensors
-  (`transformers`), ONNX (`onnxruntime`)
-- FastAPI server with OpenAI-style `/v1/completions` and `/v1/chat/completions`
-
-**Export & evaluation**
-- ONNX export (logits-only graph)
-- GGUF metadata manifest for external converter tooling
-- int8 dynamic CPU quantization; QAT preparation
-- Checkpoint evaluation (loss, perplexity, token accuracy), forward-pass benchmark, and
-  analytical param/FLOP/memory profiling
-
-See [docs/architecture.md](docs/architecture.md) for what each of these does under the hood,
-including honest notes on which pieces are experimental or partial.
-
----
-
-## Performance layer (Rust)
-
-Nanoforge keeps orchestration and modelling in Python (PyTorch) but pushes CPU-bound,
-embarrassingly-parallel hot loops into an optional **Rust** extension
-(`native/nanoforge-tokenizers/`, built with PyO3 + `maturin`, using `rayon` for
-multithreading and `lto = "thin"`). The extension is **optional** — every Rust path has a
-pure-Python fallback, so the framework runs without a Rust toolchain.
-
-```bash
-pip install -e ".[native]"          # installs maturin
 cd native/nanoforge-tokenizers
-maturin develop --release           # builds the extension into your venv
-nanoforge tokenizer-status          # confirms native acceleration is active
+cargo test --locked
 ```
 
-**In Rust today**
-- Byte-level BPE tokenizer *training* (merge-pair heap, parallel word-frequency counting)
-- Parallel batch encoding/decoding
+## First workflow: inspect → prepare → train → evaluate
 
-**Good candidates to move into Rust next** (currently pure Python, and the CPU bottlenecks):
-- **Data packing** (`data/packing.py`) — tokenize + pack into binary shards; the single most
-  expensive preprocessing step and trivially parallel across documents.
-- **Cleaning & dedup** (`data/cleaning.py`) — UTF-8 normalization, hashing-based dedup,
-  language filtering over large corpora.
-- **Memmap dataset iteration / shard sampling** (`data/dataset.py`) — hot path during
-  training; a Rust iterator would cut Python per-batch overhead.
-- **Format streaming** (`data/formats.py`) — JSONL/CSV/Parquet record extraction.
+Put a small, licensed dataset under an ignored runtime directory such as `data/raw/`.
 
-Model math (attention, matmuls) stays in PyTorch — that already dispatches to optimized
-C++/CUDA kernels, so rewriting it in Rust would be slower, not faster. Rust is for the
-data-and-tokenizer path, not the tensor path.
+```bash
+nanoforge inspect-dataset --input data/raw
+nanoforge validate-dataset --input data/raw
+nanoforge profile-dataset --input data/raw --json
 
----
+# Byte tokenizer is for smoke tests. Use native-bpe/BPE for real text when available.
+nanoforge auto-train \
+  --input data/raw \
+  --name local-specialist \
+  --mode auto \
+  --tokenizer native-bpe \
+  --vocab-size 8000 \
+  --seq-len 512 \
+  --ram 8GB \
+  --no-train
 
-## Project layout
-
-```text
-Nanoforge/
-├── configs/               # YAML training configs (nano-debug, small-base, chat-sft, moe-large)
-├── docs/                  # documentation (this set)
-├── scripts/               # helper scripts (data generation, conversion, checks)
-├── tests/                 # pytest suite
-├── native/                # optional Rust tokenizer extension (nanoforge-tokenizers)
-├── src/nanoforge/
-│   ├── cli.py             # command-line interface (entry point: `nanoforge`)
-│   ├── config.py          # dataclass config system + YAML loader
-│   ├── registry.py        # component registries + plugin discovery
-│   ├── model/             # backbone, task heads, attention, rope, norms, moe, lora, ...
-│   ├── data/              # formats, cleaning, tokenizers, packing, dataset, modes
-│   ├── training/          # trainer, optimizers, schedulers, checkpoint, health
-│   ├── generation/        # inference engine + sampling
-│   ├── evaluation/        # checkpoint metrics
-│   ├── export/            # onnx + gguf manifest
-│   ├── server.py          # FastAPI inference server
-│   ├── webapp.py          # web UI backend (FastAPI) serving the React SPA
-│   ├── web_dist/          # built React SPA (the web UI)
-│   └── tui.py             # terminal UI (Textual) — live on `train`, or `tui`/`web`
-└── runs/                  # training outputs (checkpoints, metrics) — gitignored
+nanoforge train --config configs/local-specialist.yaml
+nanoforge evaluate \
+  --checkpoint runs/local-specialist/best.pt \
+  --data data/packed/local-specialist/val.bin \
+  --batches 20
+nanoforge chat --checkpoint runs/local-specialist/best.pt --mode chat
 ```
 
----
+For a dependency-free smoke path:
 
-## Limitations
+```bash
+python scripts/make_chat_data.py --out data/raw/smoke.jsonl
+nanoforge prepare --input data/raw/smoke.jsonl --tokenizer byte --mode chat \
+  --loss-masking assistant_only --seq-len 128 --out data/packed/smoke
+nanoforge train --config configs/nano-debug.yaml --no-tui
+```
 
-- Single-node multi-GPU FSDP / DDP work under `torchrun`; multi-node, DeepSpeed ZeRO-3,
-  tensor parallel and pipeline parallel are roadmap items.
-- FlashAttention uses the real `flash_attn` kernel when installed, else falls back to
-  PyTorch SDPA (with a one-time warning); `chunked`/`sparse`/`paged`/`hybrid_local_global`
-  are honest windowed-SDPA presets, not bespoke kernels.
-- int4 / GPTQ / AWQ quantization raise `NotImplementedError` with guidance (export to
-  GGUF + llama.cpp, or an external GPTQ/AWQ toolchain); int8 dynamic (CPU) is real.
-- Speculative decoding and NTK RoPE scaling are **not** implemented
-  (see [docs/roadmap.md](docs/roadmap.md)).
-- The web UI is a local single-run/experiment viewer, not a multi-user experiment tracker.
+The exact presets and Windows examples are in [`docs/training.md`](docs/training.md). Always
+inspect label-mask balance before trusting a chat run.
 
-## Disclaimer
+## Adaptation is the quality path
 
-Nanoforge is an educational project. Model outputs may be wrong, biased, nonsensical, or
-unpredictable. Do not rely on them for legal, medical, financial, or safety-critical use.
+If the goal is a useful general assistant, do not expect a tiny randomly initialized CPU model to
+learn broad knowledge. Prefer:
+
+1. import a capable compatible base model;
+2. keep changing/private facts in governed RAG or memory;
+3. use carefully curated SFT/LoRA/QLoRA data to teach behavior and domain style;
+4. evaluate tool calls, grounding, refusals, multi-turn behavior, latency, and memory;
+5. export a quantized model to a dedicated CPU runtime when that is faster and smaller.
+
+The audit explains why this is the practical route and which pieces Nanoforge still needs to make
+it first-class.
+
+## Web studio
+
+```bash
+cd web
+npm ci
+npm run dev
+```
+
+Build assets into `src/nanoforge/web_dist/` with `npm run build`, then run the local backend with
+the `nanoforge web` command. The default should remain localhost. Do not expose the current web
+studio to a network: it can inspect data, write configs, load models, and start jobs without a
+complete authentication/authorization layer.
+
+## Native tokenizer extension
+
+Python fallbacks are mandatory, but the optional Rust path accelerates tokenizer work:
+
+```bash
+python -m pip install -e ".[native]"
+cd native/nanoforge-tokenizers
+maturin develop --release
+nanoforge tokenizer-status
+```
+
+## Project map
+
+| Area | Location |
+| --- | --- |
+| Python runtime | `src/nanoforge/` |
+| Model | `src/nanoforge/model/` |
+| Data/tokenizers | `src/nanoforge/data/` |
+| Training | `src/nanoforge/training/` |
+| Generation/server | `src/nanoforge/generation/`, `server.py` |
+| RAG | `src/nanoforge/rag/` |
+| Web studio | `web/`, `src/nanoforge/webapp.py` |
+| Configs/docs/tests | `configs/`, `docs/`, `tests/` |
+| Agent instructions | `AGENTS.md` |
+
+## Safety and privacy
+
+Nanoforge is experimental. Model outputs may be wrong or unsafe. Keep servers localhost-only,
+never execute arbitrary model-generated shell code, keep personal data outside source control,
+and treat memory/tool access as explicit capabilities. See `AGENTS.md` for the full engineering
+and self-improvement contract.
 
 ## License
 
-MIT — see [LICENSE.md](LICENSE.md).
+MIT — see [`LICENSE.md`](LICENSE.md).

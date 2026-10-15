@@ -6,7 +6,6 @@ top-k ordering, and the no-index chat-stream regression.
 
 from __future__ import annotations
 
-import json
 import tempfile
 from pathlib import Path
 
@@ -17,7 +16,6 @@ from nanoforge.rag.chunker import chunk_text
 from nanoforge.rag.embeddings import TfIdfEmbedder, get_embedder
 from nanoforge.rag.retriever import Retriever
 from nanoforge.rag.store import NumpyVectorStore
-
 
 # ── Chunker ───────────────────────────────────────────────────────────────────
 
@@ -158,7 +156,7 @@ def test_store_roundtrip():
 
 def test_store_meta_has_embedder_state():
     with tempfile.TemporaryDirectory() as d:
-        store = _build_store(d)
+        _build_store(d)
         store2 = NumpyVectorStore.load(d)
         assert "idf" in store2.meta.embedder_state
 

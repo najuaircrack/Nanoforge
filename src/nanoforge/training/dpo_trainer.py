@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import copy
 import json
-import math
 import time
 from pathlib import Path
 from typing import Iterator
@@ -23,7 +22,6 @@ from nanoforge.training.utils import (
     autocast_dtype,
     configure_named_optimizer,
     ensure_dir,
-    grad_global_norm,
     grads_are_finite,
     resolve_device,
     seed_everything,

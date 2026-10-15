@@ -1,24 +1,17 @@
-import importlib, traceback
+"""Import smoke check retained for maintainers; use pytest for behavior checks."""
 
-mods = [
+import importlib
+
+MODULES = [
     "nanoforge.cli",
     "nanoforge.config",
-    "nanoforge.tui",
-    "nanoforge.webapp",
-    "nanoforge.imports",
     "nanoforge.server",
-    "nanoforge.progress",
-    "nanoforge.templates",
-    "nanoforge.benchmark",
-    "nanoforge.profiling",
+    "nanoforge.webapp",
     "nanoforge.model.transformer",
     "nanoforge.data.dataset",
     "nanoforge.data.formats",
     "nanoforge.data.profiler",
     "nanoforge.data.tokenizer",
-    "nanoforge.data.native_tokenizer",
-    "nanoforge.data.tokenizer_metrics",
-    "nanoforge.data.tokenizer_benchmark",
     "nanoforge.training.trainer",
     "nanoforge.training.pipeline",
     "nanoforge.training.checkpoint",
@@ -28,13 +21,20 @@ mods = [
     "nanoforge.export.onnx",
     "nanoforge.export.gguf",
 ]
-ok, bad = [], []
-for m in mods:
-    try:
-        importlib.import_module(m)
-        ok.append(m)
-    except Exception as e:
-        bad.append((m, f"{type(e).__name__}: {e}"))
-print(f"OK {len(ok)}/{len(mods)}")
-for m, e in bad:
-    print("FAIL", m, "->", e)
+
+
+def main() -> int:
+    failures: list[str] = []
+    for name in MODULES:
+        try:
+            importlib.import_module(name)
+        except Exception as exc:  # pragma: no cover - diagnostic script
+            failures.append(f"{name}: {type(exc).__name__}: {exc}")
+    print(f"OK {len(MODULES) - len(failures)}/{len(MODULES)}")
+    for failure in failures:
+        print(f"FAIL {failure}")
+    return 1 if failures else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

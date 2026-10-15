@@ -5,9 +5,12 @@ import struct
 from dataclasses import asdict
 from enum import IntEnum
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from nanoforge.config import NanoforgeConfig
+
+if TYPE_CHECKING:
+    import torch
 
 GGUF_MAGIC = 0x46554747  # "GGUF" little-endian
 GGUF_VERSION = 3

@@ -4,7 +4,6 @@ import copy
 from pathlib import Path
 
 import torch
-from torch import nn
 
 from nanoforge.config import NanoforgeConfig, load_config
 from nanoforge.logging_utils import get_logger

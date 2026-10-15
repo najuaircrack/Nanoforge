@@ -13,7 +13,7 @@ Other backends are single-pass (embed on the fly).
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Iterable, Iterator
+from typing import Iterator
 
 from nanoforge.rag.chunker import chunk_text
 from nanoforge.rag.embeddings import TfIdfEmbedder, get_embedder

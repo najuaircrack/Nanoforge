@@ -4,7 +4,7 @@ import asyncio
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import AsyncIterator, Iterator
+from typing import TYPE_CHECKING, AsyncIterator, Iterator
 
 import torch
 
@@ -15,6 +15,9 @@ from nanoforge.model.attention import KVCache
 from nanoforge.model.transformer import build_model
 from nanoforge.training.checkpoint import load_checkpoint
 from nanoforge.training.utils import resolve_device
+
+if TYPE_CHECKING:
+    from nanoforge.model.transformer import NanoforgeForCausalLM
 
 
 @dataclass

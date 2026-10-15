@@ -717,7 +717,6 @@ def cmd_serve(args: argparse.Namespace) -> None:
 def cmd_export(args: argparse.Namespace) -> None:
     from nanoforge.export.onnx import export_onnx
     from nanoforge.generation.engine import GenerationEngine
-    from nanoforge.training.checkpoint import load_checkpoint
 
     if args.format == "onnx":
         engine = GenerationEngine.from_checkpoint(args.checkpoint, device=args.device)

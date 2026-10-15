@@ -1,10 +1,7 @@
 from __future__ import annotations
 
 import struct
-import tempfile
 from pathlib import Path
-
-import pytest
 
 
 def _write_bin(path: Path, n: int = 4096) -> None:
@@ -14,6 +11,7 @@ def _write_bin(path: Path, n: int = 4096) -> None:
 class TestDataMixture:
     def test_sample_shape(self, tmp_path):
         import torch
+
         from nanoforge.data.mixture import DataMixture, MixtureSource
 
         for name in ("a.bin", "b.bin"):
@@ -164,6 +162,7 @@ stages:
     def test_weight_handoff_path(self, tmp_path):
         """_apply_overrides correctly sets resume_from_checkpoint."""
         import torch
+
         from nanoforge.config import load_config
         from nanoforge.training.pipeline import _apply_overrides
 

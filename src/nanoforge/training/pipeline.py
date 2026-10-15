@@ -25,7 +25,8 @@ class PipelineRecipe:
 
 def _apply_overrides(cfg: NanoforgeConfig, overrides: dict[str, Any]) -> NanoforgeConfig:
     """Shallow-merge a nested overrides dict onto a NanoforgeConfig."""
-    import copy, dataclasses
+    import copy
+    import dataclasses
     cfg = copy.deepcopy(cfg)
     section_map = {"model": cfg.model, "training": cfg.training, "data": cfg.data, "inference": cfg.inference}
     for section, values in overrides.items():

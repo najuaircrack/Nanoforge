@@ -6,15 +6,21 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from nanoforge.config import DataConfig, InferenceConfig, ModelConfig, NanoforgeConfig, TrainConfig
-from nanoforge.export.gguf import (
+from nanoforge.config import (  # noqa: E402
+    DataConfig,
+    InferenceConfig,
+    ModelConfig,
+    NanoforgeConfig,
+    TrainConfig,
+)
+from nanoforge.export.gguf import (  # noqa: E402
     GGUF_DEFAULT_ALIGNMENT,
     GGUF_MAGIC,
     GGUF_VERSION,
     GGUFValueType,
     export_gguf,
 )
-from nanoforge.model.transformer import build_model
+from nanoforge.model.transformer import build_model  # noqa: E402
 
 
 def _tiny_config() -> NanoforgeConfig:

@@ -5,9 +5,9 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "nanoforge"
 version = "0.1.0"
-description = "A compact, production-structured transformer training and inference framework for local hardware."
+description = "A local-first transformer and agent training platform for CPU and single-device workflows."
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.10,<3.13"
 license = { text = "MIT" }
 authors = [{ name = "Nanoforge" }]
 dependencies = [
@@ -27,39 +27,31 @@ logging = ["tensorboard>=2.14", "wandb>=0.16"]
 export = ["onnx>=1.15", "onnxruntime>=1.16"]
 dev = ["pytest>=7.4", "ruff>=0.3"]
 all = [
-  "tokenizers>=0.15",
-  "sentencepiece>=0.1.99",
-  "pyarrow>=15.0",
-  "datasets>=2.18",
-  "webdataset>=0.2.86",
-  "maturin>=1.5",
-  "fastapi>=0.110",
-  "uvicorn>=0.27",
-  "tensorboard>=2.14",
-  "wandb>=0.16",
-  "onnx>=1.15",
-  "onnxruntime>=1.16",
-  "textual>=0.50",
-  "pytest>=7.4",
-  "ruff>=0.3",
+  "tokenizers>=0.15", "sentencepiece>=0.1.99",
+  "pyarrow>=15.0", "datasets>=2.18", "webdataset>=0.2.86",
+  "maturin>=1.5", "fastapi>=0.110", "uvicorn>=0.27",
+  "tensorboard>=2.14", "wandb>=0.16",
+  "onnx>=1.15", "onnxruntime>=1.16", "textual>=0.50",
+  "pytest>=7.4", "ruff>=0.3",
 ]
 
 [project.scripts]
 nanoforge = "nanoforge.cli:main"
 
+[project.entry-points."nanoforge.plugins"]
+# Third-party packages may add a plugin entry point without editing Nanoforge.
+
 [tool.setuptools.packages.find]
 where = ["src"]
 
 [tool.setuptools.package-data]
-nanoforge = ["py.typed"]
+nanoforge = ["py.typed", "web_dist/**/*"]
 
 [tool.ruff]
 line-length = 100
 target-version = "py310"
 
 [tool.ruff.lint]
-# E/W: pycodestyle, F: pyflakes, I: isort. Line length (E501) is advisory here
-# since many config/table lines are intentionally long.
 select = ["E", "W", "F", "I"]
 ignore = ["E501"]
 

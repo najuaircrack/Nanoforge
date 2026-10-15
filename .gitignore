@@ -5,7 +5,13 @@ __pycache__/
 *.pyd
 *.so
 
+# Agent/tool local state
 .agents/
+.claude/
+.opencode/
+.unlazy/
+.unlazy-hook-state.json
+
 # Virtual environments
 .venv/
 venv/
@@ -18,23 +24,23 @@ dist/
 .eggs/
 native/**/target/
 
-# IDEs
+# IDEs and OS files
 .vscode/
 .idea/
-
-# OS files
 .DS_Store
 Thumbs.db
 
-# Logs
+# Logs and local runtime state
 *.log
-
-# Training outputs
 runs/
 checkpoints/
 outputs/
+models/
+backup/
+metrics.jsonl
+wandb/
 
-# Model weights
+# Model weights and exports
 *.pt
 *.pth
 *.ckpt
@@ -42,57 +48,35 @@ outputs/
 *.safetensors
 *.onnx
 *.gguf
+exports/
 
-# Datasets and tokenizers
+# Datasets and generated tokenizers
 data/raw/
 data/packed/
 data/chat/
 data/tokenizers/
-
-# ...but keep the small committed demo sample
+data/facts/
+data/rag/
+data/persona*
 !data/demo/
 !data/demo/*.jsonl
 !data/demo/*.md
 
-# Imported model registry / scratch
-models/
-backup/
-
-# Reports
+# Reports and caches
 reports/
-
-# Caches
 .cache/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
-
-# Jupyter
 .ipynb_checkpoints/
-
-# HuggingFace
 hf_cache/
 huggingface/
 
-# Temporary / scratch files
+# Temporary and generated text
 tmp/
 temp/
 *.tmp
 nextupdate.txt
-
-# Metrics / dashboards
-metrics.jsonl
-
-# WandB
-wandb/
-
-# CUDA
-*.cu.o
-
-# Export artifacts
-exports/
-
-# Generated text
 samples/
 generated/
 
@@ -100,21 +84,13 @@ generated/
 .env
 .env.local
 
-# Claude / AI tooling — not for distribution
-CLAUDE.md
-.claude/
-opencode.json
-package.json
-package-lock.json
-skills-lock.json
+# Frontend dependencies and build output
+web/node_modules/
+web/dist/
 
-# ── Personal / private "nashwa" artifacts — NOT for the open-source repo ──
-# The nashwa* work is a private style-clone + personal facts KB. Keep the
-# reusable framework (rag/, personal.py, generic scripts) public, but never
-# publish the personal configs, data, indexes, or throwaway probe scripts.
+# Keep the frontend manifests: they are required to rebuild the web UI.
+# Do not use broad package.json/package-lock.json ignore rules here.
+
+# Private personal tooling
 configs/nashwa-*.yaml
 scripts/*nashwa*.py
-data/facts/
-data/rag/
-data/persona*
-data/chat/
