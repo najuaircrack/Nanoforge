@@ -1,31 +1,13 @@
-"""Persisted numpy vector store for RAG.
-
-An index directory holds three files, written atomically (temp + rename):
-
-    vectors.npy      float32 [N, dim]        — L2-normalised document vectors
-    metadata.json    [{text_chunk, source, metadata}]  — one entry per vector
-    index_meta.json  IndexMeta               — self-describing backend descriptor
-
-The index is self-describing: ``index_meta.json`` records which embedding backend
-built it plus the embedder state (e.g. the TF-IDF IDF table), so a query-time
-embedder can be reconstructed without any external config.
-"""
-
+"""Immutable-generation, bounded-memory vector index with legacy readers."""
 from __future__ import annotations
-
-import datetime as _dt
+import datetime
 import json
 import os
+import uuid
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Iterable
-
 import numpy as np
-
-_VECTORS_FILE = "vectors.npy"
-_METADATA_FILE = "metadata.json"
-_META_FILE = "index_meta.json"
-
+from nanoforge.artifacts import atomic_write_json, fingerprint_file
 
 @dataclass
 class IndexMeta:
@@ -34,129 +16,154 @@ class IndexMeta:
     num_docs: int
     embedder_state: dict = field(default_factory=dict)
     created_at: str = ""
-
-    def to_dict(self) -> dict:
+    schema_version: int = 2
+    files: dict = field(default_factory=dict)
+    fingerprints: dict = field(default_factory=dict)
+    encoder_identity: dict = field(default_factory=dict)
+    provenance: dict = field(default_factory=dict)
+    def to_dict(self):
         return asdict(self)
-
     @classmethod
-    def from_dict(cls, d: dict) -> "IndexMeta":
-        return cls(
-            backend=d["backend"],
-            dim=int(d["dim"]),
-            num_docs=int(d["num_docs"]),
-            embedder_state=d.get("embedder_state", {}),
-            created_at=d.get("created_at", ""),
-        )
+    def from_dict(cls, raw):
+        version = raw.get("schema_version",1)
+        if isinstance(version,bool) or not isinstance(version,int) or version not in {1,2}:
+            raise ValueError("unsupported index schema")
+        for key in ("dim","num_docs"):
+            value = raw.get(key)
+            if isinstance(value,bool) or not isinstance(value,int) or value < (1 if key == "dim" else 0):
+                raise ValueError("invalid index dimensions")
+        values = {key:raw[key] for key in cls.__dataclass_fields__ if key in raw}
+        values["schema_version"] = version
+        return cls(**values)
 
-
-def _atomic_write_bytes(path: Path, write_fn) -> None:
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    with tmp.open("wb") as fh:
-        write_fn(fh)
-    os.replace(tmp, path)
-
-
-def _atomic_write_text(path: Path, text: str) -> None:
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(text, encoding="utf-8")
-    os.replace(tmp, path)
-
+class JsonlDocuments:
+    """Indexed lazy JSONL metadata; text is read only for selected hits."""
+    def __init__(self,path,offsets,max_doc_bytes=1048576):
+        self.path,self.offsets,self.max_doc_bytes = Path(path),offsets,max_doc_bytes
+    def __len__(self):
+        return len(self.offsets)
+    def __getitem__(self,index):
+        if isinstance(index,slice):
+            return [self[i] for i in range(*index.indices(len(self)))]
+        if not 0 <= index < len(self):
+            raise IndexError(index)
+        with self.path.open("rb") as handle:
+            handle.seek(int(self.offsets[index]))
+            line = handle.readline(self.max_doc_bytes+1)
+        if len(line)>self.max_doc_bytes:
+            raise ValueError("index document byte limit exceeded")
+        return json.loads(line)
 
 class NumpyVectorStore:
-    """In-memory view over a persisted numpy index."""
-
-    def __init__(self, vectors: np.ndarray, docs: list[dict], meta: IndexMeta) -> None:
-        self.vectors = vectors
-        self.docs = docs
-        self.meta = meta
-
-    # ── Load ──────────────────────────────────────────────────────────────────
-
+    def __init__(self,vectors,docs,meta):
+        if vectors.ndim != 2 or vectors.shape != (meta.num_docs,meta.dim) or len(docs) != meta.num_docs:
+            raise ValueError("index integrity failure: dimensions/counts")
+        self.vectors,self.docs,self.meta = vectors,docs,meta
+        self._closed = False
+    def close(self):
+        if getattr(self, "_closed", True):
+            return
+        for array in (self.vectors, getattr(self.docs, "offsets", None)):
+            mapping = getattr(array, "_mmap", None)
+            if mapping is not None:
+                mapping.close()
+        self._closed = True
+    def __enter__(self):
+        return self
+    def __exit__(self, *_args):
+        self.close()
+    def __del__(self):
+        self.close()
     @classmethod
-    def load(cls, index_dir: str | Path) -> "NumpyVectorStore":
-        base = Path(index_dir)
-        if not base.exists():
-            raise FileNotFoundError(f"Index directory not found: {base}")
-        vec_path = base / _VECTORS_FILE
-        meta_path = base / _META_FILE
-        docs_path = base / _METADATA_FILE
-        for p in (vec_path, meta_path, docs_path):
-            if not p.exists():
-                raise FileNotFoundError(f"Missing index file: {p}")
-        vectors = np.load(vec_path).astype(np.float32)
+    def load(cls,index_dir,*,verify=True):
+        base = Path(index_dir).resolve()
+        meta_path = base/"index_meta.json"
+        if not meta_path.exists():
+            raise FileNotFoundError(f"Missing index file: {meta_path}")
         meta = IndexMeta.from_dict(json.loads(meta_path.read_text(encoding="utf-8")))
-        docs = json.loads(docs_path.read_text(encoding="utf-8"))
-        return cls(vectors, docs, meta)
-
-    # ── Build + save (streaming) ────────────────────────────────────────────────
-
-    @classmethod
-    def build_and_save(
-        cls,
-        index_dir: str | Path,
-        embedder,
-        chunks: Iterable[tuple[str, str, dict]],
-        backend: str,
-        embedder_state: dict | None = None,
-        batch_size: int = 64,
-        max_docs: int | None = None,
-        progress_callback=None,
-    ) -> "NumpyVectorStore":
-        """Embed ``chunks`` (text, source, metadata) in batches and persist.
-
-        Vectors are accumulated per batch and stacked once at the end. Nothing
-        beyond one batch of raw text is held before embedding.
-        """
-        base = Path(index_dir)
-        base.mkdir(parents=True, exist_ok=True)
-
-        vec_batches: list[np.ndarray] = []
-        docs: list[dict] = []
-        buf_text: list[str] = []
-        buf_meta: list[tuple[str, dict]] = []
-        n_total = 0
-
-        def _flush() -> None:
-            nonlocal buf_text, buf_meta
-            if not buf_text:
-                return
-            vecs = embedder.embed_batch(buf_text)
-            vec_batches.append(vecs.astype(np.float32))
-            for text, (source, md) in zip(buf_text, buf_meta):
-                docs.append({"text_chunk": text, "source": source, "metadata": md})
-            buf_text = []
-            buf_meta = []
-
-        for text, source, md in chunks:
-            if max_docs is not None and n_total >= max_docs:
-                break
-            buf_text.append(text)
-            buf_meta.append((source, md))
-            n_total += 1
-            if len(buf_text) >= batch_size:
-                _flush()
-                if progress_callback:
-                    progress_callback(n_total)
-        _flush()
-        if progress_callback:
-            progress_callback(n_total)
-
-        if vec_batches:
-            vectors = np.vstack(vec_batches).astype(np.float32)
+        if meta.schema_version == 1:
+            vectors = np.load(base/"vectors.npy",mmap_mode="r",allow_pickle=False)
+            docs = json.loads((base/"metadata.json").read_text(encoding="utf-8"))
+            if vectors.dtype != np.float32:
+                raise ValueError("index dtype must be float32")
+            return cls(vectors,docs,meta)
+        expected = {"vectors","docs","offsets"}
+        if set(meta.files) != expected or set(meta.fingerprints) != expected:
+            raise ValueError("index integrity failure: generation files")
+        paths = {}
+        for name,relative in meta.files.items():
+            relative = Path(relative)
+            path = (base/relative).resolve()
+            if relative.is_absolute() or ".." in relative.parts or not path.is_relative_to(base) or not path.is_file():
+                raise ValueError("index integrity failure: invalid generation path")
+            if verify and fingerprint_file(path) != meta.fingerprints[name]:
+                raise ValueError("index integrity failure: fingerprint")
+            paths[name] = path
+        if paths["vectors"].stat().st_size != meta.num_docs*meta.dim*4 or paths["offsets"].stat().st_size != meta.num_docs*8:
+            raise ValueError("index integrity failure: size")
+        if meta.num_docs:
+            vectors = np.memmap(paths["vectors"],mode="r",dtype=np.float32,shape=(meta.num_docs,meta.dim))
+            offsets = np.memmap(paths["offsets"],mode="r",dtype=np.int64,shape=(meta.num_docs,))
+            if int(offsets[0]) != 0 or np.any(offsets[1:] <= offsets[:-1]) or int(offsets[-1]) >= paths["docs"].stat().st_size:
+                raise ValueError("index integrity failure: offsets")
         else:
-            dim = int(getattr(embedder, "dim", 1))
-            vectors = np.zeros((0, dim), dtype=np.float32)
-
-        meta = IndexMeta(
-            backend=backend,
-            dim=int(vectors.shape[1]) if vectors.size else int(getattr(embedder, "dim", 1)),
-            num_docs=len(docs),
-            embedder_state=embedder_state or {},
-            created_at=_dt.datetime.now(_dt.timezone.utc).isoformat(),
-        )
-
-        _atomic_write_bytes(base / _VECTORS_FILE, lambda fh: np.save(fh, vectors))
-        _atomic_write_text(base / _METADATA_FILE, json.dumps(docs, ensure_ascii=False))
-        _atomic_write_text(base / _META_FILE, json.dumps(meta.to_dict(), ensure_ascii=False))
-
-        return cls(vectors, docs, meta)
+            vectors,offsets = np.empty((0,meta.dim),dtype=np.float32),np.empty((0,),dtype=np.int64)
+        docs = JsonlDocuments(paths["docs"],offsets)
+        return cls(vectors,docs,meta)
+    @classmethod
+    def build_and_save(cls,index_dir,embedder,chunks,backend,embedder_state=None,
+                       batch_size=64,max_docs=None,progress_callback=None,encoder_identity=None,provenance=None):
+        if isinstance(batch_size,bool) or not isinstance(batch_size,int) or not 1 <= batch_size <= 65536:
+            raise ValueError("batch_size must be in [1,65536]")
+        if max_docs is not None and (isinstance(max_docs,bool) or not isinstance(max_docs,int) or max_docs < 0):
+            raise ValueError("max_docs must be nonnegative")
+        dim = int(embedder.dim)
+        if not 1 <= dim <= 65536:
+            raise ValueError("embedding dimension limit exceeded")
+        base = Path(index_dir).resolve()
+        generation = base/".generations"/uuid.uuid4().hex
+        generation.mkdir(parents=True)
+        paths = {"vectors":generation/"vectors.f32","docs":generation/"docs.jsonl","offsets":generation/"offsets.i64"}
+        count = 0
+        buffer = []
+        with paths["vectors"].open("wb") as vecfile, paths["docs"].open("wb") as docfile, paths["offsets"].open("wb") as offsetfile:
+            def flush():
+                nonlocal count
+                if not buffer:
+                    return
+                array = np.asarray(embedder.embed_batch([item[0] for item in buffer]),dtype=np.float32)
+                if array.shape != (len(buffer),dim) or not np.isfinite(array).all():
+                    raise ValueError("invalid embedding batch shape/values")
+                norms = np.linalg.norm(array,axis=1,keepdims=True)
+                array = array/np.maximum(norms,1e-9)
+                vecfile.write(array.tobytes())
+                for text,source,metadata in buffer:
+                    raw = (json.dumps({"text_chunk":text,"source":source,"metadata":metadata},ensure_ascii=False,allow_nan=False)+"\n").encode("utf-8")
+                    if len(raw)>1048576:
+                        raise ValueError("index document byte limit exceeded")
+                    offsetfile.write(np.asarray([docfile.tell()],dtype=np.int64).tobytes())
+                    docfile.write(raw)
+                    count += 1
+                buffer.clear()
+                if progress_callback:
+                    progress_callback(count)
+            for text,source,metadata in chunks:
+                if max_docs is not None and count+len(buffer) >= max_docs:
+                    break
+                if not isinstance(text,str) or not isinstance(source,str) or not isinstance(metadata,dict):
+                    raise ValueError("invalid index document")
+                buffer.append((text,source,metadata))
+                if len(buffer)>=batch_size:
+                    flush()
+            flush()
+            for handle in (vecfile,docfile,offsetfile):
+                handle.flush()
+                os.fsync(handle.fileno())
+        state = embedder_state or (embedder.to_dict() if hasattr(embedder,"to_dict") else {})
+        meta = IndexMeta(backend,dim,count,state,datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                         files={name:path.relative_to(base).as_posix() for name,path in paths.items()},
+                         fingerprints={name:fingerprint_file(path) for name,path in paths.items()},
+                         encoder_identity=encoder_identity or {},provenance=provenance or {})
+        # This is the only mutable pointer; readers see a whole old/new generation.
+        atomic_write_json(base/"index_meta.json",meta.to_dict())
+        return cls.load(base)

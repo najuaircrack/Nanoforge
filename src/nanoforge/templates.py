@@ -80,7 +80,7 @@ def build_cpu_config(
   d_model: {d_model}
   n_layers: {layers}
   n_heads: {heads}
-  n_kv_heads: 2
+  n_kv_heads: {2 if heads % 2 == 0 else 1}
   ffn_hidden_mult: 2.67
   dropout: 0.0
   rope_theta: 500000.0

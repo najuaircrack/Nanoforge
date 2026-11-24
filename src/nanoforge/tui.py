@@ -21,7 +21,7 @@ try:
     from textual.app import App, ComposeResult
     from textual.binding import Binding
     from textual.containers import Container, Grid, Horizontal, Vertical
-    from textual.screen import Screen
+    from textual.screen import ModalScreen, Screen
     from textual.widgets import (
         Button,
         DataTable,
@@ -34,13 +34,15 @@ try:
         Sparkline,
         Static,
         TextArea,
+        TabbedContent,
+        TabPane,
     )
     _TEXTUAL_OK = True
 except ImportError:
     _TEXTUAL_OK = False
     # Fallbacks so the module imports without the optional [tui] extra.
     # The launch functions raise a helpful error via _require_textual() before use.
-    App = Screen = object  # type: ignore
+    App = Screen = ModalScreen = object  # type: ignore
     ComposeResult = object  # type: ignore
 
     class Binding:  # type: ignore
@@ -517,6 +519,264 @@ class InferenceScreen(Screen):
         threading.Thread(target=_do, daemon=True).start()
 
 
+class ToolApprovalModal(ModalScreen):
+    """Review one concrete schema-validated side effect."""
+    def __init__(self, call, spec, cancellation=None):
+        super().__init__()
+        self.call = call
+        self.spec = spec
+        self.cancellation = cancellation
+
+    def compose(self):
+        with Vertical(id="approval-dialog"):
+            yield Label(f"Approve {self.spec.side_effect}: {self.call.name}?")
+            yield TextArea(json.dumps(self.call.arguments, ensure_ascii=False, indent=2), read_only=True, id="approval-details")
+            with Horizontal():
+                yield Button("Approve this action", id="harness-approve", variant="warning")
+                yield Button("Deny", id="harness-deny", variant="primary")
+                yield Button("Cancel run", id="harness-cancel-approval", variant="error")
+
+    def on_button_pressed(self, event):
+        if event.button.id in {"harness-approve", "harness-deny"}:
+            self.dismiss(event.button.id == "harness-approve")
+        elif event.button.id == "harness-cancel-approval":
+            if self.cancellation is not None:
+                self.cancellation.cancel("cancelled during operator approval")
+            self.dismiss(False)
+
+
+class TuiApprovalProvider:
+    def __init__(self, screen, cancellation, budget):
+        self.screen, self.cancellation, self.budget = screen, cancellation, budget
+
+    def approve(self, call, spec):
+        finished = threading.Event()
+        decision = [False]
+
+        def respond(value):
+            decision[0] = value is True
+            finished.set()
+
+        try:
+            self.screen.app.call_from_thread(self.screen.app.push_screen, ToolApprovalModal(call, spec, self.cancellation), respond)
+        except RuntimeError:
+            return False
+        while not finished.wait(0.05):
+            if self.cancellation.cancelled or time.monotonic() >= self.budget.started_at + self.budget.max_wall_seconds:
+                self.screen._post(self.screen._close_approval)
+                return False
+        return decision[0]
+
+
+class HarnessScreen(Screen):
+    """Local model/manual console with visible context, approvals and replay."""
+    def __init__(self, project_path: str | None = None):
+        super().__init__()
+        self._project_path = project_path or "configs/project-example.yaml"
+        self._trace = None
+        self._harness_job_running = False
+        self._last_result = None
+        self._cancellation = None
+        self._budget = None
+        self._manifest = None
+        self._workspace = None
+        self._provider = None
+
+    def compose(self) -> ComposeResult:
+        yield Header(show_clock=True)
+        with Vertical(id="harness-wrap"):
+            with Horizontal(id="harness-project-row"):
+                yield Input(self._project_path, id="harness-project", placeholder="Project manifest")
+                yield Button("Load / Run", id="harness-run-btn", variant="primary")
+                yield Button("Cancel", id="harness-cancel-btn", variant="error")
+            yield Label("Request", classes="stat-label")
+            yield TextArea("Inspect the workspace and report what you find.", id="harness-request")
+            yield Label("Manual actions (used only when provider_kind is manual)", classes="stat-label")
+            yield TextArea(
+                '[{"schema_version":1,"type":"tool_call","name":"repo.list_files","arguments":{"pattern":"**/*","max_entries":50}},'
+                '{"schema_version":1,"type":"final","content":"Manual inspection complete."}]',
+                id="harness-actions", language="json",
+            )
+            yield Label("No run yet. Project controls model, context, tools and approval policy.", id="harness-status")
+            yield Label("Budgets: no active run", id="harness-budgets")
+            with Horizontal(id="harness-replay-row"):
+                yield Input("", id="harness-trace-path", placeholder="Repository-relative saved trace")
+                yield Button("Replay", id="harness-replay-btn")
+                yield Button("Evaluate model", id="harness-eval-btn")
+            with TabbedContent():
+                with TabPane("Observations", id="harness-observations-tab"):
+                    yield TextArea("", read_only=True, id="harness-observations")
+                with TabPane("Context", id="harness-context-tab"):
+                    yield TextArea("", read_only=True, id="harness-context")
+                with TabPane("Trace", id="harness-trace-tab"):
+                    yield Log(id="harness-log", highlight=True)
+                with TabPane("Result / replay", id="harness-result-tab"):
+                    yield TextArea("", read_only=True, id="harness-result")
+                with TabPane("Evaluation", id="harness-eval-tab"):
+                    yield TextArea("", read_only=True, id="harness-evaluation")
+        yield Footer()
+
+    def on_mount(self):
+        self.set_interval(0.25, self._refresh_trace)
+
+    def on_unmount(self):
+        self._cancel()
+
+    def _post(self, callback, *args):
+        try:
+            self.app.call_from_thread(callback, *args)
+        except RuntimeError:
+            pass
+
+    def _close_approval(self):
+        if isinstance(self.app.screen, ToolApprovalModal):
+            self.app.pop_screen()
+
+    def on_button_pressed(self, event):
+        actions = {"harness-run-btn": self._run, "harness-cancel-btn": self._cancel,
+                   "harness-replay-btn": self._replay, "harness-eval-btn": self._evaluate}
+        callback = actions.get(event.button.id)
+        if callback:
+            callback()
+
+    def _cancel(self):
+        if self._cancellation is not None:
+            self._cancellation.cancel("cancelled by operator")
+
+    def _run(self):
+        if self._harness_job_running:
+            return
+        project_path = self.query_one("#harness-project", Input).value.strip()
+        request = self.query_one("#harness-request", TextArea).text.strip()
+        raw_actions = self.query_one("#harness-actions", TextArea).text
+        status = self.query_one("#harness-status", Label)
+        if not project_path or not request:
+            status.update("Project and request are required.")
+            return
+        from nanoforge.agent.protocol import CancellationToken
+        self._cancellation = CancellationToken()
+        self._harness_job_running = True
+        self._trace = None
+        self._last_result = None
+        self.query_one("#harness-observations", TextArea).text = ""
+        status.update("Loading explicitly selected local project…")
+
+        def work():
+            try:
+                from nanoforge.agent.harness import AgentHarness
+                from nanoforge.agent.project import build_project_provider, build_project_runtime, load_project_manifest, project_context_items, project_policy
+                from nanoforge.agent.protocol import InMemoryTrace
+                manifest = load_project_manifest(project_path)
+                workspace, registry, budget = build_project_runtime(manifest, project_path)
+                manual_actions = None
+                if manifest.provider_kind == "manual":
+                    manual_actions = json.loads(raw_actions)
+                    if not isinstance(manual_actions, list) or not manual_actions:
+                        raise ValueError("manual actions must be a non-empty JSON array")
+                context = project_context_items(manifest, workspace)
+                context_text = json.dumps(context, ensure_ascii=False)
+                if len(context_text.encode("utf-8")) > manifest.budgets.get("max_context_bytes", 262144):
+                    raise ValueError("selected context exceeds project context budget")
+                self._manifest, self._workspace, self._budget = manifest, workspace, budget
+                self._provider = build_project_provider(manifest, project_path, manual_actions)
+                trace = InMemoryTrace()
+                trace_relative = f"{manifest.trace_dir}/{trace.run_id}.json"
+                trace_path = workspace.resolve(trace_relative)
+                trace.path = trace_path
+                trace.emit("project", "loaded", "manifest", {"project_fingerprint": manifest.fingerprint, "provider_kind": manifest.provider_kind})
+                self._trace = trace
+                self._post(self.query_one("#harness-trace-path", Input).__setattr__, "value", trace_relative)
+                self._post(self.query_one("#harness-context", TextArea).__setattr__, "text", context_text)
+                approval = TuiApprovalProvider(self, self._cancellation, budget)
+                policy, approver = project_policy(manifest, approval)
+                result = AgentHarness(registry).run(request, self._provider, budget=budget, context_items=context,
+                    cancellation=self._cancellation, trace=trace,
+                    executor_kwargs={"policy": policy, "approval": approver, "capabilities": set(manifest.capabilities)})
+                self._last_result = result
+                self._post(self._show_result, result)
+            except Exception as exc:
+                self._post(status.update, f"Harness error: {type(exc).__name__}: {exc}")
+            finally:
+                self._harness_job_running = False
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _show_result(self, result):
+        self.query_one("#harness-status", Label).update(
+            f"{result.status}: {self._manifest.name} · {self._manifest.provider_kind} · {len(result.trace)} trace events")
+        self.query_one("#harness-observations", TextArea).text = json.dumps(result.observations, ensure_ascii=False, indent=2)
+        self.query_one("#harness-result", TextArea).text = result.answer or result.error or result.status
+        self._refresh_trace()
+
+    def _refresh_trace(self):
+        if self._budget is not None:
+            budget = self._budget
+            remaining = max(0.0, budget.max_wall_seconds - (time.monotonic() - budget.started_at))
+            self.query_one("#harness-budgets", Label).update(
+                f"Steps {budget.steps_used}/{budget.max_steps} · Tools {budget.tool_calls_used}/{budget.max_tool_calls} · "
+                f"Tokens {getattr(budget, 'tokens_used', 0)}/{getattr(budget, 'max_tokens', '?')} · {remaining:.1f}s remaining")
+        if self._trace is None:
+            return
+        log = self.query_one("#harness-log", Log)
+        log.clear()
+        for event in self._trace.to_list():
+            details = json.dumps(event.get("details", {}), ensure_ascii=False, default=str)
+            log.write_line(f"[{event['phase']}] {event['status']} {event['action']} {details}")
+
+    def _replay(self):
+        if self._harness_job_running:
+            return
+        try:
+            from nanoforge.agent.harness import ReplayRunner
+            from nanoforge.agent.protocol import InMemoryTrace
+            from nanoforge.agent.project import build_project_runtime, load_project_manifest
+            path = self.query_one("#harness-trace-path", Input).value.strip()
+            if path:
+                manifest_path = self.query_one("#harness-project", Input).value.strip()
+                manifest = load_project_manifest(manifest_path)
+                workspace, _, _ = build_project_runtime(manifest, manifest_path)
+                trace = InMemoryTrace.load(workspace.resolve(path)).to_list()
+            elif self._trace is not None:
+                trace = self._trace.to_list()
+            else:
+                raise ValueError("select a saved trace or complete a run first")
+            result = ReplayRunner().replay(trace)
+            self.query_one("#harness-result", TextArea).text = json.dumps(result, ensure_ascii=False, indent=2)
+            self.query_one("#harness-status", Label).update("Trace replayed without executing tools.")
+        except Exception as exc:
+            self.query_one("#harness-status", Label).update(f"Replay error: {exc}")
+
+    def _evaluate(self):
+        if self._harness_job_running:
+            return
+        if self._manifest is None or self._provider is None or self._manifest.provider_kind == "manual":
+            self.query_one("#harness-status", Label).update("Run a project with a selected model before evaluation.")
+            return
+        if not self._manifest.eval_suite:
+            self.query_one("#harness-status", Label).update("Configure eval_suite in the project manifest.")
+            return
+        from nanoforge.agent.protocol import CancellationToken
+        self._cancellation = CancellationToken()
+        self._harness_job_running = True
+        self.query_one("#harness-status", Label).update("Evaluating the selected model against the configured suite…")
+        def work():
+            try:
+                from nanoforge.agent.project import evaluate_project_model
+                result = evaluate_project_model(self._manifest,
+                    self.query_one("#harness-project", Input).value.strip(), cancellation=self._cancellation)
+                report = result["report"]
+                self._post(self.query_one("#harness-evaluation", TextArea).__setattr__, "text",
+                           json.dumps(result, ensure_ascii=False, indent=2))
+                self._post(self.query_one("#harness-status", Label).update,
+                           f"Evaluation: {report['summary']['passed']}/{report['summary']['total']} passed; {report['summary']['errors']} errors")
+            except Exception as exc:
+                self._post(self.query_one("#harness-status", Label).update, f"Evaluation error: {exc}")
+            finally:
+                self._harness_job_running = False
+        threading.Thread(target=work, daemon=True).start()
+
+
+
 class DataScreen(Screen):
     """Browse data files and profile datasets."""
 
@@ -700,7 +960,7 @@ class LaunchScreen(Screen):
             return
         log = self.query_one("#launch-log", Log)
         status = self.query_one("#launch-status", Label)
-        self.app.call_from_thread(status.update, f"Starting {mode}…")
+        status.update(f"Starting {mode}…")
 
         def _do():
             import subprocess
@@ -738,6 +998,20 @@ Screen { background: $surface; }
 #inf-params { height: 3; }
 #inf-input { height: 8; }
 #inf-output { height: 1fr; }
+#harness-wrap { padding: 1; }
+#harness-project-row { height: 3; }
+#harness-project { width: 1fr; }
+#harness-request { height: 5; }
+#harness-actions { height: 8; }
+#harness-log { height: 1fr; }
+#harness-replay-row { height: 3; }
+#harness-trace-path { width: 1fr; }
+#harness-wrap TabbedContent { height: 1fr; }
+#harness-wrap TabPane { padding: 0; }
+#harness-wrap TabPane TextArea { height: 1fr; }
+ToolApprovalModal { align: center middle; background: $background 70%; }
+#approval-dialog { width: 90%; height: 80%; border: heavy $warning; padding: 1; }
+#approval-details { height: 1fr; }
 #cfg-left { width: 30%; padding: 1; }
 #cfg-right { width: 70%; padding: 1; }
 #cfg-editor { height: 1fr; }
@@ -762,7 +1036,7 @@ Sparkline { height: 3; width: 1fr; margin: 0 1; }
 # ── Full multi-screen app ────────────────────────────────────────────────────────
 
 class NanoforgeApp(App):
-    """Nanoforge TUI — full-scope terminal interface."""
+    """Latticekin TUI — training, inference, and bounded harness console."""
 
     CSS = _CSS
     BINDINGS = [
@@ -772,12 +1046,14 @@ class NanoforgeApp(App):
         Binding("4", "switch_screen('data')", "Data"),
         Binding("5", "switch_screen('config')", "Config"),
         Binding("6", "switch_screen('system')", "System"),
+        Binding("7", "switch_screen('harness')", "Harness"),
         Binding("q", "quit", "Quit"),
     ]
 
-    def __init__(self, run_dir: str = "runs/nanoforge"):
+    def __init__(self, run_dir: str = "runs/nanoforge", project: str | None = None):
         super().__init__()
         self._run_dir = Path(run_dir)
+        self._project = project
 
     def on_mount(self) -> None:
         self.install_screen(LaunchScreen(), name="launch")
@@ -786,6 +1062,7 @@ class NanoforgeApp(App):
         self.install_screen(DataScreen(), name="data")
         self.install_screen(ConfigScreen(), name="config")
         self.install_screen(SystemScreen(), name="system")
+        self.install_screen(HarnessScreen(self._project), name="harness")
         self.push_screen("launch")
 
     def action_switch_screen(self, name: str) -> None:
@@ -823,7 +1100,7 @@ class TrainingMonitorApp(App):
         yield Footer()
 
     def on_mount(self) -> None:
-        self.title = "Nanoforge · live training"
+        self.title = "Latticekin · live training"
         self.set_interval(1.5, self._poll)
         self._poll()
 
@@ -854,9 +1131,9 @@ class TrainingMonitorApp(App):
 
 # ── Entry points ─────────────────────────────────────────────────────────────────
 
-def launch_tui(run_dir: str = "runs/nanoforge") -> None:
+def launch_tui(run_dir: str = "runs/nanoforge", project: str | None = None) -> None:
     _require_textual()
-    NanoforgeApp(run_dir=run_dir).run()
+    NanoforgeApp(run_dir=run_dir, project=project).run()
 
 
 def launch_training_tui(

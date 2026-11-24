@@ -21,7 +21,7 @@ model:
   normalization: rmsnorm
   position_embedding: rope
   attention_backend: sdpa
-  ffn_type: swiglu
+  ffn_type: moe
   block_type: transformer
   gradient_checkpointing: true
   lora_rank: 0
@@ -29,14 +29,14 @@ model:
     num_experts: 8
     top_k: 2              # 2 of 8 experts active per token
     capacity_factor: 1.25
-    load_balancing_weight: 0.01
+    router_aux_loss_coef: 0.01
 
 training:
   run_name: moe-large
   output_dir: runs/moe-large
   seed: 1337
   max_steps: 200000
-  batch_size: 512
+  batch_size: 128
   micro_batch_size: 4
   grad_accum_steps: 32
   learning_rate: 4.0e-4
@@ -59,7 +59,7 @@ training:
   ema_decay: 0.0
   tensorboard: true
   wandb: false
-  distributed_backend: fsdp   # multi-GPU; falls back to single-device if unavailable
+  distributed_backend: fsdp   # use a synchronized multi-GPU launch; validate platform support
 
 data:
   train_path: data/packed/YOUR_DATASET/train.bin
@@ -70,7 +70,6 @@ data:
   mode: generative
   loss_masking: none
   num_workers: 8
-  prefetch_factor: 4
   pin_memory: true
 
 inference:

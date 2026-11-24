@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import pytest
 
 from nanoforge.agent import (
     RepositoryWorkspace,
@@ -59,3 +60,18 @@ def test_fixed_test_profile_is_allowlisted(tmp_path):
     assert result.output["status"] == "passed"
     unknown = executor.execute({"name": "repo.run_tests", "arguments": {"profile": "shell"}})
     assert unknown.status == "error"
+
+
+def test_repository_listing_rejects_symlink_outside_workspace(tmp_path):
+    outside = tmp_path.parent / "outside-secret.txt"
+    outside.write_text("secret", encoding="utf-8")
+    link = tmp_path / "linked.txt"
+    try:
+        link.symlink_to(outside)
+    except (OSError, NotImplementedError):
+        pytest.skip("this platform does not permit creating a symlink")
+    executor = _executor(tmp_path)
+    listed = executor.execute({"name": "repo.list_files", "arguments": {}})
+    searched = executor.execute({"name": "repo.search", "arguments": {"pattern": "secret"}})
+    assert listed.status == "error"
+    assert searched.status == "error"

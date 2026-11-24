@@ -1,5 +1,16 @@
 @import "tailwindcss";
 
+@media (max-width: 900px) {
+  .studio-split { grid-template-columns: minmax(0, 1fr) !important; }
+}
+@media (max-width: 650px) {
+  .studio-layout { flex-direction: column; }
+  .studio-sidebar { position: static !important; width: 100% !important; min-height: 0 !important; }
+  .studio-sidebar nav { flex-direction: row !important; flex-wrap: wrap; }
+  .studio-main { margin-left: 0 !important; }
+}
+button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-visible { outline: 2px solid var(--color-accent); outline-offset: 3px; }
+
 /* ============================================================
    Nanoforge — dark-tech design system
    One theme (dark), one accent (indigo), one radius scale.

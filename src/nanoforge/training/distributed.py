@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from datetime import timedelta
 
 import torch
 from torch import nn
@@ -59,6 +60,8 @@ def discover_env() -> DistEnv:
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     rank = int(os.environ.get("RANK", "0"))
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    if world_size < 1 or rank < 0 or rank >= world_size or local_rank < 0:
+        raise ValueError("Distributed environment requires world_size >= 1 and valid rank/local_rank.")
     return DistEnv(rank=rank, local_rank=local_rank, world_size=world_size)
 
 
@@ -78,8 +81,10 @@ def init_process_group(env: DistEnv, backend: str | None = None) -> None:
         env.world_size,
         env.local_rank,
     )
-    dist.init_process_group(backend=backend, rank=env.rank, world_size=env.world_size)
-    if torch.cuda.is_available():
+    dist.init_process_group(
+        backend=backend, rank=env.rank, world_size=env.world_size, timeout=timedelta(seconds=60)
+    )
+    if backend == "nccl":
         torch.cuda.set_device(env.local_rank)
 
 
@@ -136,23 +141,17 @@ def wrap_model(
 
     if backend == "fsdp":
         return _wrap_fsdp(model, env, precision=precision)
-    if backend in {"ddp", "torch_ddp"}:
+    if backend in {"ddp", "torch_ddp", "zero"}:
         return _wrap_ddp(model, env)
     raise ValueError(
-        f"Unknown distributed_backend '{backend}'. Expected one of: none, fsdp, ddp."
+        f"Unknown distributed_backend '{backend}'. Expected one of: none, fsdp, ddp, zero."
     )
 
 
 def _wrap_fsdp(model: nn.Module, env: DistEnv, *, precision: str) -> nn.Module:
-    """Wrap in FullyShardedDataParallel (FULL_SHARD).
+    """Wrap FULL_SHARD; Trainer explicitly gathers full model/optimizer checkpoints.
 
-    .. note::
-       Checkpoint save/load for FSDP under ``FULL_SHARD`` saves each rank's local
-       shard: ``state_dict()`` called outside an ``FSDP.state_dict_type(FULL_STATE_DICT)``
-       context is sharded, not consolidated. The trainer routes saves through the
-       unwrapped module, which is correct for DDP and single-process runs but does
-       NOT yet gather a full FSDP state dict on rank 0 — consolidated FSDP checkpoints
-       are a tracked follow-up (see CLAUDE.md "Distributed Training — Scale Out").
+    CUDA roundtrip verification is required before a hardware release claim.
     """
 
     import functools
@@ -167,7 +166,12 @@ def _wrap_fsdp(model: nn.Module, env: DistEnv, *, precision: str) -> nn.Module:
         transformer_auto_wrap_policy,
         transformer_layer_cls={TransformerBlock},
     )
-    device_id = torch.cuda.current_device() if torch.cuda.is_available() else None
+    device = next(model.parameters()).device
+    if device.type != "cuda":
+        raise ValueError(
+            "FSDP requires CUDA in the supported workflow; CPU scale-out uses DDP or ZeRO stage 1."
+        )
+    device_id = device
     _log.info("wrapping model in FSDP (full shard) on rank %d", env.rank)
     return FSDP(
         model,
@@ -182,7 +186,7 @@ def _wrap_fsdp(model: nn.Module, env: DistEnv, *, precision: str) -> nn.Module:
 def _wrap_ddp(model: nn.Module, env: DistEnv) -> nn.Module:
     from torch.nn.parallel import DistributedDataParallel as DDP
 
-    if torch.cuda.is_available():
+    if next(model.parameters()).device.type == "cuda":
         device_ids = [env.local_rank]
         output_device = env.local_rank
     else:

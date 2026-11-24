@@ -7,85 +7,136 @@ from __future__ import annotations
 import collections
 import json
 import os
-import subprocess
 import sys
 import threading
+import time
 import uuid
+from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any
+from typing import Annotated, Any, Literal
 
 from nanoforge.progress import json_safe, read_jsonl_tail
+from nanoforge.serving import (
+    EngineRunner,
+    JobManager,
+    SecurityMiddleware,
+    ServingPolicy,
+    WorkspacePaths,
+    atomic_text,
+)
 
 try:
-    from pydantic import BaseModel
+    from fastapi import UploadFile
+    from pydantic import BaseModel, ConfigDict, Field
 except Exception:  # pydantic ships with fastapi; create_app raises a clean error if missing
     BaseModel = object  # type: ignore[assignment,misc]
+    UploadFile = object
+    ConfigDict = dict
+    def Field(default=None, **kwargs):
+        return default
+
+
+class StrictRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
 
 
 # ── Request models (module level so FastAPI resolves them as request bodies) ──
-class JobStartRequest(BaseModel):
-    type: str
+class JobStartRequest(StrictRequest):
+    type: Literal["train", "pretrain", "pipeline", "auto-train", "prepare", "download"]
     config: str | None = None
     input: list[str] | None = None
     out: str | None = None
     mode: str = "auto"
     tokenizer: str = "byte"
-    seq_len: int = 512
+    seq_len: int = Field(512, ge=2, le=8192)
     dataset: str | None = None
+    name: str | None = Field(None, pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+    max_steps: int = Field(50000, ge=1, le=10000000)
 
 
-class JobStopRequest(BaseModel):
+class JobStopRequest(StrictRequest):
     job_id: str
 
 
-class LoadRequest(BaseModel):
+class LoadRequest(StrictRequest):
     path: str
 
 
-class GenerateRequest(BaseModel):
-    prompt: str
-    temperature: float = 0.8
-    top_k: int = 50
-    max_new_tokens: int = 256
-    mode: str = "balanced"
+class GenerateRequest(StrictRequest):
+    prompt: str = Field(max_length=1024 * 1024)
+    temperature: float = Field(0.8, ge=0, le=2)
+    top_k: int = Field(50, ge=0)
+    max_new_tokens: int = Field(256, ge=1, le=4096)
+    mode: Literal["balanced", "chat", "creative", "coding", "deterministic", "low_memory", "high_quality"] = "balanced"
 
 
-class PathRequest(BaseModel):
+class PathRequest(StrictRequest):
     path: str
 
 
-class SaveConfigRequest(BaseModel):
+class SaveConfigRequest(StrictRequest):
     path: str
     yaml_text: str
 
 
-class ImportRequest(BaseModel):
+class ImportRequest(StrictRequest):
     source: str
     name: str
     backend: str | None = None
     tokenizer: str | None = None
 
 
-class ChatStreamRequest(BaseModel):
-    messages: list[list[str]]  # [[role, content], ...]
-    max_new_tokens: int = 512
-    temperature: float = 0.8
-    top_k: int = 50
+class ChatStreamRequest(StrictRequest):
+    messages: list[tuple[Literal["system", "user", "assistant", "tool"], Annotated[str, Field(max_length=1024 * 1024)]]] = Field(min_length=1, max_length=256)
+    max_new_tokens: int = Field(512, ge=1, le=4096)
+    temperature: float = Field(0.8, ge=0, le=2)
+    top_k: int = Field(50, ge=0)
 
 
-class RagLoadRequest(BaseModel):
+class RagLoadRequest(StrictRequest):
     path: str
-    top_k: int = 3
+    top_k: int = Field(3, ge=1, le=32)
 
 
-class FactsLoadRequest(BaseModel):
+class FactsLoadRequest(StrictRequest):
     path: str
-    threshold: float = 0.5
+    threshold: float = Field(0.5, ge=0, le=1)
 
 
-class ConfigBuildRequest(BaseModel):
+class ConfigBuildRequest(StrictRequest):
     sections: dict[str, dict[str, Any]]  # {"model": {...}, "training": {...}, ...}
     path: str | None = None  # if set, also write the built YAML here
+
+
+class ProjectSaveRequest(StrictRequest):
+    path: str
+    project: dict[str, Any]
+
+
+class AgentStartRequest(StrictRequest):
+    project_path: str
+    request: str = Field(min_length=1, max_length=64 * 1024)
+    actions: list[dict[str, Any]] | None = Field(None, max_length=64)
+
+
+class ApprovalRequest(StrictRequest):
+    approval_id: str
+    approved: bool = Field(strict=True)
+
+
+class ReplayRequest(StrictRequest):
+    run_id: str | None = None
+    path: str | None = None
+
+
+class EvaluationRequest(StrictRequest):
+    suite_path: str
+    model_ref: str
+    output_dir: str
+
+
+class CompareRequest(StrictRequest):
+    report_paths: list[str] = Field(min_length=2, max_length=16)
 
 
 # ── Config schema introspection (drives the web param editor) ─────────────────
@@ -115,7 +166,7 @@ _ENUM_FIELDS: dict[tuple[str, str], list[str]] = {
     ("data", "mode"): ["generative", "chat", "instruct", "classification"],
     ("data", "loss_masking"): ["auto", "all", "assistant_only", "completion_only"],
     ("model", "input_type"): ["text", "tokens"],
-    ("inference", "mode"): ["balanced", "creative", "precise", "greedy"],
+    ("inference", "mode"): ["balanced", "chat", "creative", "coding", "deterministic", "low_memory", "high_quality"],
 }
 
 # Numeric slider/step hints for well-known bounded fields.
@@ -258,35 +309,6 @@ _DATASET_CATALOG: list[dict[str, str]] = [
 _CPU_HIST: collections.deque[float] = collections.deque(maxlen=180)
 _RAM_HIST: collections.deque[float] = collections.deque(maxlen=180)
 
-# ── Job registry ──────────────────────────────────────────────────────────────
-_jobs: dict[str, dict] = {}  # job_id -> {proc, lines, done, code}
-_jobs_lock = threading.Lock()
-
-
-def _start_job(cmd: list[str]) -> str:
-    job_id = str(uuid.uuid4())
-    proc = subprocess.Popen(
-        cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        text=True, bufsize=1,
-    )
-    entry: dict[str, Any] = {"proc": proc, "lines": [], "done": False, "code": None}
-    with _jobs_lock:
-        _jobs[job_id] = entry
-
-    def _reader():
-        for line in proc.stdout:
-            line = line.rstrip()
-            with _jobs_lock:
-                entry["lines"].append(line)
-        proc.wait()
-        with _jobs_lock:
-            entry["done"] = True
-            entry["code"] = proc.returncode
-
-    threading.Thread(target=_reader, daemon=True).start()
-    return job_id
-
-
 # ── Helpers (reused from dashboard) ──────────────────────────────────────────
 def _scan_checkpoints(run_path: Path) -> list[dict]:
     ckpts = []
@@ -318,32 +340,103 @@ def _flatten_config(cfg) -> dict:
     return result
 
 
-def _load_engine_compat(path: str):
+def _load_engine_compat(path: str, *, paths: WorkspacePaths | None = None):
     try:
         from nanoforge.generation.engine import GenerationEngine
-        return GenerationEngine.from_checkpoint(path), None
+        if Path(path).suffix.lower() in {".pt", ".pth", ".ckpt"}:
+            checkpoint = paths.resolve(path) if paths else Path(path)
+            return GenerationEngine.from_checkpoint(checkpoint), None
+        from nanoforge.imports import load_imported_engine, resolve_imported_model
+        reference = path
+        if paths:
+            entry = resolve_imported_model(path, registry_file=paths.root / "models/imports.json")
+            reference = entry.source
+            local = paths.resolve(reference)
+            if not local.exists():
+                raise FileNotFoundError("Studio model import must resolve to an existing local model; network loading is disabled.")
+            return load_imported_engine(path, registry_path=paths.root / "models/imports.json", allow_network=False), None
+        return load_imported_engine(reference, allow_network=False), None
     except Exception as exc:
         return None, str(exc)
 
 
 # ── App factory ───────────────────────────────────────────────────────────────
-def create_app(run_dir: str = "runs/nanoforge"):
+def create_app(run_dir: str = "runs/nanoforge", *, workspace_root: str | Path | None = None, policy: ServingPolicy | None = None):
     try:
-        from fastapi import FastAPI, File, Form, UploadFile
+        from fastapi import FastAPI, File, Form, HTTPException
         from fastapi.responses import HTMLResponse, StreamingResponse
         from fastapi.staticfiles import StaticFiles
     except Exception as exc:
         raise RuntimeError("Install serve extras: pip install -e .[serve]") from exc
 
-    app = FastAPI(title="Nanoforge")
-    run_path = Path(run_dir)
-    metrics_path = run_path / "metrics.jsonl"
+    paths = WorkspacePaths(workspace_root or Path.cwd())
+    policy = policy or ServingPolicy()
+    jobs = JobManager(paths.root, max_concurrency=policy.max_concurrency)
+    runner = EngineRunner(policy)
+    _engine_holder = dict(globals()["_engine_holder"])
+    _rag_holder = dict(globals()["_rag_holder"])
+    _facts_holder = dict(globals()["_facts_holder"])
+    agent_runs: dict[str, dict[str, Any]] = {}
+    agent_lock = threading.RLock()
+
+    @asynccontextmanager
+    async def lifespan(app):
+        yield
+        for run in list(agent_runs.values()):
+            run["cancellation"].cancel()
+        jobs.close()
+        runner.close()
+
+    app = FastAPI(title="Latticekin", lifespan=lifespan)
+    app.add_middleware(SecurityMiddleware, policy=policy)
+    app.state.jobs = jobs
+    app.state.workspace = paths
+    app.state.engine_holder = _engine_holder
+    app.state.engine_runner = runner
+
+    @app.exception_handler(ValueError)
+    async def validation_error(request, exc):
+        from fastapi.responses import JSONResponse
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=422)
+
+    @app.exception_handler(FileNotFoundError)
+    async def missing_file(request, exc):
+        from fastapi.responses import JSONResponse
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=404)
+
+    @app.exception_handler(PermissionError)
+    async def forbidden_file(request, exc):
+        from fastapi.responses import JSONResponse
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=403)
+
+    def confined(value, *, relative=False):
+        try:
+            return paths.resolve(value, allow_absolute=not relative)
+        except (PermissionError, ValueError) as exc:
+            raise HTTPException(403, str(exc)) from exc
+
+    run_path = confined(run_dir)
+
+    def metrics_for(job_id=None, run_dir=None):
+        target = run_path
+        if job_id:
+            try:
+                selected = jobs.status(job_id).get("run_dir")
+            except KeyError as exc:
+                raise HTTPException(404, "Job not found") from exc
+            if selected:
+                target = confined(selected)
+        elif run_dir:
+            target = confined(run_dir)
+        return target, target / "metrics.jsonl"
 
     dist = Path(__file__).parent / "web_dist"
 
     # ── Metrics ───────────────────────────────────────────────────────────────
     @app.get("/api/metrics")
-    def metrics(limit: int = 2000):
+    def metrics(limit: int = 2000, job_id: str | None = None, run_dir: str | None = None):
+        limit = max(1, min(limit, 10000))
+        run_path, metrics_path = metrics_for(job_id, run_dir)
         rows = read_jsonl_tail(metrics_path, limit=limit)
         ckpts = _scan_checkpoints(run_path)
         cfg_data: dict = {}
@@ -358,8 +451,10 @@ def create_app(run_dir: str = "runs/nanoforge"):
         return json_safe({"run": run_path.name, "rows": rows, "checkpoints": ckpts, "config": cfg_data})
 
     @app.get("/api/metrics/summary")
-    def metrics_summary(limit: int = 2000):
+    def metrics_summary(limit: int = 2000, job_id: str | None = None, run_dir: str | None = None):
         """Latest values + server-computed derived metrics (ETA, throughput, gaps)."""
+        limit = max(1, min(limit, 10000))
+        run_path, metrics_path = metrics_for(job_id, run_dir)
         rows = read_jsonl_tail(metrics_path, limit=limit)
         latest: dict[str, Any] = {}
         first_step = last_step = None
@@ -418,13 +513,16 @@ def create_app(run_dir: str = "runs/nanoforge"):
     @app.get("/api/runs")
     def list_runs(root: str = "runs"):
         """List run directories under ``root`` with a last-metric summary each."""
-        base = Path(root)
+        base = confined(root)
         if not base.exists():
             return {"ok": True, "runs": []}
         runs = []
         for p in sorted(base.iterdir()):
             if p.is_dir():
-                runs.append(_run_summary(p))
+                if len(runs) >= 500:
+                    break
+                if p.resolve().is_relative_to(paths.root):
+                    runs.append(_run_summary(p))
         runs.sort(key=lambda r: r["mtime"], reverse=True)
         return json_safe({"ok": True, "runs": runs})
 
@@ -460,72 +558,89 @@ def create_app(run_dir: str = "runs/nanoforge"):
     @app.post("/api/jobs/start")
     def job_start(req: JobStartRequest):
         py = sys.executable
+        run_dir = None
         if req.type in ("train", "pretrain", "pipeline"):
             if not req.config:
                 return {"ok": False, "error": "config required"}
-            cmd = [py, "-m", "nanoforge", req.type, "--config", req.config]
+            config_path = confined(req.config)
+            if req.type != "pipeline":
+                from nanoforge.config import load_config
+                config = load_config(config_path, strict=True)
+                run_dir = paths.relative(confined(config.training.out_dir))
+                for value in (config.data.train_data, config.data.val_data, config.data.tokenizer_path):
+                    if value:
+                        confined(value)
+            cmd = [py, "-m", "nanoforge", req.type, "--config", str(config_path)]
         elif req.type == "auto-train":
-            if not req.config:
-                return {"ok": False, "error": "config required"}
-            cmd = [py, "-m", "nanoforge", "auto-train", "--config", req.config]
+            if not req.input or not req.name:
+                return {"ok": False, "error": "input and name required for auto-train"}
+            input_paths = [str(confined(value)) for value in req.input]
+            run_dir = "runs/" + req.name
+            cmd = [py, "-m", "nanoforge", "auto-train", "--input", *input_paths, "--name", req.name,
+                   "--mode", req.mode, "--tokenizer", req.tokenizer, "--seq-len", str(req.seq_len), "--max-steps", str(req.max_steps)]
         elif req.type == "prepare":
             if not req.input or not req.out:
                 return {"ok": False, "error": "input and out required"}
             cmd = [py, "-m", "nanoforge", "prepare",
-                   "--input", *req.input, "--out", req.out,
+                   "--input", *(str(confined(value)) for value in req.input), "--out", str(confined(req.out)),
                    "--mode", req.mode, "--tokenizer", req.tokenizer,
                    "--seq-len", str(req.seq_len)]
         elif req.type == "download":
             if not req.dataset:
                 return {"ok": False, "error": "dataset required"}
             repo = _DATASET_REPOS.get(req.dataset, req.dataset)
-            safe_name = req.dataset.replace("/", "__")
-            cfg = f", {_DATASET_CONFIGS[req.dataset]!r}" if req.dataset in _DATASET_CONFIGS else ""
-            cmd = [py, "-c",
-                   "import sys; from datasets import load_dataset; "
-                   f"ds=load_dataset({repo!r}{cfg}); "
-                   f"ds.save_to_disk('data/hf/{safe_name}'); "
-                   "print('done:', {k: len(v) for k, v in ds.items()})"]
+            from pathlib import PureWindowsPath
+            if (paths.root / repo).exists() or Path(repo).is_absolute() or PureWindowsPath(repo).drive or ".." in Path(repo).parts:
+                repo = str(confined(repo))
+            import hashlib
+            safe_name = hashlib.sha256(req.dataset.encode()).hexdigest()[:24]
+            output = confined("data/hf/" + safe_name)
+            cmd = [py, "-m", "nanoforge.serving", "download-dataset", "--source", repo, "--out", str(output)]
+            if req.dataset in _DATASET_CONFIGS:
+                cmd.extend(["--config", _DATASET_CONFIGS[req.dataset]])
         else:
             return {"ok": False, "error": f"unknown job type: {req.type}"}
-        job_id = _start_job(cmd)
-        return {"ok": True, "job_id": job_id}
+        try:
+            job_id = jobs.start_process(cmd, job_type=req.type, run_dir=run_dir)
+        except RuntimeError as exc:
+            raise HTTPException(429, str(exc)) from exc
+        return {"ok": True, "job_id": job_id, "run_dir": run_dir}
+
+    @app.get("/api/jobs")
+    def job_list():
+        return {"ok": True, "jobs": jobs.list()}
 
     @app.post("/api/jobs/stop")
     def job_stop(req: JobStopRequest):
-        with _jobs_lock:
-            entry = _jobs.get(req.job_id)
-        if entry and not entry["done"]:
-            try:
-                entry["proc"].terminate()
-            except Exception:
-                pass
+        try:
+            jobs.cancel(req.job_id)
+        except KeyError as exc:
+            raise HTTPException(404, "Job not found") from exc
         return {"ok": True}
 
     @app.get("/api/jobs/{job_id}")
     def job_status(job_id: str):
-        with _jobs_lock:
-            entry = _jobs.get(job_id)
-        if not entry:
-            return {"ok": False, "error": "not found"}
-        return {"ok": True, "done": entry["done"], "code": entry["code"], "lines": entry["lines"]}
+        try:
+            return {"ok": True, **jobs.status(job_id)}
+        except KeyError as exc:
+            raise HTTPException(404, "Job not found") from exc
 
     # ── SSE job stream ────────────────────────────────────────────────────────
     @app.get("/stream/job/{job_id}")
     def stream_job(job_id: str):
         def _gen():
-            sent = 0
-            import time
+            previous = []
             while True:
-                with _jobs_lock:
-                    entry = _jobs.get(job_id)
-                if entry is None:
+                try:
+                    entry = jobs.status(job_id)
+                except KeyError:
                     yield f"data: {json.dumps({'type':'done','code':-1})}\n\n"
                     return
                 lines = entry["lines"]
-                while sent < len(lines):
-                    yield f"data: {json.dumps({'type':'line','line':lines[sent]})}\n\n"
-                    sent += 1
+                start = len(previous) if lines[:len(previous)] == previous else 0
+                for line in lines[start:]:
+                    yield f"data: {json.dumps({'type':'line','line':line})}\n\n"
+                previous = lines
                 if entry["done"]:
                     yield f"data: {json.dumps({'type':'done','code':entry['code']})}\n\n"
                     return
@@ -540,7 +655,7 @@ def create_app(run_dir: str = "runs/nanoforge"):
 
     @app.post("/api/chat/load")
     def chat_load(req: LoadRequest):
-        engine, err = _load_engine_compat(req.path)
+        engine, err = _load_engine_compat(req.path, paths=paths)
         if err:
             return {"ok": False, "error": err}
         _engine_holder["engine"] = engine
@@ -556,7 +671,7 @@ def create_app(run_dir: str = "runs/nanoforge"):
     def rag_load(req: RagLoadRequest):
         try:
             from nanoforge.rag import load_index
-            retriever = load_index(req.path, engine=_engine_holder.get("engine"))
+            retriever = load_index(confined(req.path), engine=_engine_holder.get("engine"))
             _rag_holder["retriever"] = retriever
             _rag_holder["path"] = req.path
             _rag_holder["top_k"] = req.top_k
@@ -585,7 +700,7 @@ def create_app(run_dir: str = "runs/nanoforge"):
             from nanoforge.rag.personal import PersonalAnswerer
 
             answerer = PersonalAnswerer.load(
-                req.path, engine=_engine_holder.get("engine"), threshold=req.threshold
+                confined(req.path), engine=_engine_holder.get("engine"), threshold=req.threshold
             )
             if answerer is None:
                 return {"ok": False, "error": f"could not load facts index at {req.path}"}
@@ -629,6 +744,7 @@ def create_app(run_dir: str = "runs/nanoforge"):
 
         # RAG injection — non-fatal; chat continues unchanged if retrieval fails
         system: str | None = None
+        retrieval_warning = None
         retriever = _rag_holder.get("retriever")
         if retriever is not None:
             query = next((c for r, c in reversed(messages) if r == "user"), "")
@@ -638,16 +754,22 @@ def create_app(run_dir: str = "runs/nanoforge"):
                     if hits:
                         blocks = "\n\n".join(f"[{i+1}] {h['text_chunk']}" for i, h in enumerate(hits))
                         system = f"Relevant context:\n{blocks}"
-                except Exception:
-                    pass
+                except Exception as exc:
+                    retrieval_warning = str(exc)
 
         def _gen():
             try:
+                if retrieval_warning:
+                    yield f"data: {json.dumps({'type':'warning','text':'Retrieval failed: ' + retrieval_warning})}\n\n"
                 from nanoforge.generation.sampling import SamplingConfig
                 sc = SamplingConfig(mode="chat", temperature=req.temperature, top_k=req.top_k)
-                for chunk in engine.chat_stream(
-                    messages, max_new_tokens=req.max_new_tokens, sampling=sc, system=system
-                ):
+                if hasattr(engine, "chat_stream"):
+                    output = runner.stream(engine, messages, req.max_new_tokens, sc, system=system, stream_fn=engine.chat_stream)
+                else:
+                    from nanoforge.generation.engine import GenerationEngine
+                    renderer = getattr(engine, "build_chat_prompt", GenerationEngine.build_chat_prompt)
+                    output = runner.stream(engine, renderer(messages, system=system), req.max_new_tokens, sc)
+                for chunk in output:
                     yield f"data: {json.dumps({'type':'chunk','text':chunk})}\n\n"
             except Exception as exc:
                 yield f"data: {json.dumps({'type':'error','text':str(exc)})}\n\n"
@@ -659,13 +781,13 @@ def create_app(run_dir: str = "runs/nanoforge"):
     def chat_generate(req: GenerateRequest):
         engine = _engine_holder.get("engine")
         if engine is None:
-            return {"text": "[no model loaded]"}
+            return {"ok": False, "error": "No model loaded", "text": ""}
         try:
             from nanoforge.generation.sampling import SamplingConfig
             sc = SamplingConfig(mode=req.mode, temperature=req.temperature, top_k=req.top_k)
-            return {"text": engine.complete(req.prompt, max_new_tokens=req.max_new_tokens, sampling=sc) or "(empty)"}
+            return {"ok": True, "text": "".join(runner.stream(engine, req.prompt, req.max_new_tokens, sc))}
         except Exception as exc:
-            return {"text": f"[error: {exc}]"}
+            return {"ok": False, "error": str(exc), "text": ""}
 
     @app.post("/api/inference")
     def inference(req: GenerateRequest):
@@ -678,23 +800,25 @@ def create_app(run_dir: str = "runs/nanoforge"):
                 return {"ok": True, "task": task, "type": "classification", "labels": engine.classify(req.prompt)}
             from nanoforge.generation.sampling import SamplingConfig
             sc = SamplingConfig(mode=req.mode, temperature=req.temperature, top_k=req.top_k)
-            text = engine.complete(req.prompt, max_new_tokens=req.max_new_tokens, sampling=sc)
-            return {"ok": True, "task": task, "type": "generation", "text": text or "(empty)"}
+            text = "".join(runner.stream(engine, req.prompt, req.max_new_tokens, sc))
+            return {"ok": True, "task": task, "type": "generation", "text": text}
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
 
     # ── Data ──────────────────────────────────────────────────────────────────
     @app.get("/api/data/list")
     def data_list(root: str = "data"):
-        base = Path(root)
+        base = confined(root)
         if not base.exists():
             return {"ok": True, "files": []}
         files = []
-        for p in sorted(base.rglob("*")):
+        for count, p in enumerate(base.rglob("*")):
+            if count >= 10000 or len(files) >= 500:
+                break
             if p.is_file() and p.suffix.lower() in {".txt", ".jsonl", ".json", ".csv", ".tsv", ".parquet", ".bin"}:
                 try:
-                    files.append({"path": str(p), "size": p.stat().st_size})
-                except OSError:
+                    files.append({"path": paths.relative(p), "size": p.stat().st_size})
+                except (OSError, ValueError, PermissionError):
                     pass
         return {"ok": True, "files": files[:500]}
 
@@ -702,7 +826,7 @@ def create_app(run_dir: str = "runs/nanoforge"):
     def data_profile(req: PathRequest):
         try:
             from nanoforge.data.profiler import profile_dataset
-            prof = profile_dataset([req.path])
+            prof = profile_dataset([confined(req.path)])
             return {"ok": True, "profile": json_safe(prof.to_dict())}
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
@@ -714,26 +838,46 @@ def create_app(run_dir: str = "runs/nanoforge"):
 
     @app.post("/api/data/upload")
     async def data_upload(file: UploadFile = File(...), subdir: str = Form("uploads")):  # noqa: B008
-        """Stream an uploaded file to ``data/<subdir>/`` without loading it into RAM."""
-        safe_name = os.path.basename(file.filename or "upload.bin").replace("\\", "_")
-        safe_sub = os.path.normpath(subdir).replace("..", "").strip("/\\") or "uploads"
-        dest_dir = Path("data") / safe_sub
+        """Commit a size-bounded upload under data/ only after complete receipt."""
+        import tempfile
+        original = file.filename or "upload.bin"
+        from pathlib import PureWindowsPath
+        if Path(original).name != original or PureWindowsPath(original).name != original or original in {".", ".."}:
+            raise HTTPException(400, "Upload filename must be a plain filename.")
+        safe_sub = confined(subdir, relative=True)
+        dest_dir = confined(Path("data") / safe_sub.relative_to(paths.root))
         dest_dir.mkdir(parents=True, exist_ok=True)
-        dest = dest_dir / safe_name
+        dest = confined(dest_dir / original)
+        if dest.exists():
+            raise HTTPException(409, "An upload with this filename already exists.")
         size = 0
+        descriptor, temporary = tempfile.mkstemp(prefix=".upload-", suffix=".tmp", dir=dest_dir)
         try:
-            with dest.open("wb") as out:
+            with os.fdopen(descriptor, "wb") as out:
                 while True:
                     chunk = await file.read(1 << 20)  # 1 MiB
                     if not chunk:
                         break
                     size += len(chunk)
+                    if size > policy.max_request_bytes:
+                        raise HTTPException(413, "Upload exceeds configured byte limit.")
                     out.write(chunk)
+                out.flush()
+                os.fsync(out.fileno())
+            confined(dest)
+            try:
+                os.link(temporary, dest)
+            except FileExistsError as exc:
+                raise HTTPException(409, "An upload with this filename already exists.") from exc
+        except HTTPException:
+            raise
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
         finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
             await file.close()
-        return {"ok": True, "path": str(dest), "size": size}
+        return {"ok": True, "path": paths.relative(dest), "size": size}
 
     # ── Config ────────────────────────────────────────────────────────────────
     @app.get("/api/config/schema")
@@ -765,42 +909,30 @@ def create_app(run_dir: str = "runs/nanoforge"):
 
             import yaml
 
-            from nanoforge.config import (
-                DataConfig,
-                InferenceConfig,
-                ModelConfig,
-                NanoforgeConfig,
-                TrainConfig,
-                _dataclass_from_dict,
-            )
+            from nanoforge.config import parse_config
             s = req.sections
-            cfg = NanoforgeConfig(
-                model=_dataclass_from_dict(ModelConfig, s.get("model", {})),
-                training=_dataclass_from_dict(TrainConfig, s.get("training", {})),
-                data=_dataclass_from_dict(DataConfig, s.get("data", {})),
-                inference=_dataclass_from_dict(InferenceConfig, s.get("inference", {})),
-            )
+            cfg = parse_config(yaml.safe_dump(s, sort_keys=False), strict=True)
             yaml_text = yaml.safe_dump(dataclasses.asdict(cfg), sort_keys=False)
             written = None
             if req.path:
-                out = Path(req.path)
-                out.parent.mkdir(parents=True, exist_ok=True)
-                out.write_text(yaml_text, encoding="utf-8")
-                written = str(out)
+                out = confined(req.path)
+                atomic_text(out, yaml_text)
+                written = paths.relative(out)
             return {"ok": True, "yaml": yaml_text, "path": written}
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
 
     @app.get("/api/config/templates")
     def config_templates():
-        cfgs = [str(p) for p in sorted(Path("configs").glob("*.yaml"))] if Path("configs").exists() else []
+        base = confined("configs")
+        cfgs = [paths.relative(p) for p in sorted(base.glob("*.yaml"))[:500]] if base.exists() else []
         return {"ok": True, "templates": cfgs}
 
     @app.get("/api/config/load")
     def config_load(path: str):
         try:
             from nanoforge.config import load_config
-            return {"ok": True, "config": _flatten_config(load_config(path))}
+            return {"ok": True, "config": _flatten_config(load_config(confined(path)))}
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
 
@@ -808,19 +940,23 @@ def create_app(run_dir: str = "runs/nanoforge"):
     def config_raw(path: str):
         from fastapi.responses import PlainTextResponse
         try:
-            return PlainTextResponse(Path(path).read_text(encoding="utf-8"))
+            source = confined(path)
+            if source.stat().st_size > policy.max_request_bytes:
+                raise HTTPException(413, "Config exceeds byte limit.")
+            return PlainTextResponse(source.read_text(encoding="utf-8"))
+        except HTTPException:
+            raise
         except Exception as exc:
             return PlainTextResponse(str(exc), status_code=400)
 
     @app.post("/api/config/save")
     def config_save(req: SaveConfigRequest):
         try:
-            out = Path(req.path)
-            out.parent.mkdir(parents=True, exist_ok=True)
-            out.write_text(req.yaml_text, encoding="utf-8")
-            from nanoforge.config import load_config
-            load_config(out)
-            return {"ok": True, "path": str(out)}
+            out = confined(req.path)
+            from nanoforge.config import parse_config
+            parse_config(req.yaml_text, strict=True)
+            atomic_text(out, req.yaml_text)
+            return {"ok": True, "path": paths.relative(out)}
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
 
@@ -829,20 +965,25 @@ def create_app(run_dir: str = "runs/nanoforge"):
     def model_list():
         models = []
         for root in ("runs", "models"):
-            base = Path(root)
+            base = confined(root)
             if base.exists():
-                for p in sorted(base.rglob("*.pt")):
+                for count, p in enumerate(base.rglob("*.pt")):
+                    if count >= 10000 or len(models) >= 200:
+                        break
                     try:
-                        models.append({"path": str(p), "size": p.stat().st_size})
-                    except OSError:
+                        models.append({"path": paths.relative(p), "ref": paths.relative(p), "kind": "native", "size": p.stat().st_size})
+                    except (OSError, PermissionError, ValueError):
                         pass
+        from nanoforge.imports import load_registry
+        imported = load_registry(paths.root / "models/imports.json")
+        models.extend({"path": entry.name, "ref": entry.name, "name": entry.name, "kind": "imported", "backend": entry.backend, "source": entry.source} for entry in imported.values())
         return {"ok": True, "models": models[:200]}
 
     @app.get("/api/model/imports")
     def model_imports():
         try:
             from nanoforge.imports import load_registry
-            reg = load_registry()
+            reg = load_registry(paths.root / "models/imports.json")
             return {"ok": True, "models": [{"name": k, **vars(v)} for k, v in reg.items()]}
         except Exception as exc:
             return {"ok": False, "models": [], "error": str(exc)}
@@ -851,7 +992,12 @@ def create_app(run_dir: str = "runs/nanoforge"):
     def model_import(req: ImportRequest):
         try:
             from nanoforge.imports import import_model
-            entry = import_model(req.source, req.name, tokenizer=req.tokenizer, backend=req.backend)
+            source = confined(req.source)
+            if not source.exists():
+                raise ValueError("Imported studio models must exist in the selected workspace")
+            if req.tokenizer:
+                confined(req.tokenizer)
+            entry = import_model(paths.relative(source), req.name, tokenizer=req.tokenizer, backend=req.backend, registry_file=paths.root / "models/imports.json")
             return {"ok": True, "entry": vars(entry)}
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
@@ -861,6 +1007,274 @@ def create_app(run_dir: str = "runs/nanoforge"):
         from nanoforge.registry import TASK_HEADS, ensure_registry_ready
         ensure_registry_ready()
         return {"ok": True, "tasks": TASK_HEADS.names()}
+
+    def project_info(value):
+        from nanoforge.agent.project import (
+            build_project_runtime,
+            load_project_manifest,
+            project_workspace,
+        )
+        source = confined(value)
+        if source.stat().st_size > policy.max_request_bytes:
+            raise HTTPException(413, "Project manifest exceeds byte limit")
+        manifest = load_project_manifest(source)
+        confined(project_workspace(manifest, source))
+        workspace, registry, budget = build_project_runtime(manifest, source)
+        return source, manifest, workspace, registry, budget
+
+    @app.get("/api/workspace")
+    def workspace_status():
+        return {"ok": True, "workspace": ".", "run_dir": paths.relative(run_path), "resources": {"max_request_bytes": policy.max_request_bytes, "max_concurrency": policy.max_concurrency, "request_timeout": policy.request_timeout, "max_new_tokens": policy.max_new_tokens, "active_inference": runner.active}}
+
+    @app.post("/api/runs/select")
+    def select_run(req: PathRequest):
+        nonlocal run_path
+        run_path = confined(req.path)
+        return {"ok": True, "run_dir": paths.relative(run_path)}
+
+    @app.get("/api/projects/schema")
+    def project_schema():
+        from nanoforge.agent.project import _DEFAULT_BUDGETS, _SCHEMA_VERSION, ProjectManifest
+        defaults = ProjectManifest(_SCHEMA_VERSION, "workspace-agent", ".", "manual", ("repo.list_files", "repo.read_file", "repo.search"), frozenset({"workspace.read"}), "read_only", dict(_DEFAULT_BUDGETS)).to_dict()
+        return {"ok": True, "schema_version": _SCHEMA_VERSION, "defaults": defaults, "provider_kinds": ["manual", "native", "imported"], "approval_modes": ["read_only", "interactive"]}
+
+    @app.get("/api/projects")
+    def project_list():
+        projects, skipped = [], 0
+        candidates = list(paths.root.glob("*.yaml")) + list((paths.root / "configs").glob("*.yaml")) + list((paths.root / ".latticekin/projects").glob("*.yaml"))
+        for source in candidates[:500]:
+            try:
+                _, manifest, _, _, _ = project_info(source)
+                projects.append({"path": paths.relative(source), "name": manifest.name, "provider_kind": manifest.provider_kind, "fingerprint": manifest.fingerprint})
+            except (ValueError, OSError, HTTPException):
+                skipped += 1
+        return {"ok": True, "projects": projects, "skipped": skipped}
+
+    @app.post("/api/projects/load")
+    def project_load(req: PathRequest):
+        try:
+            source, manifest, _, registry, _ = project_info(req.path)
+            return {"ok": True, "path": paths.relative(source), "project": manifest.to_dict(), "tools": registry.schema(), "fingerprint": manifest.fingerprint}
+        except (ValueError, OSError) as exc:
+            return {"ok": False, "error": str(exc)}
+
+    @app.post("/api/projects/save")
+    def project_save(req: ProjectSaveRequest):
+        import tempfile
+
+        import yaml
+        target = confined(req.path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        descriptor, temporary = tempfile.mkstemp(prefix=".project-", suffix=".yaml", dir=target.parent)
+        os.close(descriptor)
+        try:
+            Path(temporary).write_text(yaml.safe_dump(req.project, sort_keys=False), encoding="utf-8")
+            _, manifest, _, registry, _ = project_info(temporary)
+            atomic_text(target, yaml.safe_dump(manifest.to_dict(), sort_keys=False))
+            return {"ok": True, "path": paths.relative(target), "project": manifest.to_dict(), "tools": registry.schema()}
+        except (ValueError, OSError) as exc:
+            return {"ok": False, "error": str(exc)}
+        finally:
+            Path(temporary).unlink(missing_ok=True)
+
+    @app.get("/api/projects/context")
+    def project_context(path: str):
+        _, manifest, workspace, _, _ = project_info(path)
+        files, used = [], 0
+        limit = int(manifest.budgets.get("max_context_bytes", 262144))
+        for value in manifest.resources["context_paths"]:
+            remaining = min(workspace.max_file_bytes, limit - used)
+            if remaining <= 0:
+                break
+            document = workspace.read_file(value, max_bytes=remaining)
+            used += len(document["text"].encode("utf-8"))
+            files.append(document)
+        return {"ok": True, "files": files, "resources": {"context_bytes": used, "max_context_bytes": limit}, "truncated": len(files) < len(manifest.resources["context_paths"])}
+
+    def agent_snapshot(run):
+        with agent_lock:
+            approvals = [{key: value for key, value in pending.items() if key not in {"event", "approved"}} for pending in run["pending"].values()]
+            return {"run_id": run["run_id"], "project_path": run["project_path"], "state": run["state"], "done": run["done"], "error": run["error"], "result": run["result"], "pending_approvals": approvals, "resources": run["budget"].snapshot(), "trace_path": run["trace_path"]}
+
+    @app.post("/api/agent/runs")
+    def agent_start(req: AgentStartRequest):
+        from dataclasses import asdict
+
+        from nanoforge.agent.actions import decode_action
+        from nanoforge.agent.harness import AgentHarness
+        from nanoforge.agent.project import (
+            build_project_provider,
+            project_context_items,
+            project_policy,
+        )
+        from nanoforge.agent.protocol import CancellationToken, InMemoryTrace
+        source, manifest, workspace, registry, budget = project_info(req.project_path)
+        if manifest.provider_kind == "manual" and not req.actions:
+            raise HTTPException(422, "Manual projects require an explicit action sequence")
+        for action in req.actions or ():
+            try:
+                decode_action(json.dumps(action, allow_nan=False))
+            except ValueError as exc:
+                raise HTTPException(422, str(exc)) from exc
+        run_id = uuid.uuid4().hex
+        trace_file = confined(workspace.root / manifest.trace_dir / (run_id + ".json"))
+        trace = InMemoryTrace(run_id, path=trace_file)
+        cancellation = CancellationToken()
+        run = {"run_id": run_id, "project_path": paths.relative(source), "state": "queued", "done": False, "error": None, "result": None, "pending": {}, "budget": budget, "trace": trace, "trace_path": paths.relative(trace_file), "cancellation": cancellation}
+        with agent_lock:
+            if len(agent_runs) >= 64:
+                finished = next((key for key, value in agent_runs.items() if value["done"]), None)
+                if finished is None:
+                    raise HTTPException(429, "Agent run retention limit reached")
+                agent_runs.pop(finished)
+            agent_runs[run_id] = run
+
+        class InteractiveApproval:
+            def approve(self, call, spec):
+                approval_id = uuid.uuid4().hex
+                pending = {"approval_id": approval_id, "tool": spec.name, "arguments": call.arguments, "event": threading.Event(), "approved": False}
+                with agent_lock:
+                    run["pending"][approval_id] = pending
+                    run["state"] = "awaiting_approval"
+                try:
+                    while not cancellation.cancelled and budget.remaining_seconds() > 0:
+                        if pending["event"].wait(min(.1, budget.remaining_seconds())):
+                            return pending["approved"]
+                    return False
+                finally:
+                    with agent_lock:
+                        run["pending"].pop(approval_id, None)
+                        run["state"] = "running"
+
+        def execute(cancel):
+            cancellation._event = cancel
+            run["state"] = "running"
+            try:
+                provider = build_project_provider(manifest, source, manual_actions=req.actions)
+                capability_policy, approval = project_policy(manifest, approval=InteractiveApproval())
+                context_items = project_context_items(manifest, workspace)
+                result = AgentHarness(registry).run(req.request, provider, budget=budget, cancellation=cancellation, trace=trace, trace_path=trace_file, context_items=context_items, executor_kwargs={"policy": capability_policy, "approval": approval, "capabilities": manifest.capabilities})
+                run["result"] = json_safe(asdict(result))
+                run["state"] = result.status
+                return {"run_id": run_id, "status": result.status, "trace_path": paths.relative(trace_file)}
+            except Exception as exc:
+                run["error"], run["state"] = str(exc), "failed"
+                raise
+            finally:
+                run["done"] = True
+
+        try:
+            job_id = jobs.start_callable(execute, job_type="agent", run_dir=paths.relative(workspace.root))
+        except RuntimeError as exc:
+            agent_runs.pop(run_id, None)
+            raise HTTPException(429, str(exc)) from exc
+        run["job_id"] = job_id
+        return {"ok": True, "run_id": run_id, "job_id": job_id}
+
+    def find_agent(run_id):
+        if run_id not in agent_runs:
+            raise HTTPException(404, "Agent run not found")
+        return agent_runs[run_id]
+
+    @app.get("/api/agent/runs")
+    def agent_list():
+        return {"ok": True, "runs": [agent_snapshot(run) for run in reversed(list(agent_runs.values()))]}
+
+    @app.post("/api/projects/evaluate")
+    def project_evaluate(req: PathRequest):
+        from nanoforge.agent.project import evaluate_project_model
+        from nanoforge.agent.protocol import CancellationToken
+        source, manifest, workspace, _, _ = project_info(req.path)
+        if manifest.provider_kind == "manual" or not manifest.eval_suite:
+            raise HTTPException(422, "Project evaluation requires a selected model and eval_suite")
+        def evaluate(cancel):
+            return evaluate_project_model(manifest, source, cancellation=CancellationToken(cancel))
+        try:
+            job_id = jobs.start_callable(evaluate, job_type="project_evaluation", run_dir=paths.relative(workspace.root))
+        except RuntimeError as exc:
+            raise HTTPException(429, str(exc)) from exc
+        return {"ok": True, "job_id": job_id}
+
+    @app.get("/api/agent/runs/{run_id}")
+    def agent_status(run_id: str):
+        return {"ok": True, "run": agent_snapshot(find_agent(run_id))}
+
+    @app.get("/api/agent/runs/{run_id}/trace")
+    def agent_trace(run_id: str):
+        return {"ok": True, "events": find_agent(run_id)["trace"].to_list()}
+
+    @app.post("/api/agent/runs/{run_id}/approve")
+    def agent_approve(run_id: str, req: ApprovalRequest):
+        run = find_agent(run_id)
+        with agent_lock:
+            pending = run["pending"].get(req.approval_id)
+            if pending is None or pending["event"].is_set() or run["cancellation"].cancelled:
+                raise HTTPException(409, "Approval is no longer pending")
+            pending["approved"] = req.approved
+            pending["event"].set()
+        return {"ok": True}
+
+    @app.post("/api/agent/runs/{run_id}/cancel")
+    def agent_cancel(run_id: str):
+        run = find_agent(run_id)
+        run["cancellation"].cancel()
+        jobs.cancel(run["job_id"])
+        return {"ok": True}
+
+    @app.post("/api/agent/replay")
+    def agent_replay(req: ReplayRequest):
+        from nanoforge.agent.harness import ReplayRunner
+        if bool(req.path) == bool(req.run_id):
+            raise HTTPException(422, "Provide exactly one run_id or trace path")
+        value = confined(req.path) if req.path else find_agent(req.run_id)["trace"]
+        return {"ok": True, "replay": ReplayRunner().replay(value)}
+
+    @app.get("/api/evaluations/suites")
+    def evaluation_suites():
+        from nanoforge.evaluation.catalog import list_task_suites
+        return {"ok": True, "suites": list_task_suites(paths.root)}
+
+    @app.post("/api/evaluations/run")
+    def evaluation_start(req: EvaluationRequest):
+        suite, output = confined(req.suite_path), confined(req.output_dir)
+        from nanoforge.evaluation.suite import load_task_suite
+        load_task_suite(suite)
+        model_ref = req.model_ref
+        flag = "--checkpoint" if Path(model_ref).suffix.lower() in {".pt", ".pth"} else "--model"
+        if flag == "--checkpoint":
+            model_ref = str(confined(model_ref))
+        else:
+            from nanoforge.imports import load_registry
+            entry = load_registry(paths.root / "models/imports.json").get(model_ref)
+            local = confined(entry.source if entry else model_ref)
+            if not local.exists():
+                raise HTTPException(422, "Evaluation model must exist locally")
+        command = [sys.executable, "-m", "nanoforge", "evaluate-suite", "--suite", str(suite), flag, model_ref, "--out", str(output)]
+        try:
+            job_id = jobs.start_process(command, job_type="evaluation", run_dir=paths.relative(output))
+        except RuntimeError as exc:
+            raise HTTPException(429, str(exc)) from exc
+        return {"ok": True, "job_id": job_id}
+
+    @app.get("/api/evaluations/reports")
+    def evaluation_reports():
+        from nanoforge.evaluation.catalog import list_evaluation_reports
+        return {"ok": True, "reports": list_evaluation_reports(paths.root)}
+
+    @app.get("/api/evaluations/report")
+    def evaluation_report(path: str):
+        from nanoforge.evaluation.catalog import load_evaluation_report
+        return {"ok": True, **load_evaluation_report(confined(path))}
+
+    @app.post("/api/evaluations/compare")
+    def evaluation_compare(req: CompareRequest):
+        from nanoforge.evaluation.catalog import compare_evaluation_reports
+        return {"ok": True, "comparison": compare_evaluation_reports([confined(value) for value in req.report_paths])}
+
+    @app.get("/api/artifacts")
+    def artifacts():
+        from nanoforge.artifacts import list_artifact_manifests
+        return {"ok": True, "artifacts": list_artifact_manifests(paths.root)}
 
     @app.get("/favicon.ico")
     def favicon():
@@ -882,9 +1296,10 @@ def create_app(run_dir: str = "runs/nanoforge"):
     return app
 
 
-def serve_webapp(run_dir: str = "runs/nanoforge", host: str = "127.0.0.1", port: int = 7860):
+def serve_webapp(run_dir: str = "runs/nanoforge", host: str = "127.0.0.1", port: int = 7860, *, api_key=None, workspace_root=None, max_request_bytes=2 * 1024 * 1024, max_concurrency=2, request_timeout=120.0, allowed_origins=None):
     try:
         import uvicorn
     except Exception as exc:
         raise RuntimeError("Install serve extras: pip install -e .[serve]") from exc
-    uvicorn.run(create_app(run_dir), host=host, port=port)
+    policy = ServingPolicy(host=host, api_key=api_key, max_request_bytes=max_request_bytes, max_concurrency=max_concurrency, request_timeout=request_timeout, allowed_origins=tuple(allowed_origins or ()))
+    uvicorn.run(create_app(run_dir, workspace_root=workspace_root, policy=policy), host=host, port=port)

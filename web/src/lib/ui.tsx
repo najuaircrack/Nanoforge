@@ -38,7 +38,7 @@ type BtnProps = {
 export function Button({ children, onClick, disabled, variant = 'default', icon, style, title }: BtnProps) {
   const cls = variant === 'primary' ? 'btn btn-primary' : variant === 'ghost' ? 'btn btn-ghost' : 'btn'
   return (
-    <button className={cls} onClick={onClick} disabled={disabled} style={style} title={title}>
+    <button type="button" className={cls} onClick={onClick} disabled={disabled} style={style} title={title}>
       {icon}{children}
     </button>
   )
@@ -61,7 +61,7 @@ export function StatusText({ msg }: { msg: string }) {
   if (!msg) return null
   const ok = msg.startsWith('✓')
   const err = /error/i.test(msg)
-  return <div style={{ fontSize: 12, color: ok ? 'var(--color-pos)' : err ? 'var(--color-neg)' : 'var(--color-ink-2)' }}>{msg}</div>
+  return <div role={err ? 'alert' : 'status'} aria-live="polite" style={{ fontSize: 12, color: ok ? 'var(--color-pos)' : err ? 'var(--color-neg)' : 'var(--color-ink-2)' }}>{msg}</div>
 }
 
 export function LogBox({ lines, running, minHeight = 220, maxHeight = 440 }: { lines: string[]; running?: boolean; minHeight?: number; maxHeight?: number }) {
@@ -162,7 +162,7 @@ export function Tabs<T extends string>({ tabs, active, onChange }: {
   return (
     <div style={{ display: 'flex', gap: 2, background: 'var(--color-surface-2)', padding: 3, borderRadius: 10, border: '1px solid var(--color-line)' }}>
       {tabs.map(t => (
-        <button key={t.id} onClick={() => onChange(t.id)} style={{
+        <button type="button" aria-pressed={active === t.id} key={t.id} onClick={() => onChange(t.id)} style={{
           padding: '6px 14px', borderRadius: 8, border: 'none', cursor: 'pointer',
           fontSize: 13, fontWeight: 500, whiteSpace: 'nowrap',
           background: active === t.id ? 'var(--color-accent)' : 'transparent',
@@ -177,7 +177,7 @@ export function Tabs<T extends string>({ tabs, active, onChange }: {
 // On/off toggle switch.
 export function Toggle({ checked, onChange, label }: { checked: boolean; onChange: (v: boolean) => void; label?: ReactNode }) {
   return (
-    <button onClick={() => onChange(!checked)} style={{
+    <button type="button" role="switch" aria-checked={checked} aria-label={typeof label === 'string' ? label : 'Toggle'} onClick={() => onChange(!checked)} style={{
       display: 'flex', alignItems: 'center', gap: 9, border: 'none', background: 'transparent',
       cursor: 'pointer', padding: 0, color: 'var(--color-ink)', fontSize: 13,
     }}>
@@ -206,7 +206,7 @@ export function Slider({ value, min, max, step = 1, onChange, format, label }: {
 }) {
   const row = (
     <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-      <input type="range" min={min} max={max} step={step} value={value}
+      <input aria-label={label ?? 'Parameter'} type="range" min={min} max={max} step={step} value={value}
         onChange={e => onChange(+e.target.value)} style={{ flex: 1, accentColor: 'var(--color-accent)' }} />
       <span style={{ fontFamily: 'var(--font-mono)', fontSize: 12, color: 'var(--color-ink)', minWidth: 54, textAlign: 'right' }}>
         {format ? format(value) : value}

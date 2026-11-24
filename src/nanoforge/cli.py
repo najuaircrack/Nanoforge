@@ -33,7 +33,7 @@ def cmd_registries(args: argparse.Namespace) -> None:
 def cmd_validate_config(args: argparse.Namespace) -> None:
     from nanoforge.config import load_config
 
-    cfg = load_config(args.config)
+    cfg = load_config(args.config, strict=not args.allow_unknown)
     print("valid: true")
     print(f"block: {cfg.model.block_type}")
     print(f"attention: {cfg.model.attention_backend}")
@@ -408,6 +408,43 @@ def cmd_train(args: argparse.Namespace) -> None:
     run_training_with_optional_tui(args.config, no_tui=getattr(args, "no_tui", False))
 
 
+def cmd_adapt(args: argparse.Namespace) -> None:
+    import json
+
+    from nanoforge.training.pretrained import PretrainedAdaptationConfig, train_pretrained
+
+    path = Path(args.config)
+    if path.stat().st_size > 65536:
+        raise ValueError("Adaptation config exceeds 64 KiB.")
+    values = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(values, dict):
+        raise ValueError("Adaptation config must be a JSON object.")
+    print(json.dumps(train_pretrained(PretrainedAdaptationConfig(**values)), indent=2))
+
+
+def _serving_options(args: argparse.Namespace) -> dict:
+    import os
+
+    return {
+        "api_key": os.environ.get(args.api_key_env),
+        "workspace_root": args.workspace,
+        "max_request_bytes": args.max_request_bytes,
+        "max_concurrency": args.max_concurrency,
+        "request_timeout": args.request_timeout,
+        "allowed_origins": args.allowed_origin,
+    }
+
+
+def _add_serving_options(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--api-key-env", default="LATTICEKIN_API_KEY",
+                        help="Environment variable containing the server API key.")
+    parser.add_argument("--workspace", default=".", help="Root for server file access.")
+    parser.add_argument("--max-request-bytes", type=int, default=2 * 1024 * 1024)
+    parser.add_argument("--max-concurrency", type=int, default=2)
+    parser.add_argument("--request-timeout", type=float, default=120.0)
+    parser.add_argument("--allowed-origin", action="append", help="Allowed browser origin; repeatable.")
+
+
 def cmd_web(args: argparse.Namespace) -> None:
     import webbrowser
 
@@ -420,13 +457,83 @@ def cmd_web(args: argparse.Namespace) -> None:
             webbrowser.open(url)
         except Exception:
             pass
-    serve_webapp(args.run, args.host, args.port)
+    serve_webapp(args.run, args.host, args.port, **_serving_options(args))
 
 
 def cmd_tui(args: argparse.Namespace) -> None:
     from nanoforge.tui import launch_tui
 
-    launch_tui(run_dir=args.run)
+    launch_tui(run_dir=args.run, project=args.project)
+
+
+class _TerminalApproval:
+    def approve(self, call, spec) -> bool:
+        import json
+
+        print(f"Approval required for {spec.name}:\n"
+              f"{json.dumps(call.arguments, indent=2, ensure_ascii=False)}", file=sys.stderr)
+        try:
+            return input("Allow this action? [y/N] ").strip().lower() in {"y", "yes"}
+        except (EOFError, KeyboardInterrupt):
+            return False
+
+
+def cmd_agent_run(args: argparse.Namespace) -> None:
+    import json
+    from dataclasses import asdict
+
+    from nanoforge.agent import (
+        AgentHarness,
+        CancellationToken,
+        InMemoryTrace,
+        build_project_provider,
+        build_project_runtime,
+        load_project_manifest,
+        project_context_items,
+        project_policy,
+        project_workspace,
+    )
+
+    manifest = load_project_manifest(args.project)
+    actions = None
+    if args.actions:
+        path = Path(args.actions)
+        if path.stat().st_size > 1048576:
+            raise ValueError("Manual actions exceed 1 MiB.")
+        actions = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(actions, list) or any(not isinstance(action, dict) for action in actions):
+            raise ValueError("Manual actions must be a JSON array of action objects.")
+    workspace, registry, budget = build_project_runtime(manifest, args.project)
+    provider = build_project_provider(manifest, args.project, manual_actions=actions)
+    policy, approval = project_policy(manifest, _TerminalApproval())
+    root = project_workspace(manifest, args.project)
+    trace = InMemoryTrace()
+    trace_path = (root / manifest.trace_dir / f"{trace.run_id}.json").resolve()
+    if not trace_path.is_relative_to(root):
+        raise ValueError("Trace directory escapes project workspace.")
+    cancellation = CancellationToken()
+    try:
+        result = AgentHarness(registry).run(
+            args.request, provider, budget=budget, cancellation=cancellation,
+            trace=trace, trace_path=trace_path,
+            context_items=project_context_items(manifest, workspace),
+            executor_kwargs={"capabilities": manifest.capabilities,
+                             "policy": policy, "approval": approval},
+        )
+    except KeyboardInterrupt:
+        cancellation.cancel("operator interrupted run")
+        raise SystemExit(130) from None
+    output = asdict(result)
+    output["trace_path"] = trace_path.relative_to(root).as_posix()
+    print(json.dumps(output, indent=2, ensure_ascii=False))
+
+
+def cmd_agent_replay(args: argparse.Namespace) -> None:
+    import json
+
+    from nanoforge.agent import ReplayRunner
+
+    print(json.dumps(ReplayRunner().replay(args.trace), indent=2, ensure_ascii=False))
 
 
 def _sampling_from_args(args: argparse.Namespace):
@@ -434,6 +541,11 @@ def _sampling_from_args(args: argparse.Namespace):
 
     return SamplingConfig(
         mode=args.mode,
+        sampler="beam" if args.beams > 1 else args.sampler,
+        num_beams=args.beams,
+        length_penalty=args.length_penalty,
+        contrastive_alpha=args.contrastive_alpha,
+        contrastive_top_k=args.contrastive_top_k,
         temperature=args.temperature,
         top_k=args.top_k,
         top_p=args.top_p,
@@ -447,17 +559,15 @@ def _sampling_from_args(args: argparse.Namespace):
         repetition_window=args.repetition_window,
         repetition_threshold=args.repetition_threshold,
         mirostat=args.mirostat,
+        mirostat_version=args.mirostat_version,
+        mirostat_tau=args.mirostat_tau,
+        mirostat_eta=args.mirostat_eta,
     )
 
 
 def cmd_generate(args: argparse.Namespace) -> None:
     engine = _load_generation_engine(args)
-    if args.beams > 1:
-        if not hasattr(engine, "beam_search"):
-            raise SystemExit("Beam search is only available for native Nanoforge checkpoints.")
-        print(engine.beam_search(args.prompt, args.max_new_tokens, args.beams))
-    else:
-        print(engine.complete(args.prompt, args.max_new_tokens, _sampling_from_args(args), args.stop_token))
+    print(engine.complete(args.prompt, args.max_new_tokens, _sampling_from_args(args), args.stop_token))
 
 
 def cmd_chat(args: argparse.Namespace) -> None:
@@ -483,27 +593,30 @@ def cmd_chat(args: argparse.Namespace) -> None:
     print("Nanoforge chat. Press Ctrl+C or submit an empty prompt to exit.")
     if system:
         print(f"[system] {system}")
+    messages: list[tuple[str, str]] = []
     try:
         while True:
             prompt = input("\nuser> ").strip()
             if not prompt:
                 return
             print("assistant> ", end="", flush=True)
+            messages.append(("user", prompt))
             # Personal question with a confident KB hit -> answer directly.
             fact = answerer.answer(prompt) if answerer is not None else None
             if fact is not None:
                 print(fact)
+                messages.append(("assistant", fact))
                 continue
-            # This pipeline packs each assistant turn conditioned on the system
-            # prompt + most recent user turn (see data/modes._chat_prefix), so we
-            # condition inference the same way to match training.
+            response: list[str] = []
             for chunk in engine.chat_stream(
-                [("user", prompt)],
+                messages,
                 args.max_new_tokens,
                 _sampling_from_args(args),
                 system=system,
             ):
+                response.append(chunk)
                 print(chunk, end="", flush=True)
+            messages.append(("assistant", "".join(response)))
             print()
     except KeyboardInterrupt:
         print()
@@ -529,7 +642,8 @@ def _load_generation_engine(args: argparse.Namespace):
     if getattr(args, "model", None):
         from nanoforge.imports import load_imported_engine
 
-        return load_imported_engine(args.model, device=args.device)
+        return load_imported_engine(args.model, device=args.device,
+                                    allow_network=getattr(args, "allow_network", False))
     if not getattr(args, "checkpoint", None):
         raise SystemExit("Provide --checkpoint for a Nanoforge checkpoint or --model for an imported model.")
     from nanoforge.generation.engine import GenerationEngine
@@ -540,7 +654,8 @@ def _load_generation_engine(args: argparse.Namespace):
 def cmd_import_model(args: argparse.Namespace) -> None:
     from nanoforge.imports import import_model
 
-    entry = import_model(args.model, args.name, tokenizer=args.tokenizer, backend=args.backend)
+    entry = import_model(args.model, args.name, tokenizer=args.tokenizer, backend=args.backend,
+                         replace=args.replace)
     print(f"imported: {entry.name}")
     print(f"backend: {entry.backend}")
     print(f"format: {entry.format}")
@@ -711,7 +826,7 @@ def cmd_auto_train(args: argparse.Namespace) -> None:
 def cmd_serve(args: argparse.Namespace) -> None:
     from nanoforge.server import serve
 
-    serve(args.checkpoint, args.host, args.port, args.device)
+    serve(args.checkpoint, args.host, args.port, args.device, **_serving_options(args))
 
 
 def cmd_export(args: argparse.Namespace) -> None:
@@ -720,7 +835,7 @@ def cmd_export(args: argparse.Namespace) -> None:
 
     if args.format == "onnx":
         engine = GenerationEngine.from_checkpoint(args.checkpoint, device=args.device)
-        export_onnx(engine.model, args.out)
+        export_onnx(engine.model, args.out, config=engine.config)
     else:
         from nanoforge.export.gguf import export_gguf
         engine = GenerationEngine.from_checkpoint(args.checkpoint, device="cpu")
@@ -801,14 +916,14 @@ def cmd_evaluate_suite(args: argparse.Namespace) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="nanoforge")
+    parser = argparse.ArgumentParser(prog="latticekin", description="Local-first AI agent platform for CPU and GPU.")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     p = sub.add_parser("params", help="Estimate model parameter count.")
     p.add_argument("--config", required=True)
     p.set_defaults(func=cmd_params)
 
-    p = sub.add_parser("registries", help="List registered Nanoforge component keys.")
+    p = sub.add_parser("registries", help="List registered Latticekin component keys.")
     p.add_argument(
         "--name",
         choices=[
@@ -832,6 +947,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("validate-config", help="Load a config and validate registry-backed keys.")
     p.add_argument("--config", required=True)
+    p.add_argument("--allow-unknown", action="store_true",
+                   help="Compatibility mode: warn about unknown keys instead of rejecting them.")
     p.set_defaults(func=cmd_validate_config)
 
     p = sub.add_parser("new-config", help="Interactively create a CPU-friendly training config.")
@@ -881,6 +998,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--name", required=True)
     p.add_argument("--tokenizer", help="Optional tokenizer path/name for ONNX or custom imports.")
     p.add_argument("--backend", choices=["llama_cpp", "transformers", "onnxruntime", "safetensors"])
+    p.add_argument("--replace", action="store_true", help="Explicitly replace an existing model alias.")
     p.set_defaults(func=cmd_import_model)
 
     p = sub.add_parser("train-tokenizer", help="Train a BPE, WordPiece, or SentencePiece tokenizer.")
@@ -1033,6 +1151,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-tui", action="store_true", help="Disable the live terminal UI even on an interactive TTY.")
     p.set_defaults(func=cmd_train)
 
+    p = sub.add_parser("adapt", help="Adapt a local pretrained model using full, LoRA or CUDA QLoRA training.")
+    p.add_argument("--config", required=True, help="Pretrained adaptation JSON config.")
+    p.set_defaults(func=cmd_adapt)
+
     p = sub.add_parser("pipeline", help="Run a multi-stage training recipe (e.g. pretrain -> SFT -> DPO).")
     p.add_argument("--config", required=True, help="Recipe YAML (see configs/recipes/).")
     p.add_argument("--output-dir", help="Override the recipe's output_dir.")
@@ -1058,13 +1180,25 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("tui", help="Launch the full-scope terminal UI.")
     p.add_argument("--run", default="runs/nanoforge", help="Run directory to monitor.")
+    p.add_argument("--project", help="Project manifest for the bounded harness console.")
     p.set_defaults(func=cmd_tui)
+
+    p = sub.add_parser("agent-run", help="Run a bounded project agent with explicit tool approvals.")
+    p.add_argument("--project", required=True, help="Versioned project YAML manifest.")
+    p.add_argument("--request", required=True)
+    p.add_argument("--actions", help="JSON action array, required for the manual provider.")
+    p.set_defaults(func=cmd_agent_run)
+
+    p = sub.add_parser("agent-replay", help="Reconstruct a saved trace without applying side effects.")
+    p.add_argument("--trace", required=True)
+    p.set_defaults(func=cmd_agent_replay)
 
     p = sub.add_parser("web", help="Launch the full-scope web UI (React SPA + FastAPI).")
     p.add_argument("--run", default="runs/nanoforge", help="Run directory to monitor.")
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--port", type=int, default=7860)
     p.add_argument("--no-browser", action="store_true", help="Do not auto-open a browser.")
+    _add_serving_options(p)
     p.set_defaults(func=cmd_web)
 
     for name, help_text, func in [
@@ -1074,6 +1208,7 @@ def build_parser() -> argparse.ArgumentParser:
         p = sub.add_parser(name, help=help_text)
         p.add_argument("--checkpoint")
         p.add_argument("--model", help="Imported model name or external model path/HuggingFace id.")
+        p.add_argument("--allow-network", action="store_true", help="Permit downloading an imported model.")
         p.add_argument("--prompt", default="")
         p.add_argument("--device", default="auto")
         p.add_argument("--max-new-tokens", type=int, default=256)
@@ -1110,7 +1245,14 @@ def build_parser() -> argparse.ArgumentParser:
             help="Minimum retrieval similarity to answer from facts (else defer to the model).",
         )
         p.add_argument("--mirostat", action="store_true")
+        p.add_argument("--mirostat-version", type=int, choices=[1, 2], default=2)
+        p.add_argument("--mirostat-tau", type=float, default=5.0)
+        p.add_argument("--mirostat-eta", type=float, default=0.1)
+        p.add_argument("--sampler", choices=["top_k_top_p", "mirostat", "beam", "contrastive"], default="top_k_top_p")
         p.add_argument("--beams", type=int, default=1)
+        p.add_argument("--length-penalty", type=float, default=0.8)
+        p.add_argument("--contrastive-alpha", type=float, default=0.6)
+        p.add_argument("--contrastive-top-k", type=int, default=4)
         p.set_defaults(func=func)
 
     p = sub.add_parser("serve", help="Run the FastAPI inference server.")
@@ -1118,6 +1260,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--port", type=int, default=8000)
     p.add_argument("--device", default="auto")
+    _add_serving_options(p)
     p.set_defaults(func=cmd_serve)
 
     p = sub.add_parser("export", help="Export model to GGUF (binary) or ONNX format.")
@@ -1158,6 +1301,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--out", required=True, help="Output directory or report.json path.")
     p.add_argument("--device", default="auto")
     p.add_argument("--seed", type=int, default=1337)
+    p.add_argument("--allow-network", action="store_true", help="Permit downloading an imported model.")
     p.set_defaults(func=cmd_evaluate_suite)
 
     return parser

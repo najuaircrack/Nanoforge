@@ -1,0 +1,76 @@
+# c-tiny — a small CPU-trainable C/FIM specialist smoke model.
+# This is a reproducible coding-data workflow, not a frontier general model.
+# Prepare its ignored packed inputs with --val-fraction 0.20 for a larger held-out smoke set.
+
+model:
+  vocab_size: 260
+  max_seq_len: 128
+  d_model: 128
+  n_layers: 3
+  n_heads: 4
+  n_kv_heads: 2
+  ffn_hidden_mult: 2.0
+  dropout: 0.0
+  rope_theta: 10000.0
+  norm_eps: 1.0e-5
+  tie_embeddings: true
+  use_flash: false
+  activation: swiglu
+  normalization: rmsnorm
+  position_embedding: rope
+  attention_backend: sdpa
+  ffn_type: swiglu
+  block_type: transformer
+  gradient_checkpointing: false
+
+training:
+  mode: pretrain
+  run_name: c-tiny
+  output_dir: runs/c-tiny
+  seed: 42
+  max_steps: 300
+  batch_size: 8
+  micro_batch_size: 2
+  grad_accum_steps: 4
+  learning_rate: 3.0e-4
+  min_learning_rate: 3.0e-5
+  warmup_ratio: 0.10
+  optimizer: adamw
+  scheduler: cosine
+  weight_decay: 0.1
+  betas: [0.9, 0.95]
+  eps: 1.0e-8
+  grad_clip: 1.0
+  precision: fp32
+  gradient_checkpointing: false
+  eval_interval: 100
+  eval_steps: 5
+  save_interval: 150
+  log_interval: 25
+  health_interval: 25
+  early_stopping_patience: 10
+  tensorboard: false
+  wandb: false
+  distributed_backend: none
+  device: cpu
+
+data:
+  train_path: data/packed/c-tiny/train.bin
+  val_path: data/packed/c-tiny/val.bin
+  tokenizer_type: byte
+  tokenizer_path: null
+  seq_len: 128
+  mode: fim
+  loss_masking: none
+  tokenizer_batch_size: 32
+  num_workers: 0
+  pin_memory: false
+
+inference:
+  mode: deterministic
+  max_new_tokens: 96
+  temperature: 0.2
+  top_k: 1
+  top_p: null
+  repetition_penalty: 1.0
+  deterministic: true

@@ -2,16 +2,16 @@ import { useEffect, useRef, useState } from 'react'
 import { Send, Loader2, Bot, ChevronDown, Database, Sliders, Sparkles } from 'lucide-react'
 import ReactMarkdown from 'react-markdown'
 import { useQuery } from '@tanstack/react-query'
-import { get, post } from '../lib/api'
+import { get, post, authHeaders, consumeSSE, errorMessage } from '../lib/api'
 import { Slider } from '../lib/ui'
 
-type Msg = { role: 'user' | 'assistant'; content: string }
+type Msg = { role: 'user' | 'assistant'; content: string; source?: string; error?: boolean }
 
 const STORAGE_KEY = 'nanoforge_loaded_model'
 
 export default function Chat() {
-  const [loaded, setLoaded] = useState(() => localStorage.getItem(STORAGE_KEY) ?? '')
-  const [loading, setLoading] = useState(false)
+  const [loaded, setLoaded] = useState('')
+  const [loading, setLoading] = useState(true)
   const [msgs, setMsgs] = useState<Msg[]>([])
   const [input, setInput] = useState('')
   const [busy, setBusy] = useState(false)
@@ -34,51 +34,53 @@ export default function Chat() {
   const [showFacts, setShowFacts] = useState(false)
   const endRef = useRef<HTMLDivElement>(null)
   const taRef = useRef<HTMLTextAreaElement>(null)
+  const streamAbort = useRef<AbortController | null>(null)
 
   const { data: modelData } = useQuery({ queryKey: ['models'], queryFn: () => get('/api/model/list') })
-  const models: any[] = modelData?.models ?? []
+  const { data: importData } = useQuery({ queryKey: ['imports'], queryFn: () => get('/api/model/imports') })
+  const models: any[] = [...(modelData?.models ?? []).map((model: any) => ({ ...model, path: model.ref ?? model.path ?? model.name })), ...(importData?.models ?? []).map((model: any) => ({ ...model, path: model.ref ?? model.name, kind: 'imported' }))].filter((model, index, list) => list.findIndex(other => other.path === model.path) === index)
 
-  // Restore loaded model state from server on mount
+  // Server state is authoritative, including an empty engine after restart.
   useEffect(() => {
-    get('/api/chat/status').then(r => {
-      if (r.loaded) { setLoaded(r.loaded); localStorage.setItem(STORAGE_KEY, r.loaded) }
-    }).catch(() => {})
-    get('/api/rag/status').then(r => {
-      if (r.loaded) { setRagLoaded(r.loaded); setRagPath(r.loaded) }
-    }).catch(() => {})
-    get('/api/facts/status').then(r => {
-      if (r.loaded) { setFactsLoaded(r.loaded); setFactsPath(r.loaded) }
-    }).catch(() => {})
+    const controller = new AbortController()
+    get('/api/chat/status', undefined, { signal: controller.signal }).then(result => {
+      setLoaded(result.loaded ?? '')
+      if (result.loaded) localStorage.setItem(STORAGE_KEY, result.loaded)
+      else localStorage.removeItem(STORAGE_KEY)
+    }).catch(error => { if (!controller.signal.aborted) setStatus('Error checking model: ' + errorMessage(error)) })
+      .finally(() => { if (!controller.signal.aborted) setLoading(false) })
+    get('/api/rag/status', undefined, { signal: controller.signal }).then(result => { setRagLoaded(result.loaded ?? ''); setRagPath(result.loaded ?? '') }).catch(() => {})
+    get('/api/facts/status', undefined, { signal: controller.signal }).then(result => { setFactsLoaded(result.loaded ?? ''); setFactsPath(result.loaded ?? '') }).catch(() => {})
+    return () => { controller.abort(); streamAbort.current?.abort() }
   }, [])
 
   async function loadRag() {
     const path = ragPath.trim()
-    if (!path) return
+    if (!path || ragBusy || busy) return
     setRagBusy(true)
-    const r = await post('/api/rag/load', { path })
-    setRagBusy(false)
-    if (r.ok) { setRagLoaded(path); setShowRag(false) }
-    else setStatus(`RAG error: ${r.error}`)
+    try { await post('/api/rag/load', { path }); setRagLoaded(path); setShowRag(false); setStatus('') }
+    catch (error) { setStatus('RAG error: ' + errorMessage(error)) }
+    finally { setRagBusy(false) }
   }
-
   async function unloadRag() {
-    await post('/api/rag/unload', {})
-    setRagLoaded(''); setShowRag(false)
+    setRagBusy(true)
+    try { await post('/api/rag/unload'); setRagLoaded(''); setShowRag(false) }
+    catch (error) { setStatus('RAG error: ' + errorMessage(error)) }
+    finally { setRagBusy(false) }
   }
-
   async function loadFacts() {
     const path = factsPath.trim()
-    if (!path) return
+    if (!path || factsBusy || busy) return
     setFactsBusy(true)
-    const r = await post('/api/facts/load', { path })
-    setFactsBusy(false)
-    if (r.ok) { setFactsLoaded(path); setShowFacts(false) }
-    else setStatus(`Facts error: ${r.error}`)
+    try { await post('/api/facts/load', { path }); setFactsLoaded(path); setShowFacts(false); setStatus('') }
+    catch (error) { setStatus('Facts error: ' + errorMessage(error)) }
+    finally { setFactsBusy(false) }
   }
-
   async function unloadFacts() {
-    await post('/api/facts/unload', {})
-    setFactsLoaded(''); setShowFacts(false)
+    setFactsBusy(true)
+    try { await post('/api/facts/unload'); setFactsLoaded(''); setShowFacts(false) }
+    catch (error) { setStatus('Facts error: ' + errorMessage(error)) }
+    finally { setFactsBusy(false) }
   }
 
   useEffect(() => { endRef.current?.scrollIntoView({ behavior: 'smooth' }) }, [msgs])
@@ -91,72 +93,35 @@ export default function Chat() {
   }
 
   async function loadModel(path: string) {
-    if (!path || path === loaded) return
+    if (!path || busy || loading) return
     setLoading(true); setStatus('Loading…')
-    const r = await post('/api/chat/load', { path })
-    setLoading(false)
-    if (r.ok) { setLoaded(path); localStorage.setItem(STORAGE_KEY, path); setStatus('') }
-    else setStatus(`Error: ${r.error}`)
-    setShowPicker(false)
+    try { await post('/api/chat/load', { path }); setLoaded(path); localStorage.setItem(STORAGE_KEY, path); setStatus(''); setMsgs([]) }
+    catch (error) { setStatus('Error: ' + errorMessage(error)) }
+    finally { setLoading(false); setShowPicker(false) }
   }
 
   async function send() {
-    if (!input.trim() || busy || !loaded) return
-    const text = input.trim()
-    const history: Msg[] = [...msgs, { role: 'user', content: text }]
-    setMsgs(history)
-    setInput(''); setBusy(true)
+    if (!input.trim() || busy || !loaded || loading) return
+    const history: Msg[] = [...msgs.filter(message => !message.error), { role: 'user', content: input.trim() }]
+    const assistantIndex = history.length
+    setMsgs([...history, { role: 'assistant', content: '' }]); setInput(''); setBusy(true); setStatus('')
+    const controller = new AbortController(); streamAbort.current = controller
     if (taRef.current) taRef.current.style.height = 'auto'
-
-    // Add empty assistant message to stream into
-    setMsgs(m => [...m, { role: 'assistant', content: '' }])
-
     try {
-      const res = await fetch('/api/chat/stream', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          messages: history.map(m => [m.role, m.content]),
-          max_new_tokens: maxTokens,
-          temperature,
-          top_k: topK,
-        }),
+      const response = await fetch('/api/chat/stream', {
+        method: 'POST', headers: authHeaders({ 'Content-Type': 'application/json' }), signal: controller.signal,
+        body: JSON.stringify({ messages: history.map(message => [message.role, message.content]), max_new_tokens: maxTokens, temperature, top_k: topK }),
       })
-      const reader = res.body!.getReader()
-      const dec = new TextDecoder()
-      let buf = ''
-      while (true) {
-        const { done, value } = await reader.read()
-        if (done) break
-        buf += dec.decode(value, { stream: true })
-        const lines = buf.split('\n')
-        buf = lines.pop() ?? ''
-        for (const line of lines) {
-          if (!line.startsWith('data: ')) continue
-          const msg = JSON.parse(line.slice(6))
-          if (msg.type === 'chunk') {
-            setMsgs(m => {
-              const copy = [...m]
-              copy[copy.length - 1] = { role: 'assistant', content: copy[copy.length - 1].content + msg.text }
-              return copy
-            })
-          } else if (msg.type === 'error') {
-            setMsgs(m => {
-              const copy = [...m]
-              copy[copy.length - 1] = { role: 'assistant', content: `[error: ${msg.text}]` }
-              return copy
-            })
-          }
-        }
-      }
-    } catch (e: any) {
-      setMsgs(m => {
-        const copy = [...m]
-        copy[copy.length - 1] = { role: 'assistant', content: `[error: ${e.message}]` }
-        return copy
-      })
-    }
-    setBusy(false)
+      await consumeSSE(response, message => {
+        if (message.type === 'warning') { setStatus('Warning: ' + message.text); return }
+        if (message.type !== 'chunk') return
+        setMsgs(current => current.map((item, index) => index === assistantIndex ? { ...item, content: item.content + message.text, source: message.source ?? item.source } : item))
+      }, controller.signal)
+    } catch (error) {
+      const detail = controller.signal.aborted ? 'Generation cancelled' : 'Error: ' + errorMessage(error)
+      setStatus(detail)
+      setMsgs(current => current.map((item, index) => index === assistantIndex ? { ...item, content: item.content || detail, error: true } : item))
+    } finally { streamAbort.current = null; setBusy(false) }
   }
 
   const modelName = loaded ? loaded.split(/[\\/]/).pop() : null
@@ -216,6 +181,7 @@ export default function Chat() {
                   padding: '10px 14px',
                 } : { padding: '2px 0' }),
               }}>
+                {m.source && <div className="chip" style={{ marginBottom: 6 }}>Source: {m.source}</div>}
                 {m.content
                   ? <ReactMarkdown>{m.content}</ReactMarkdown>
                   : busy && i === msgs.length - 1
@@ -249,9 +215,10 @@ export default function Chat() {
             {/* Text input */}
             <textarea ref={taRef} value={input}
               onChange={e => { setInput(e.target.value); resizeTextarea() }}
-              onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send() } }}
+              aria-label="Message"
+              onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) { e.preventDefault(); send() } }}
               placeholder={loaded ? 'Message…' : 'Select a model below, then message…'}
-              disabled={!loaded || busy} rows={1}
+              disabled={!loaded || busy || loading} rows={1}
               style={{
                 border: 'none', outline: 'none', background: 'transparent', resize: 'none',
                 color: 'var(--color-ink)', fontFamily: 'var(--font-sans)', fontSize: 15,
@@ -264,7 +231,7 @@ export default function Chat() {
               <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
               {/* Model pill — Claude.ai style */}
               <div style={{ position: 'relative' }} onClick={e => e.stopPropagation()}>
-                <button onClick={() => setShowPicker(s => !s)} style={{
+                <button aria-label="Select model" aria-expanded={showPicker} disabled={loading || busy} onClick={() => setShowPicker(s => !s)} style={{
                   display: 'flex', alignItems: 'center', gap: 6,
                   padding: '5px 10px', borderRadius: 20,
                   border: '1px solid var(--color-line-2)',
@@ -294,7 +261,7 @@ export default function Chat() {
                     {models.length === 0
                       ? <div style={{ padding: '8px 10px', fontSize: 12, color: 'var(--color-ink-3)' }}>No checkpoints found in runs/</div>
                       : models.map(m => (
-                        <button key={m.path} onClick={() => loadModel(m.path)} style={{
+                        <button key={m.path} disabled={loading || busy} onClick={() => loadModel(m.path)} style={{
                           display: 'block', width: '100%', textAlign: 'left',
                           padding: '8px 10px', borderRadius: 8, border: 'none', cursor: 'pointer',
                           background: m.path === loaded ? 'var(--color-surface-3)' : 'transparent',
@@ -350,12 +317,12 @@ export default function Chat() {
                       }}
                     />
                     <div style={{ display: 'flex', gap: 6 }}>
-                      <button onClick={loadRag} disabled={ragBusy || !ragPath.trim()} style={{
+                      <button onClick={loadRag} disabled={ragBusy || busy || !ragPath.trim()} style={{
                         flex: 1, padding: '6px 0', borderRadius: 8, border: 'none', cursor: 'pointer',
                         background: 'var(--color-accent)', color: 'var(--color-accent-ink)', fontSize: 12,
                       }}>Load</button>
                       {ragLoaded && (
-                        <button onClick={unloadRag} style={{
+                        <button disabled={ragBusy || busy} onClick={unloadRag} style={{
                           padding: '6px 12px', borderRadius: 8, border: '1px solid var(--color-line-2)',
                           background: 'transparent', color: 'var(--color-ink-3)', cursor: 'pointer', fontSize: 12,
                         }}>Unload</button>
@@ -409,12 +376,12 @@ export default function Chat() {
                       }}
                     />
                     <div style={{ display: 'flex', gap: 6 }}>
-                      <button onClick={loadFacts} disabled={factsBusy || !factsPath.trim()} style={{
+                      <button onClick={loadFacts} disabled={factsBusy || busy || !factsPath.trim()} style={{
                         flex: 1, padding: '6px 0', borderRadius: 8, border: 'none', cursor: 'pointer',
                         background: 'var(--color-accent)', color: 'var(--color-accent-ink)', fontSize: 12,
                       }}>Load</button>
                       {factsLoaded && (
-                        <button onClick={unloadFacts} style={{
+                        <button disabled={factsBusy || busy} onClick={unloadFacts} style={{
                           padding: '6px 12px', borderRadius: 8, border: '1px solid var(--color-line-2)',
                           background: 'transparent', color: 'var(--color-ink-3)', cursor: 'pointer', fontSize: 12,
                         }}>Unload</button>
@@ -456,7 +423,7 @@ export default function Chat() {
               </div>
 
               {/* Send button */}
-              <button onClick={send} disabled={!loaded || busy || !input.trim()} style={{
+              <button aria-label={busy ? 'Stop generation' : 'Send message'} onClick={() => busy ? streamAbort.current?.abort() : send()} disabled={!loaded || loading || (!busy && !input.trim())} style={{
                 width: 34, height: 34, borderRadius: 10, border: 'none', flexShrink: 0,
                 background: loaded && input.trim() && !busy ? 'var(--color-accent)' : 'var(--color-surface-3)',
                 color: loaded && input.trim() && !busy ? 'var(--color-accent-ink)' : 'var(--color-ink-3)',
@@ -469,7 +436,7 @@ export default function Chat() {
             </div>
           </div>
 
-          {status && <div style={{ fontSize: 12, color: 'var(--color-neg)', marginTop: 6, paddingLeft: 4 }}>{status}</div>}
+          {status && <div role="status" aria-live="polite" style={{ fontSize: 12, color: 'var(--color-neg)', marginTop: 6, paddingLeft: 4 }}>{status}</div>}
         </div>
       </div>
 

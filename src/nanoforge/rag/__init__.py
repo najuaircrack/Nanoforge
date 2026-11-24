@@ -26,7 +26,7 @@ def load_index(index_dir: str | Path, engine=None) -> "Retriever":
     ``model`` backend, pass the loaded ``GenerationEngine`` as ``engine`` so the
     query encoder matches the one used at index time.
     """
-    from nanoforge.rag.embeddings import get_embedder
+    from nanoforge.rag.embeddings import embedding_identity, get_embedder
     from nanoforge.rag.retriever import Retriever
     from nanoforge.rag.store import NumpyVectorStore
 
@@ -35,7 +35,11 @@ def load_index(index_dir: str | Path, engine=None) -> "Retriever":
         backend=store.meta.backend,
         engine=engine,
         tfidf_state=store.meta.embedder_state,
+        strict=True,
     )
+    if store.meta.schema_version == 2 and store.meta.encoder_identity:
+        if embedding_identity(embedder) != store.meta.encoder_identity:
+            raise ValueError("index encoder identity mismatch; rebuild with the original encoder")
     return Retriever(store, embedder)
 
 

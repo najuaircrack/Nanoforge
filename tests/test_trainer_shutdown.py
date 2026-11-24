@@ -13,7 +13,9 @@ from pathlib import Path
 
 import pytest
 
-pytestmark = pytest.mark.skipif(importlib.util.find_spec("torch") is None, reason="torch not installed")
+pytestmark = pytest.mark.skipif(
+    importlib.util.find_spec("torch") is None, reason="torch not installed"
+)
 
 
 def _make_tiny_dataset(tmp_path: Path, name: str, seq_len: int = 16, n_seqs: int = 8) -> Path:
@@ -33,7 +35,9 @@ def _make_tiny_dataset(tmp_path: Path, name: str, seq_len: int = 16, n_seqs: int
             json.dumps({"dtype": "uint16", "files": [f"{split}.bin"], "sequence_length": seq_len})
         )
         (out / f"{split}.labels.manifest.json").write_text(
-            json.dumps({"dtype": "int32", "files": [f"{split}.labels.bin"], "sequence_length": seq_len})
+            json.dumps(
+                {"dtype": "int32", "files": [f"{split}.labels.bin"], "sequence_length": seq_len}
+            )
         )
 
     _write("train", n_seqs)

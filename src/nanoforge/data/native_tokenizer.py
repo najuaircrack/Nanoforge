@@ -152,6 +152,10 @@ class NativeBPETokenizer:
     def vocab_size(self) -> int:
         return int(self._native.vocab_size if self._native is not None else self._fallback.vocab_size)
 
+    @property
+    def artifact_version(self) -> int:
+        return int(self._native.artifact_version if self._native is not None else self._fallback.artifact_version)
+
     def encode(self, text: str, add_bos: bool = False, add_eos: bool = False) -> list[int]:
         if self._native is not None:
             return list(self._native.encode(text, add_bos, add_eos))
@@ -188,6 +192,7 @@ def train_native_bpe_from_texts(
     min_frequency: int = 2,
     require_native: bool = False,
     show_progress: bool = True,   # ← NEW
+    max_training_bytes: int = 16_777_216,
 ) -> bool:
     module = load_native_module()
     if module is None or not hasattr(module, "ByteLevelBpeTokenizer"):
@@ -218,22 +223,23 @@ def train_native_bpe_from_texts(
             pass  # tqdm not installed, train silently
 
     try:
-        import os
         import tempfile
-        with tempfile.NamedTemporaryFile(
-            mode="w", encoding="utf-8", suffix=".txt", delete=False
-        ) as tmp:
-            tmp_path = tmp.name
-            for text in texts:
-                tmp.write(text.replace("\n", " "))
-                tmp.write("\n")
-        try:
+
+        with tempfile.TemporaryDirectory(prefix="nanoforge-bpe-") as directory:
+            tmp_path = Path(directory) / "corpus.txt"
+            written_bytes = 0
+            with tmp_path.open("w", encoding="utf-8", newline="\n") as stream:
+                for text in texts:
+                    encoded_bytes = len(text.encode("utf-8")) + 1
+                    written_bytes += encoded_bytes
+                    if written_bytes > max_training_bytes:
+                        raise ValueError("Native tokenizer training byte budget exceeded")
+                    stream.write(text)
+                    stream.write("\n")
             tokenizer = module.ByteLevelBpeTokenizer.train_from_file(
-                tmp_path, vocab_size, min_frequency,
-                progress_cb=progress_cb,   # ← passed through
+                str(tmp_path), vocab_size, min_frequency, progress_cb=progress_cb,
+                max_training_bytes=max_training_bytes,
             )
-        finally:
-            os.unlink(tmp_path)
     finally:
         if bar is not None:
             bar.close()
@@ -242,26 +248,33 @@ def train_native_bpe_from_texts(
     return True
 
 def encode_batch(
-    self,
+    tokenizer,
     texts: Iterable[str],
     add_bos: bool = False,
     add_eos: bool = False,
     *,
-    chunk_size: int = 256,      # tune to your RAM budget
+    chunk_size: int = 256,
 ) -> list[list[int]]:
+    if chunk_size < 1:
+        raise ValueError("chunk_size must be positive")
     results: list[list[int]] = []
     buf: list[str] = []
+    batch_encoder = getattr(tokenizer, "encode_batch", None)
+
+    def flush() -> None:
+        if callable(batch_encoder):
+            encoded = batch_encoder(buf, add_bos=add_bos, add_eos=add_eos)
+            if len(encoded) != len(buf):
+                raise ValueError("Tokenizer batch result count does not match its input count")
+            results.extend([list(ids) for ids in encoded])
+        else:
+            results.extend(tokenizer.encode(t, add_bos=add_bos, add_eos=add_eos) for t in buf)
+        buf.clear()
+
     for text in texts:
         buf.append(text)
         if len(buf) >= chunk_size:
-            if self._native is not None:
-                results.extend(self._native.encode_batch(buf, add_bos, add_eos))
-            else:
-                results.extend(self.encode(t, add_bos=add_bos, add_eos=add_eos) for t in buf)
-            buf.clear()
+            flush()
     if buf:
-        if self._native is not None:
-            results.extend(self._native.encode_batch(buf, add_bos, add_eos))
-        else:
-            results.extend(self.encode(t, add_bos=add_bos, add_eos=add_eos) for t in buf)
+        flush()
     return results

@@ -167,14 +167,15 @@ def register_builtin_components() -> None:
     ATTENTION_BACKENDS.register("sdpa", "nanoforge.model.attention:CausalSelfAttention", version="1", replace=True, status="available")
     ATTENTION_BACKENDS.register("manual", "nanoforge.model.attention:CausalSelfAttention", version="1", replace=True, status="available")
     ATTENTION_BACKENDS.register("sliding_window", "nanoforge.model.attention:CausalSelfAttention", version="1", replace=True, status="available")
-    # flash/flash_v2/flash_v3: use real flash-attn kernel when installed, else SDPA with warning
-    for name in ["flash", "flash_v2", "flash_v3"]:
+    # Flash 1/2 use external kernels on supported CUDA devices; v3 remains a fallback.
+    for name in ["flash", "flash_v2"]:
         ATTENTION_BACKENDS.register(name, "nanoforge.model.attention:CausalSelfAttention", version="1", replace=True, status="requires_flash_attn")
-    # chunked/sparse/paged: SDPA with sliding-window presets (not true sparse/paged kernels)
-    ATTENTION_BACKENDS.register("chunked", "nanoforge.model.attention:ChunkedCausalSelfAttention", version="1", replace=True, status="sdpa_with_window")
-    ATTENTION_BACKENDS.register("sparse", "nanoforge.model.attention:SparseCausalSelfAttention", version="1", replace=True, status="sdpa_with_window")
-    ATTENTION_BACKENDS.register("hybrid_local_global", "nanoforge.model.attention:HybridLocalGlobalCausalAttention", version="1", replace=True, status="sdpa_with_window")
-    ATTENTION_BACKENDS.register("paged", "nanoforge.model.attention:PagedCausalSelfAttention", version="1", replace=True, status="sdpa_with_window")
+    ATTENTION_BACKENDS.register("flash_v3", "nanoforge.model.attention:CausalSelfAttention", version="1", replace=True, status="unimplemented_v3_fallback")
+    # Portable reference algorithms; these are not optimized native/CUDA kernels.
+    ATTENTION_BACKENDS.register("chunked", "nanoforge.model.attention:ChunkedCausalSelfAttention", version="2", replace=True, status="reference_chunked_online_softmax")
+    ATTENTION_BACKENDS.register("sparse", "nanoforge.model.attention:SparseCausalSelfAttention", version="2", replace=True, status="reference_local_block_sparse")
+    ATTENTION_BACKENDS.register("hybrid_local_global", "nanoforge.model.attention:HybridLocalGlobalCausalAttention", version="2", replace=True, status="reference_periodic_global")
+    ATTENTION_BACKENDS.register("paged", "nanoforge.model.attention:PagedCausalSelfAttention", version="2", replace=True, status="reference_paged_online_softmax")
 
     FFN_BACKENDS.register("swiglu", "nanoforge.model.moe:FeedForward", version="1", replace=True)
     FFN_BACKENDS.register("geglu", "nanoforge.model.moe:FeedForward", version="1", replace=True)
@@ -183,12 +184,14 @@ def register_builtin_components() -> None:
         "mamba_selective_state",
         "nanoforge.model.moe:MambaSelectiveStateFeedForward",
         version="1",
+        status="experimental_mixer",
         replace=True,
     )
     FFN_BACKENDS.register(
         "rwkv_mixing",
         "nanoforge.model.moe:RWKVMixingFeedForward",
         version="1",
+        status="experimental_mixer",
         replace=True,
     )
 
@@ -212,20 +215,21 @@ def register_builtin_components() -> None:
         TOKENIZERS.register(name, "nanoforge.data.tokenizer:load_tokenizer", version="1", replace=True)
 
     for name in ["top_k_top_p", "mirostat", "beam", "contrastive"]:
-        SAMPLERS.register(name, "nanoforge.generation.sampling:sample_next", version="1", replace=True)
+        SAMPLERS.register(name, f"nanoforge.generation.sampling:{name}_generate", version="2", replace=True)
 
     OPTIMIZERS.register("adamw", "nanoforge.training.optimizers:create_adamw_optimizer", version="1", replace=True)
     OPTIMIZERS.register("lion", "nanoforge.training.optimizers:Lion", version="1", replace=True)
     OPTIMIZERS.register("adafactor", "nanoforge.training.optimizers:Adafactor", version="1", replace=True)
-    OPTIMIZERS.register("sophia", "nanoforge.training.optimizers:SophiaG", version="1", replace=True)
-    OPTIMIZERS.register("sophiag", "nanoforge.training.optimizers:SophiaG", version="1", replace=True)
+    OPTIMIZERS.register("sophia", "nanoforge.training.optimizers:SophiaG", version="1", replace=True, status="experimental_gradient_square_approximation")
+    OPTIMIZERS.register("sophiag", "nanoforge.training.optimizers:SophiaG", version="1", replace=True, status="experimental_gradient_square_approximation")
 
     SCHEDULERS.register("cosine", "nanoforge.training.schedulers:create_cosine_scheduler", version="1", replace=True)
     SCHEDULERS.register("linear", "nanoforge.training.schedulers:create_linear_scheduler", version="1", replace=True)
     SCHEDULERS.register("constant", "nanoforge.training.schedulers:create_constant_scheduler", version="1", replace=True)
 
     for name in ["none", "int8", "int4", "gptq", "awq", "gguf"]:
-        QUANTIZATION_BACKENDS.register(name, "nanoforge.quantization:apply_quantization", version="1", replace=True)
+        QUANTIZATION_BACKENDS.register(name, "nanoforge.quantization:apply_quantization", version="1", replace=True,
+            status="available_cpu_inference" if name in {"none", "int8"} else "unsupported_in_native_model")
 
     TRANSFORMER_BLOCKS.register(
         "transformer",

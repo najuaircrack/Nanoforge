@@ -30,9 +30,13 @@ class CosineScheduler(LearningRateScheduler):
         warmup = self._warmup(step)
         if warmup is not None:
             return warmup
-        progress = (step - self.config.warmup_steps) / max(1, self.config.max_steps - self.config.warmup_steps)
+        progress = (step - self.config.warmup_steps) / max(
+            1, self.config.max_steps - self.config.warmup_steps
+        )
         coeff = 0.5 * (1.0 + math.cos(math.pi * min(1.0, progress)))
-        return self.config.min_learning_rate + coeff * (self.config.learning_rate - self.config.min_learning_rate)
+        return self.config.min_learning_rate + coeff * (
+            self.config.learning_rate - self.config.min_learning_rate
+        )
 
 
 class LinearScheduler(LearningRateScheduler):
@@ -40,9 +44,13 @@ class LinearScheduler(LearningRateScheduler):
         warmup = self._warmup(step)
         if warmup is not None:
             return warmup
-        progress = (step - self.config.warmup_steps) / max(1, self.config.max_steps - self.config.warmup_steps)
+        progress = (step - self.config.warmup_steps) / max(
+            1, self.config.max_steps - self.config.warmup_steps
+        )
         coeff = max(0.0, 1.0 - progress)
-        return self.config.min_learning_rate + coeff * (self.config.learning_rate - self.config.min_learning_rate)
+        return self.config.min_learning_rate + coeff * (
+            self.config.learning_rate - self.config.min_learning_rate
+        )
 
 
 class ConstantScheduler(LearningRateScheduler):

@@ -1,53 +1,37 @@
-"""Cosine top-k retrieval over a loaded :class:`NumpyVectorStore`.
-
-All stored vectors and query vectors are L2-normalised, so cosine similarity is
-just a dot product. Top-k selection uses ``np.argpartition`` (O(N)) then sorts
-only the k winners.
-"""
-
+"""Blockwise bounded top-k retrieval without materializing the score corpus."""
 from __future__ import annotations
-
-from typing import TYPE_CHECKING
-
 import numpy as np
 
-if TYPE_CHECKING:
-    from nanoforge.rag.embeddings import Embedder
-    from nanoforge.rag.store import NumpyVectorStore
-
-
 class Retriever:
-    def __init__(self, store: "NumpyVectorStore", embedder: "Embedder") -> None:
-        self.store = store
-        self.embedder = embedder
-
-    def query(self, text: str, top_k: int = 3) -> list[dict]:
-        """Return the ``top_k`` most similar documents to ``text``.
-
-        Each result is ``{text_chunk, source, metadata, score}`` sorted by
-        descending cosine similarity. Returns ``[]`` for an empty index.
-        """
+    def __init__(self,store,embedder):
+        if store.meta.dim != embedder.dim:
+            raise ValueError("index encoder dimension mismatch; rebuild with the selected encoder")
+        self.store,self.embedder = store,embedder
+    def close(self):
+        self.store.close()
+    def __enter__(self):
+        return self
+    def __exit__(self, *_args):
+        self.close()
+    def query(self,text,top_k=3):
+        if getattr(self.store, "_closed", False):
+            raise RuntimeError("RAG index is closed")
+        if isinstance(top_k,bool) or not isinstance(top_k,int) or not 1 <= top_k <= 1000:
+            raise ValueError("top_k must be in [1,1000]")
+        if not isinstance(text,str):
+            raise ValueError("query must be text")
         vectors = self.store.vectors
-        if vectors.shape[0] == 0 or not text.strip():
+        if not len(vectors) or not text.strip():
             return []
-
-        q = self.embedder.embed_batch([text])[0].astype(np.float32)  # [dim]
-        scores = vectors @ q  # [N]
-
-        k = min(top_k, scores.shape[0])
-        # O(N) partial selection of the top-k, then sort those k descending.
-        top_idx = np.argpartition(-scores, k - 1)[:k]
-        top_idx = top_idx[np.argsort(-scores[top_idx])]
-
-        results: list[dict] = []
-        for i in top_idx:
-            doc = self.store.docs[int(i)]
-            results.append(
-                {
-                    "text_chunk": doc.get("text_chunk", ""),
-                    "source": doc.get("source", ""),
-                    "metadata": doc.get("metadata", {}),
-                    "score": float(scores[int(i)]),
-                }
-            )
-        return results
+        q = np.asarray(self.embedder.embed_batch([text]),dtype=np.float32)
+        if q.shape != (1,self.store.meta.dim) or not np.isfinite(q).all():
+            raise ValueError("invalid query embedding")
+        q = q[0]/max(float(np.linalg.norm(q[0])),1e-9)
+        winners = []
+        for start in range(0,len(vectors),4096):
+            scores = vectors[start:start+4096]@q
+            k = min(top_k,len(scores))
+            indices = np.argpartition(-scores,k-1)[:k]
+            winners.extend((float(scores[i]),start+int(i)) for i in indices)
+            winners = sorted(winners,key=lambda item:(-item[0],item[1]))[:top_k]
+        return [{**self.store.docs[index],"score":score} for score,index in winners]

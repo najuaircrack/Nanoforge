@@ -14,6 +14,7 @@ class ModelProfile:
     activation_memory_mb: float
     kv_cache_memory_mb: float
     optimizer_state_memory_mb: float
+    estimation_notes: tuple[str, ...] = ()
 
     def to_dict(self) -> dict[str, float | int]:
         return asdict(self)
@@ -27,7 +28,14 @@ def estimate_model_profile(
     bytes_per_param: int = 2,
     optimizer_multiplier: float = 2.0,
 ) -> ModelProfile:
+    import torch
+    from nanoforge.model.transformer import NanoforgeModel
+
     seq_len = seq_len or config.max_seq_len
+    if batch_size < 1 or seq_len < 1 or bytes_per_param < 1 or optimizer_multiplier < 0:
+        raise ValueError("profile dimensions and byte assumptions must be positive")
+    with torch.device("meta"):
+        model = NanoforgeModel(config)
     head_dim = config.d_model // config.n_heads
     hidden = int(config.d_model * config.ffn_hidden_mult)
     embed_params = config.vocab_size * config.d_model
@@ -39,7 +47,7 @@ def estimate_model_profile(
     ffn_params = config.n_layers * 3 * config.d_model * hidden
     norm_params = config.n_layers * 2 * config.d_model + config.d_model
     lm_head_params = 0 if config.tie_embeddings else embed_params
-    params = embed_params + attn_params + ffn_params + norm_params + lm_head_params
+    params = sum(parameter.numel() for parameter in model.parameters())
     attn_flops = 4 * config.d_model * config.d_model + 2 * seq_len * config.d_model
     ffn_flops = 6 * config.d_model * hidden
     forward_flops_per_token = int(config.n_layers * (attn_flops + ffn_flops))
@@ -47,7 +55,7 @@ def estimate_model_profile(
     activation_memory = batch_size * seq_len * config.n_layers * config.d_model * bytes_per_param
     kv_heads = config.n_kv_heads or config.n_heads
     kv_cache = batch_size * seq_len * config.n_layers * 2 * kv_heads * head_dim * bytes_per_param
-    optimizer_memory = params * bytes_per_param * optimizer_multiplier
+    optimizer_memory = params * 4 * optimizer_multiplier
     return ModelProfile(
         parameters=int(params),
         non_embedding_parameters=int(params - embed_params),
@@ -56,4 +64,5 @@ def estimate_model_profile(
         activation_memory_mb=activation_memory / (1024 * 1024),
         kv_cache_memory_mb=kv_cache / (1024 * 1024),
         optimizer_state_memory_mb=optimizer_memory / (1024 * 1024),
+        estimation_notes=("parameters count actual selected modules on meta device", "FLOPs/activations/KV are estimates", "optimizer estimate assumes float32 states", "allocator/workspace/attention score memory are not included"),
     )

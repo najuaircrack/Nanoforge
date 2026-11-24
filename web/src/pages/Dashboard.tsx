@@ -2,7 +2,7 @@ import { useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { AreaChart, Area, LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid } from 'recharts'
 import { GitCommit, Activity, Layers } from 'lucide-react'
-import { get } from '../lib/api'
+import { get, errorMessage } from '../lib/api'
 import { Card, CardTitle, PageHeader, Empty, Gauge, Stat, ArchFlow } from '../lib/ui'
 import { normalizeRows, fmt, fmtInt, fmtCompact, fmtPct, fmtDur, fmtExp } from '../lib/metrics'
 
@@ -37,17 +37,19 @@ function AreaMetric({ data, dataKey, color, label, right }: { data: any[]; dataK
 
 export default function Dashboard() {
   const [runRoot] = useState('runs')
+  const [selectedRun, setSelectedRun] = useState('')
+  const jobsQuery = useQuery({ queryKey: ['jobs'], queryFn: () => get('/api/jobs'), refetchInterval: 5000 })
   const { data: runsData } = useQuery({ queryKey: ['runs', runRoot], queryFn: () => get('/api/runs', { root: runRoot }), refetchInterval: 8000 })
   const runs: any[] = runsData?.runs ?? []
 
-  const { data, isLoading } = useQuery({
-    queryKey: ['metrics'],
-    queryFn: () => get('/api/metrics'),
+  const { data, isLoading, error: metricsError } = useQuery({
+    queryKey: ['metrics', selectedRun],
+    queryFn: () => get('/api/metrics', { run_dir: selectedRun }),
     refetchInterval: 3000,
   })
   const { data: summaryData } = useQuery({
-    queryKey: ['metrics-summary'],
-    queryFn: () => get('/api/metrics/summary'),
+    queryKey: ['metrics-summary', selectedRun],
+    queryFn: () => get('/api/metrics/summary', { run_dir: selectedRun }),
     refetchInterval: 3000,
   })
 
@@ -57,7 +59,8 @@ export default function Dashboard() {
   const cfg = data?.config ?? {}
   const valRows = rows.filter(r => r.val_loss != null)
 
-  const running = s.progress != null && s.progress < 1
+  const runPath = selectedRun || data?.run_dir
+  const running = (jobsQuery.data?.jobs ?? []).some((job: any) => !job.done && job.run_dir && job.run_dir.replace(/\\/g, '/') === runPath?.replace(/\\/g, '/'))
 
   return (
     <div style={{ padding: 28 }}>
@@ -69,10 +72,14 @@ export default function Dashboard() {
             {isLoading && <span className="live-dot" style={{ color: 'var(--color-accent)', fontSize: 10 }}>●</span>}
           </span>
         }
-        right={running
+        right={jobsQuery.error || jobsQuery.isPending ? <span className="chip">Status unavailable</span> : running
           ? <span className="chip" style={{ color: 'var(--color-pos)' }}><span className="live-dot">●</span> training</span>
           : <span className="chip">idle</span>}
       />
+
+      <label style={{ display: 'block', marginBottom: 16 }}>Run <select aria-label="Selected run" className="select" value={selectedRun} onChange={event => setSelectedRun(event.target.value)}><option value="">Server default</option>{runs.map((run: any) => <option key={run.path} value={run.path}>{run.name}</option>)}</select></label>
+      {jobsQuery.error && <div role="alert">Job status unavailable: {errorMessage(jobsQuery.error)}</div>}
+      {metricsError && <div role="alert">Metrics unavailable: {errorMessage(metricsError)}</div>}
 
       {/* Gauges */}
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 12, marginBottom: 16 }}>

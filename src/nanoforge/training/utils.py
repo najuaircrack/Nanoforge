@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import random
+from contextlib import contextmanager
 from pathlib import Path
 
 import numpy as np
@@ -38,7 +39,6 @@ def autocast_dtype(precision: str, device: torch.device) -> torch.dtype | None:
     return None
 
 
-
 def configure_named_optimizer(
     model: torch.nn.Module,
     name: str,
@@ -62,22 +62,23 @@ def configure_named_optimizer(
         {"params": decay, "weight_decay": weight_decay},
         {"params": no_decay, "weight_decay": 0.0},
     ]
-    return create_optimizer(optimizer_name, groups, lr=lr, weight_decay=weight_decay, betas=betas, eps=eps)
+    return create_optimizer(
+        optimizer_name, groups, lr=lr, weight_decay=weight_decay, betas=betas, eps=eps
+    )
 
 
 @torch.no_grad()
 def grad_global_norm(parameters) -> float:
-    total = torch.zeros((), dtype=torch.float32)
-    found = False
+    squared_norms = []
     for param in parameters:
         if param.grad is None:
             continue
-        found = True
         grad = param.grad.detach().float()
-        total += grad.pow(2).sum()
-    if not found:
+        squared_norms.append(grad.pow(2).sum())
+    if not squared_norms:
         return 0.0
-    return float(total.sqrt().cpu())
+    device = squared_norms[0].device
+    return float(torch.stack([value.to(device) for value in squared_norms]).sum().sqrt().cpu())
 
 
 def grads_are_finite(parameters) -> bool:
@@ -105,6 +106,63 @@ class EMA:
 
     def state_dict(self) -> dict[str, torch.Tensor]:
         return self.shadow
+
+    def load_state_dict(self, state: dict[str, torch.Tensor]) -> None:
+        if set(state) != set(self.shadow):
+            raise ValueError("Averaged-weight state does not match model parameters.")
+        for name, value in state.items():
+            if value.shape != self.shadow[name].shape:
+                raise ValueError(f"Averaged weight shape mismatch: {name}")
+            self.shadow[name].copy_(value.to(self.shadow[name].device))
+
+    @contextmanager
+    def applied(self, model: torch.nn.Module):
+        parameters = dict(model.named_parameters())
+        original = {name: parameters[name].detach().clone() for name in self.shadow}
+        try:
+            with torch.no_grad():
+                for name, value in self.shadow.items():
+                    parameters[name].copy_(value)
+            yield
+        finally:
+            with torch.no_grad():
+                for name, value in original.items():
+                    parameters[name].copy_(value)
+
+
+class SWA(EMA):
+    """Uniform average of explicit post-update snapshots; never replaces live optimizer weights."""
+
+    def __init__(self, model: torch.nn.Module):
+        super().__init__(model, decay=0.0)
+        self.updates = 0
+
+    @torch.no_grad()
+    def update(self, model: torch.nn.Module) -> None:
+        self.updates += 1
+        for name, parameter in model.named_parameters():
+            if name in self.shadow:
+                self.shadow[name].lerp_(parameter.detach(), 1.0 / self.updates)
+
+
+def move_optimizer_state(optimizer: torch.optim.Optimizer, *, to_cpu: bool) -> None:
+    """Offload persistent state between updates; transfer it back for the optimizer step."""
+
+    def move(value, device):
+        if torch.is_tensor(value):
+            return value.to(device)
+        if isinstance(value, dict):
+            return {key: move(item, device) for key, item in value.items()}
+        if isinstance(value, list):
+            return [move(item, device) for item in value]
+        if isinstance(value, tuple):
+            return tuple(move(item, device) for item in value)
+        return value
+
+    for parameter, state in list(optimizer.state.items()):
+        optimizer.state[parameter] = move(
+            state, torch.device("cpu") if to_cpu else parameter.device
+        )
 
 
 def ensure_dir(path: str | Path) -> Path:

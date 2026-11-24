@@ -4,7 +4,9 @@ import importlib.util
 
 import pytest
 
-pytestmark = pytest.mark.skipif(importlib.util.find_spec("torch") is None, reason="torch not installed")
+pytestmark = pytest.mark.skipif(
+    importlib.util.find_spec("torch") is None, reason="torch not installed"
+)
 
 
 def test_checkpoint_hash_and_schema_roundtrip(tmp_path):
@@ -25,7 +27,7 @@ def test_checkpoint_hash_and_schema_roundtrip(tmp_path):
     assert path.with_suffix(".pt.hash").exists()
     assert path.with_suffix(".pt.meta.json").exists()
     payload = load_checkpoint(path)
-    assert payload["schema_version"] == 2
+    assert payload["schema_version"] == 3
     assert payload["step"] == 3
     assert "rng" in payload
     assert "registry" in payload

@@ -35,10 +35,14 @@ class DataMixture:
         self.datasets: list[PackedMemmapDataset] = []
         weights: list[float] = []
         self.names: list[str] = []
-        for src in sources:
+        for source_index, src in enumerate(sources):
+            if not np.isfinite(src.weight) or src.weight < 0:
+                raise ValueError("Mixture weights must be finite and nonnegative")
             if src.weight <= 0:
                 continue
-            ds = PackedMemmapDataset(src.path, src.seq_len or seq_len)
+            if src.seq_len is not None and src.seq_len != seq_len:
+                raise ValueError("Mixture source sequence lengths must match the batch sequence length")
+            ds = PackedMemmapDataset(src.path, seq_len, seed=seed + source_index + 1)
             self.datasets.append(ds)
             weights.append(float(src.weight))
             self.names.append(src.name or Path(src.path).stem)
@@ -65,8 +69,28 @@ class DataMixture:
         x = torch.cat(xs, dim=0)
         y = torch.cat(ys, dim=0)
         # Shuffle so sources are interleaved within the batch, not block-ordered.
-        perm = torch.randperm(x.shape[0])
+        perm = torch.from_numpy(self._rng.permutation(x.shape[0]))
         return x[perm], y[perm]
+
+    def state_dict(self) -> dict:
+        import copy
+
+        return {"schema_version": 1, "names": list(self.names), "seq_len": self.seq_len,
+                "rng": copy.deepcopy(self._rng.bit_generator.state),
+                "datasets": [dataset.state_dict() for dataset in self.datasets]}
+
+    def load_state_dict(self, state: dict) -> None:
+        if state.get("schema_version") != 1 or state.get("names") != self.names or state.get("seq_len") != self.seq_len:
+            raise ValueError("Mixture sampler state is incompatible")
+        if len(state.get("datasets", [])) != len(self.datasets):
+            raise ValueError("Mixture sampler dataset count differs")
+        self._rng.bit_generator.state = state["rng"]
+        for dataset, dataset_state in zip(self.datasets, state["datasets"]):
+            dataset.load_state_dict(dataset_state)
+
+    def close(self) -> None:
+        for dataset in self.datasets:
+            dataset.close()
 
     def describe(self) -> dict[str, float]:
         return {name: float(prob) for name, prob in zip(self.names, self.probs)}

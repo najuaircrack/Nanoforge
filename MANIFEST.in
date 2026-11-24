@@ -1,0 +1,19 @@
+include README.md LICENSE.md pyproject.toml requirements.txt Makefile Dockerfile .dockerignore .python-version .nvmrc
+recursive-include src *.py py.typed *.html *.js *.css *.svg
+recursive-include configs *.yaml *.json *.jsonl
+recursive-include docs *.md
+recursive-include scripts *.py
+recursive-include tests *.py *.jsonl
+recursive-include native *.rs *.toml Cargo.lock *.md
+prune data
+prune models
+prune runs
+prune reports
+prune .unlazy
+prune .latticekin
+prune .agents
+prune .codex
+prune web/node_modules
+prune native/nanoforge-tokenizers/target
+global-exclude *.pyc *.pyo *.pt *.pth *.bin *.gguf *.onnx .env .env.*
+exclude configs/nashwa-*.yaml scripts/*nashwa*.py

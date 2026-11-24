@@ -1,4 +1,4 @@
-# Nanoforge agent instruction ledger
+# Latticekin agent instruction ledger
 
 This file is the operating contract for coding agents working in this repository. It is
 deliberately evidence-first: an agent may improve the system, but it must not silently change
@@ -6,7 +6,7 @@ the product, hide a failed check, or turn an experimental fallback into a claime
 
 ## Mission
 
-Nanoforge is a local-first platform for people to:
+Latticekin is a local-first platform for people to:
 
 1. inspect and clean their own data;
 2. train or adapt a language model on CPU, one GPU, or a small distributed job;
@@ -15,9 +15,10 @@ Nanoforge is a local-first platform for people to:
 5. export and serve the result locally with clear resource and safety boundaries.
 
 The current repository is **not yet the complete platform**. It is a compact transformer
-training/inference toolkit with a partial web studio and a minimal tool registry. Treat the
-platform design in `docs/platform-audit.md` as the current product contract and backlog, not as
-evidence that all listed capabilities already exist.
+training/inference toolkit with a partial web studio, a bounded backend harness, and a training
+TUI that is not yet the complete agent operator console. Treat `docs/project-charter.md`,
+`docs/agent-platform-architecture.md`, and `docs/platform-audit.md` as the current product
+contract and backlog, not as evidence that all listed capabilities already exist.
 
 ## Read before editing
 

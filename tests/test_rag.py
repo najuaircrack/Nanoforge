@@ -138,10 +138,10 @@ def _build_store(tmp_dir: str) -> NumpyVectorStore:
 
 def test_store_files_created():
     with tempfile.TemporaryDirectory() as d:
-        _build_store(d)
-        assert (Path(d) / "vectors.npy").exists()
-        assert (Path(d) / "metadata.json").exists()
+        store = _build_store(d)
+        assert all((Path(d) / path).exists() for path in store.meta.files.values())
         assert (Path(d) / "index_meta.json").exists()
+        store.close()
 
 
 def test_store_roundtrip():
@@ -152,6 +152,8 @@ def test_store_roundtrip():
         assert len(store2.docs) == len(DOCS)
         assert store2.meta.num_docs == len(DOCS)
         assert store2.meta.backend == "tfidf"
+        store.close()
+        store2.close()
 
 
 def test_store_meta_has_embedder_state():
@@ -159,6 +161,7 @@ def test_store_meta_has_embedder_state():
         _build_store(d)
         store2 = NumpyVectorStore.load(d)
         assert "idf" in store2.meta.embedder_state
+        store2.close()
 
 
 def test_store_load_missing_dir():
@@ -174,6 +177,7 @@ def test_store_max_docs():
             d, e, chunks, backend="tfidf", max_docs=2
         )
         assert store.meta.num_docs == 2
+        store.close()
 
 
 # ── Retriever ─────────────────────────────────────────────────────────────────
@@ -190,6 +194,7 @@ def test_retriever_top1_exact_match():
         hits = r.query("transformers use self-attention mechanisms", top_k=1)
         assert len(hits) == 1
         assert hits[0]["text_chunk"] == "transformers use self-attention mechanisms"
+        r.close()
 
 
 def test_retriever_top_k_count():
@@ -197,6 +202,7 @@ def test_retriever_top_k_count():
         r = _make_retriever(d)
         hits = r.query("programming language", top_k=2)
         assert len(hits) == 2
+        r.close()
 
 
 def test_retriever_sorted_descending():
@@ -205,6 +211,7 @@ def test_retriever_sorted_descending():
         hits = r.query("blue ocean sky", top_k=3)
         scores = [h["score"] for h in hits]
         assert scores == sorted(scores, reverse=True)
+        r.close()
 
 
 def test_retriever_result_fields():
@@ -215,6 +222,7 @@ def test_retriever_result_fields():
         assert "source" in hits[0]
         assert "metadata" in hits[0]
         assert "score" in hits[0]
+        r.close()
 
 
 def test_retriever_empty_query():
@@ -222,6 +230,7 @@ def test_retriever_empty_query():
         r = _make_retriever(d)
         hits = r.query("", top_k=3)
         assert hits == []
+        r.close()
 
 
 def test_retriever_empty_store():
@@ -247,6 +256,7 @@ def test_load_index_roundtrip():
         hits = r.query("ocean deep blue", top_k=1)
         assert len(hits) == 1
         assert hits[0]["score"] > 0.0
+        r.close()
 
 
 # ── Webapp no-index regression ────────────────────────────────────────────────

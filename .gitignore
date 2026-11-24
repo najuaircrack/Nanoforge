@@ -11,6 +11,7 @@ __pycache__/
 .opencode/
 .unlazy/
 .unlazy-hook-state.json
+.latticekin/
 
 # Virtual environments
 .venv/

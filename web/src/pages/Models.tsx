@@ -1,7 +1,8 @@
 import { useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
+import { useNavigate } from 'react-router-dom'
 import { Box, Upload, RefreshCw } from 'lucide-react'
-import { get, post, fmtBytes } from '../lib/api'
+import { get, post, fmtBytes, errorMessage } from '../lib/api'
 import { Card, CardTitle, PageHeader, Button, Field, Empty } from '../lib/ui'
 
 export default function Models() {
@@ -9,18 +10,24 @@ export default function Models() {
   const [importName, setImportName] = useState('')
   const [importBackend, setImportBackend] = useState('')
   const [status, setStatus] = useState('')
+  const [pending, setPending] = useState(false)
+  const navigate = useNavigate()
 
   const { data: modelData, refetch } = useQuery({ queryKey: ['models'], queryFn: () => get('/api/model/list') })
   const { data: importData, refetch: refetchImports } = useQuery({ queryKey: ['imports'], queryFn: () => get('/api/model/imports') })
-  const models: any[] = modelData?.models ?? []
+  const models: any[] = (modelData?.models ?? []).map((model: any) => ({ ...model, path: model.ref ?? model.path ?? model.name }))
   const imports: any[] = importData?.models ?? []
 
   async function importModel() {
-    if (!importSrc || !importName) return
-    setStatus('Importing…')
-    const r = await post('/api/model/import', { source: importSrc, name: importName, backend: importBackend || undefined })
-    if (r.ok) { setStatus(`✓ Imported ${r.entry?.name}`); refetchImports() }
-    else setStatus(`Error: ${r.error}`)
+    if (!importSrc.trim() || !importName.trim() || pending) return
+    setPending(true); setStatus('Importing…')
+    try { const result = await post('/api/model/import', { source: importSrc.trim(), name: importName.trim(), backend: importBackend || undefined }); setStatus('✓ Imported ' + result.entry?.name); await refetchImports(); await refetch() }
+    catch (error) { setStatus('Error: ' + errorMessage(error)) } finally { setPending(false) }
+  }
+  async function loadModel(ref: string) {
+    setPending(true); setStatus('Loading…')
+    try { await post('/api/chat/load', { path: ref }); navigate('/chat') }
+    catch (error) { setStatus('Error: ' + errorMessage(error)) } finally { setPending(false) }
   }
 
   return (
@@ -40,7 +47,7 @@ export default function Models() {
             <CardTitle right={
               <span style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: 'var(--color-ink-3)' }}>{models.length} found</span>
             }>
-              Nanoforge checkpoints
+              Available models
             </CardTitle>
             {models.length === 0
               ? <Empty>No checkpoints found in runs/ or models/</Empty>
@@ -55,6 +62,7 @@ export default function Models() {
                       <Box size={14} style={{ color: 'var(--color-accent)', flexShrink: 0 }} />
                       <span className="mono" style={{ flex: 1, fontSize: 12, color: 'var(--color-ink-2)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{m.path}</span>
                       <span style={{ fontSize: 11, color: 'var(--color-ink-3)', fontFamily: 'var(--font-mono)' }}>{fmtBytes(m.size)}</span>
+                      <Button disabled={pending} onClick={() => loadModel(m.ref ?? m.path ?? m.name)}>Load</Button>
                     </div>
                   ))}
                 </div>
@@ -79,6 +87,7 @@ export default function Models() {
                         <div style={{ fontSize: 13, fontWeight: 500, color: 'var(--color-ink)' }}>{m.name}</div>
                         <div style={{ fontSize: 11, color: 'var(--color-ink-3)', fontFamily: 'var(--font-mono)' }}>{m.backend} · {m.format} · {m.source}</div>
                       </div>
+                      <Button disabled={pending} onClick={() => loadModel(m.ref ?? m.name)}>Load</Button>
                     </div>
                   ))}
                 </div>
@@ -106,10 +115,10 @@ export default function Models() {
                 <option value="onnxruntime">onnxruntime</option>
               </select>
             </Field>
-            <Button onClick={importModel} disabled={!importSrc || !importName} variant="primary" icon={<Upload size={13} />}>
+            <Button onClick={importModel} disabled={pending || !importSrc.trim() || !importName.trim()} variant="primary" icon={<Upload size={13} />}>
               Import
             </Button>
-            {status && <div style={{ fontSize: 12, color: status.startsWith('✓') ? 'var(--color-pos)' : 'var(--color-neg)' }}>{status}</div>}
+            {status && <div role="status" aria-live="polite" style={{ fontSize: 12, color: status.startsWith('✓') ? 'var(--color-pos)' : 'var(--color-neg)' }}>{status}</div>}
           </div>
         </Card>
       </div>

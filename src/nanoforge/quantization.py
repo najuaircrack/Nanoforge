@@ -22,9 +22,8 @@ def apply_quantization(model: torch.nn.Module, backend: str = "none", **kwargs) 
     if key in {"int4", "gptq", "awq"}:
         raise NotImplementedError(
             f"Quantization backend '{backend}' is not implemented natively. "
-            "Nanoforge does not ship int4/GPTQ/AWQ kernels. Export the model to GGUF "
-            "(`nanoforge export --format gguf`) and quantize with llama.cpp, or run an "
-            "external GPTQ/AWQ toolchain on the exported weights. Use backend='int8' for "
+            "Nanoforge does not ship int4/GPTQ/AWQ kernels. Use a supported external "
+            "pretrained quantized runtime, or backend='int8' for "
             "built-in dynamic CPU quantization."
         )
     if key == "gguf":
@@ -35,8 +34,28 @@ def apply_quantization(model: torch.nn.Module, backend: str = "none", **kwargs) 
 def dynamic_quantize_cpu(model: torch.nn.Module) -> torch.nn.Module:
     """Apply dynamic int8 quantization to Linear layers for CPU inference."""
 
+    from nanoforge.model.lora import merge_lora
+
+    dense = merge_lora(model).cpu().eval()
     quant = getattr(torch, "ao", torch).quantization
-    return quant.quantize_dynamic(model.cpu().eval(), {torch.nn.Linear}, dtype=torch.qint8)
+    converted = quant.quantize_dynamic(dense, {torch.nn.Linear}, dtype=torch.qint8)
+    converted.nanoforge_quantization = QuantizationConfig(backend="int8")
+    return converted
+
+
+def prepare_inference_model(
+    model: torch.nn.Module, backend: str = "none", *, device: str = "auto"
+) -> torch.nn.Module:
+    """Apply quantization after loading floating-point weights; never during training."""
+    from nanoforge.training.utils import resolve_device
+
+    key = backend.strip().lower().replace("-", "_")
+    if key in {"int8", "dynamic_int8", "cpu_int8"}:
+        if device != "auto" and torch.device(device).type != "cpu":
+            raise ValueError("Dynamic int8 inference requires a CPU device")
+        return dynamic_quantize_cpu(model)
+    result = apply_quantization(model, backend)
+    return result.to(resolve_device(device)).eval()
 
 
 def mark_gguf_export_compatible(model: torch.nn.Module) -> torch.nn.Module:

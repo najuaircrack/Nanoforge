@@ -1,0 +1,47 @@
+# Public byte-tokenizer chat fixture. No assistant quality promise.
+model:
+  vocab_size: 260
+  max_seq_len: 128
+  d_model: 128
+  n_layers: 3
+  n_heads: 4
+  n_kv_heads: 2
+  ffn_hidden_mult: 2.0
+  use_flash: false
+  gradient_checkpointing: false
+training:
+  mode: chat
+  run_name: nano-chat-smoke
+  output_dir: runs/nano-chat-smoke
+  seed: 42
+  max_steps: 300
+  batch_size: 2
+  micro_batch_size: 1
+  grad_accum_steps: 2
+  learning_rate: 0.0003
+  warmup_steps: 0
+  warmup_ratio: 0.1
+  gradient_checkpointing: false
+  eval_interval: 100
+  eval_steps: 5
+  save_interval: 150
+  log_interval: 25
+  health_interval: 25
+  tensorboard: false
+  device: cpu
+  resume_from_checkpoint: null
+data:
+  train_path: data/packed/nano-chat-smoke/train.bin
+  val_path: data/packed/nano-chat-smoke/val.bin
+  tokenizer_type: byte
+  seq_len: 128
+  mode: chat
+  loss_masking: assistant_only
+  assistant_only_loss: true
+  num_workers: 0
+  pin_memory: false
+inference:
+  mode: deterministic
+  deterministic: true
+  max_new_tokens: 64
+

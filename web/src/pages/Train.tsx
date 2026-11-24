@@ -1,166 +1,44 @@
 import { useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { Play, Square, RefreshCw } from 'lucide-react'
-import { LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid } from 'recharts'
-import { get, post } from '../lib/api'
-import { Card, CardTitle, PageHeader, Button, Field, LogBox } from '../lib/ui'
-
-function normalizeRow(row: any): any {
-  const out: any = { step: row.step }
-  for (const [k, v] of Object.entries(row)) {
-    if (k.startsWith('train/')) out[k.slice(6)] = v
-    else if (k.startsWith('val/')) out['val_' + k.slice(4)] = v
-    else out[k] = v
-  }
-  return out
-}
-
+import { LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer } from 'recharts'
+import { get, errorMessage } from '../lib/api'
+import { Card, CardTitle, PageHeader, Button, Field, LogBox, StatusText } from '../lib/ui'
+import { normalizeRows, latestOf, fmt } from '../lib/metrics'
+import { useJob } from '../lib/useJob'
 export default function Train() {
-  const [config, setConfig] = useState('configs/nano-debug.yaml')
-  const [mode, setMode] = useState<'train' | 'pretrain' | 'pipeline' | 'auto-train'>('train')
-  const [jobId, setJobId] = useState<string | null>(null)
-  const [logs, setLogs] = useState<string[]>([])
-  const [running, setRunning] = useState(false)
-  const [exitCode, setExitCode] = useState<number | null>(null)
-
-  const { data: cfgList } = useQuery({ queryKey: ['cfg-templates'], queryFn: () => get('/api/config/templates') })
-  const templates: string[] = cfgList?.templates ?? []
-
-  const { data: metricsData } = useQuery({
-    queryKey: ['train-metrics'],
-    queryFn: () => get('/api/metrics'),
-    refetchInterval: running ? 3000 : false,
-    enabled: running,
-  })
-  const rows = (metricsData?.rows ?? []).map(normalizeRow)
-  const last = rows[rows.length - 1]
-
-  async function startJob() {
-    setLogs([]); setExitCode(null); setRunning(true)
-    const r = await post('/api/jobs/start', { type: mode, config })
-    if (!r.ok) { setLogs([`Error: ${r.error}`]); setRunning(false); return }
-    setJobId(r.job_id)
-    const es = new EventSource(`/stream/job/${r.job_id}`)
-    es.onmessage = (e) => {
-      const msg = JSON.parse(e.data)
-      if (msg.type === 'line') setLogs(l => [...l.slice(-600), msg.line])
-      else if (msg.type === 'done') { setExitCode(msg.code); setRunning(false); es.close() }
-    }
-    es.onerror = () => { setRunning(false); es.close() }
+  const [config, setConfig] = useState('configs/nano-debug.yaml'), [mode, setMode] = useState('train')
+  const [inputs, setInputs] = useState(''), [name, setName] = useState(''), [showLogs, setShowLogs] = useState(true)
+  const monitor = useJob('training')
+  const templates = useQuery({ queryKey: ['cfg-templates'], queryFn: () => get('/api/config/templates') })
+  const jobs = useQuery({ queryKey: ['jobs'], queryFn: () => get('/api/jobs'), refetchInterval: 5000 })
+  const metrics = useQuery({ queryKey: ['train-metrics', monitor.jobId], enabled: !!monitor.jobId,
+    queryFn: ({ signal }) => get('/api/metrics', { job_id: monitor.jobId }, { signal }), refetchInterval: monitor.running ? 3000 : false })
+  const rows = normalizeRows(metrics.data?.rows ?? []), latest = latestOf(rows)
+  async function start() {
+    setShowLogs(true)
+    try { await monitor.start(mode === 'auto-train' ? { type: mode, input: inputs.split('\n').map(value => value.trim()).filter(Boolean), name: name.trim(), mode: 'auto', tokenizer: 'native-bpe', seq_len: 512 } : { type: mode, config: config.trim() }) }
+    catch { /* useJob owns the visible error and always releases pending state. */ }
   }
-
-  async function stopJob() {
-    if (!jobId) return
-    await post('/api/jobs/stop', { job_id: jobId })
-    setRunning(false)
-  }
-
-  return (
-    <div style={{ padding: 28 }}>
-      <PageHeader
-        title="Train"
-        right={
-          exitCode !== null
-            ? <span style={{ fontSize: 13, color: exitCode === 0 ? 'var(--color-pos)' : 'var(--color-neg)' }}>
-                {exitCode === 0 ? '✓ Completed' : `Exit ${exitCode}`}
-              </span>
-            : running
-              ? <span style={{ fontSize: 13, color: 'var(--color-pos)', display: 'flex', alignItems: 'center', gap: 7 }}>
-                  <span className="live-dot">●</span> Training
-                </span>
-              : undefined
-        }
-      />
-
-      <div style={{ display: 'grid', gridTemplateColumns: '280px 1fr', gap: 14 }}>
-        {/* Config panel */}
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-          <Card>
-            <CardTitle>Configuration</CardTitle>
-            <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-              <Field label="Mode">
-                <select value={mode} onChange={e => setMode(e.target.value as any)} className="select">
-                  <option value="train">train</option>
-                  <option value="pretrain">pretrain</option>
-                  <option value="pipeline">pipeline</option>
-                  <option value="auto-train">auto-train</option>
-                </select>
-              </Field>
-              <Field label="Config file">
-                <input value={config} onChange={e => setConfig(e.target.value)} className="input" placeholder="configs/nano-debug.yaml" />
-              </Field>
-              {templates.length > 0 && (
-                <Field label="Template">
-                  <select onChange={e => e.target.value && setConfig(e.target.value)} className="select" defaultValue="">
-                    <option value="">Pick a template...</option>
-                    {templates.map(t => <option key={t} value={t}>{t}</option>)}
-                  </select>
-                </Field>
-              )}
-              <div style={{ display: 'flex', gap: 8, paddingTop: 4 }}>
-                <Button onClick={startJob} disabled={running || !config} variant="primary" icon={<Play size={13} />} style={{ flex: 1 }}>
-                  Start
-                </Button>
-                <Button onClick={stopJob} disabled={!running} icon={<Square size={13} />} style={{ flex: 1, color: running ? 'var(--color-neg)' : undefined }}>
-                  Stop
-                </Button>
-              </div>
-            </div>
-          </Card>
-
-          {/* Live metrics */}
-          {last && (
-            <Card>
-              <CardTitle>Live metrics</CardTitle>
-              <div style={{ display: 'flex', flexDirection: 'column', gap: 0 }}>
-                {[
-                  ['Step', last?.step?.toLocaleString()],
-                  ['Loss', last?.loss?.toFixed(4)],
-                  ['Val loss', last?.val_loss?.toFixed(4)],
-                  ['LR', last?.lr?.toExponential(2)],
-                  ['Grad norm', last?.grad_norm?.toFixed(3)],
-                  ['Tok/s', last?.tokens_per_sec?.toFixed(0)],
-                ].map(([k, v]) => v != null ? (
-                  <div key={k} style={{ display: 'flex', justifyContent: 'space-between', fontSize: 12, padding: '5px 0', borderBottom: '1px solid var(--color-line)' }}>
-                    <span style={{ color: 'var(--color-ink-2)' }}>{k}</span>
-                    <span style={{ fontFamily: 'var(--font-mono)' }}>{v}</span>
-                  </div>
-                ) : null)}
-              </div>
-            </Card>
-          )}
-        </div>
-
-        {/* Charts + log */}
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-          {rows.length > 0 && (
-            <Card>
-              <CardTitle>Loss curve</CardTitle>
-              <ResponsiveContainer width="100%" height={130}>
-                <LineChart data={rows.slice(-300)} margin={{ top: 2, right: 4, left: -20, bottom: 0 }}>
-                  <CartesianGrid strokeDasharray="3 3" stroke="var(--color-line)" />
-                  <XAxis dataKey="step" tick={{ fontSize: 10, fill: 'var(--color-ink-3)' }} tickLine={false} axisLine={false} />
-                  <YAxis tick={{ fontSize: 10, fill: 'var(--color-ink-3)' }} tickLine={false} axisLine={false} width={52} />
-                  <Tooltip contentStyle={{ background: 'var(--color-surface-3)', border: '1px solid var(--color-line-2)', borderRadius: 8, fontSize: 12 }} />
-                  <Line type="monotone" dataKey="loss" stroke="var(--color-neg)" dot={false} strokeWidth={1.75} />
-                  <Line type="monotone" dataKey="val_loss" stroke="var(--color-warn)" dot={false} strokeWidth={1.75} />
-                </LineChart>
-              </ResponsiveContainer>
-            </Card>
-          )}
-
-          <Card style={{ flex: 1 }}>
-            <CardTitle right={
-              <Button variant="ghost" onClick={() => setLogs([])} icon={<RefreshCw size={11} />} style={{ fontSize: 11, padding: '3px 8px' }}>
-                Clear
-              </Button>
-            }>
-              Output log
-            </CardTitle>
-            <LogBox lines={logs} running={running} />
-          </Card>
-        </div>
-      </div>
+  const canStart = mode === 'auto-train' ? !!inputs.trim() && !!name.trim() : !!config.trim()
+  const knownJobs = (jobs.data?.jobs ?? []).filter((job: any) => ['train', 'pretrain', 'pipeline', 'auto-train'].includes(job.type))
+  return <div style={{ padding: 28 }}><PageHeader title="Train" subtitle={monitor.jobId ? 'Job ' + monitor.jobId : 'Choose a configuration and start a run.'}
+    right={<span className="chip">{monitor.job?.done ? monitor.job.code === 0 ? 'Completed' : 'Exit ' + monitor.job.code : monitor.running ? 'Running / checking status' : 'Idle'}</span>} />
+    <div className="studio-split" style={{ display: 'grid', gridTemplateColumns: '300px minmax(300px,1fr)', gap: 14 }}>
+      <Card><CardTitle>Configuration</CardTitle><Field label="Mode"><select className="select" value={mode} onChange={event => setMode(event.target.value)}>{['train', 'pretrain', 'pipeline', 'auto-train'].map(value => <option key={value}>{value}</option>)}</select></Field>
+        {mode === 'auto-train' ? <><Field label="Input paths (one per line)"><textarea className="textarea" rows={4} value={inputs} onChange={event => setInputs(event.target.value)} /></Field><Field label="Run name"><input className="input" value={name} onChange={event => setName(event.target.value)} /></Field></> :
+          <><Field label="Config file"><input className="input" value={config} onChange={event => setConfig(event.target.value)} /></Field><Field label="Template"><select className="select" defaultValue="" onChange={event => event.target.value && setConfig(event.target.value)}><option value="">Pick template…</option>{(templates.data?.templates ?? []).map((value: string) => <option key={value}>{value}</option>)}</select></Field></>}
+        <div style={{ display: 'flex', gap: 8, marginTop: 12 }}><Button variant="primary" icon={<Play size={13} />} onClick={start} disabled={monitor.running || !canStart}>Start</Button><Button icon={<Square size={13} />} onClick={monitor.stop} disabled={!monitor.jobId || monitor.job?.done || monitor.pending}>Stop</Button></div>
+        <StatusText msg={monitor.error ? 'Error: ' + monitor.error : ''} />
+        {monitor.error && monitor.jobId && <Button onClick={() => monitor.select(null)}>Disconnect monitor</Button>}
+        {knownJobs.length > 0 && <Field label="Reconnect to job"><select className="select" value={monitor.jobId ?? ''} onChange={event => monitor.select(event.target.value || null)}><option value="">Select job…</option>{knownJobs.map((job: any) => <option key={job.job_id} value={job.job_id}>{job.type} · {job.job_id} · {job.done ? 'finished' : 'running'}</option>)}</select></Field>}
+        {jobs.error && <StatusText msg={'Error listing jobs: ' + errorMessage(jobs.error)} />}
+        {monitor.job?.done && <Button onClick={() => monitor.select(null)}>New run</Button>}
+      </Card>
+      <div><Card><CardTitle>Metrics {metrics.data?.run ? '· ' + metrics.data.run : ''}</CardTitle>
+        {metrics.error && <div role="alert">{errorMessage(metrics.error)}</div>}
+        {rows.length > 0 ? <><div style={{ display: 'flex', gap: 18 }}><span>Step {latest.step}</span><span>Loss {fmt(latest.loss)}</span><span>Val {fmt(latest.val_loss)}</span></div><ResponsiveContainer width="100%" height={150}><LineChart data={rows.slice(-300)}><XAxis dataKey="step" /><YAxis /><Tooltip /><Line dataKey="loss" stroke="var(--color-neg)" dot={false} /><Line dataKey="val_loss" stroke="var(--color-warn)" dot={false} /></LineChart></ResponsiveContainer></> : <p>No metrics for this job yet.</p>}
+      </Card><Card><CardTitle right={<Button icon={<RefreshCw size={12} />} onClick={() => { setShowLogs(true); monitor.refetch() }}>Refresh</Button>}>Output log</CardTitle><Button onClick={() => setShowLogs(value => !value)}>{showLogs ? 'Hide log' : 'Show log'}</Button>{showLogs && <LogBox lines={(monitor.job?.lines ?? []).slice(-600)} running={monitor.running} />}</Card></div>
     </div>
-  )
+  </div>
 }

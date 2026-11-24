@@ -1,13 +1,21 @@
-# Nanoforge platform audit and modernization contract
+# Latticekin platform audit and modernization contract
 
-**Status:** baseline audit, October 2026
+**Status:** historical baseline audit, October 2026; modernization in progress, November 2026
 **Audience:** maintainers and coding agents
-**Decision:** keep the compact PyTorch/Rust foundation, but stop treating it as a complete agent
-platform. Build the platform in measured vertical slices.
+**Decision:** adopt Latticekin as the public product direction. Keep the compact PyTorch/Rust
+foundation, but make the local agent loop—not scratch pretraining—the product center. Build the
+platform in measured vertical slices.
 
 ## Executive conclusion
 
-Nanoforge is not an empty or useless project. It already contains a readable local transformer
+The observations below describe the October baseline and the staged product contract. They are
+not a current completion certificate. November implementation and verification status is recorded
+in [roadmap.md](roadmap.md), [architecture.md](architecture.md), and the project-local fix progress
+ledger. The [2026-11-11 audit](audit-2026-11-11.md) preserves the later pre-fix findings. Current
+schemas are generated from code in [configuration.md](configuration.md). Where the historical
+sections say a capability is absent or implemented, consult current callers/tests before acting.
+
+Latticekin is not an empty or useless project. It already contains a readable local transformer
 stack: schema-aware data readers, tokenizers, masked packing, a configurable transformer,
 checkpointing, sampling, RAG primitives, a FastAPI server, a React studio, DPO/distillation
 experiments, and an optional Rust tokenizer extension.
@@ -22,8 +30,10 @@ structured tool use → guarded execution → memory/retrieval → replayable de
 ```
 
 The current repository is strongest in the first half of a research toolkit and weakest in
-capability provenance, quality evaluation, CPU-efficient model serving, and the safe agent
-harness. The correct strategy is therefore **adapt and compose first, train foundations second**.
+capability provenance, quality evaluation, CPU-efficient model serving, and the integrated agent
+operator console. The correct strategy is therefore **adapt and compose first, train foundations
+second**. The public product definition is in [`project-charter.md`](project-charter.md), and the
+target harness is in [`agent-platform-architecture.md`](agent-platform-architecture.md).
 
 ## Current architecture
 
@@ -73,7 +83,7 @@ conversion, tokenizer training and reporting, packing, training, pretraining, pi
 DPO, distillation, evaluation, benchmarking, import/export, RAG indexing, serving, chat, TUI,
 and web commands. The presence of a command is not proof that its production contract is complete.
 
-## What works today
+## Foundations observed in the October baseline
 
 The following are real foundations, subject to their tests and documented limitations:
 
@@ -92,7 +102,7 @@ The following are real foundations, subject to their tests and documented limita
   explicitly rejected rather than faked.
 - Local server and web studio defaults that can be run on localhost.
 
-## Critical limitations
+## Limitations observed in October (historical)
 
 ### 1. It is a scratch-model toolkit, not a capable-model factory
 
@@ -128,13 +138,15 @@ Every training run needs a manifest containing code revision, config, data finge
 policy, tokenizer identity, model size, seed, hardware, elapsed time, peak memory, and evaluation
 results. Reports must preserve failed cases, not only aggregate scores.
 
-### 4. There is no real agent harness yet
+### 4. The bounded agent harness is early and not yet a complete agent product
 
-`src/nanoforge/tools.py` stores a name, description, JSON-like parameter dictionary, and Python
-callable, then calls the callable directly. It has no schema validation, authorization, timeout,
-cancellation, output truncation, audit event, approval policy, sandbox, replay trace, or
-multi-step state machine. `webapp.py` can start subprocess jobs and write local paths; it is a
-local admin UI, not a multi-user control plane.
+The legacy `src/nanoforge/tools.py` stores a name, description, JSON-like parameter dictionary,
+and Python callable, then calls the callable directly. It is not the safe model-facing boundary.
+The newer `src/nanoforge/agent/` package now provides schema validation, authorization,
+timeouts, cancellation, output truncation, approval policy, bounded repository tools, traces,
+and a multi-step state machine. The first Textual harness screen accepts explicit manual actions;
+it does not yet have a tested free-form model-to-structured-action adapter, persistent redaction,
+hard process isolation, or a multi-user control plane. `webapp.py` remains a local admin UI.
 
 The required target is:
 
@@ -282,7 +294,7 @@ must be explicit capabilities.
 
 This is the order that minimizes rework and gives a useful product after each slice.
 
-### Phase 0 — foundation and truthfulness (completed)
+### Phase 0 — foundation and truthfulness (recorded completed at baseline)
 
 - Restore package/docs/license/ignore files and keep frontend/Rust lockfiles visible.
 - Record the actual architecture and limitations in this document.
@@ -293,7 +305,7 @@ This is the order that minimizes rework and gives a useful product after each sl
 **Exit evidence:** clean checkout installs, Python tests run, web build/lint are reproducible when
 dependencies are installed, native tests are reproducible, and all failures are recorded.
 
-### Phase 1 — artifact and evaluation spine (implemented)
+### Phase 1 — artifact and evaluation spine (baseline implemented slice)
 
 The current Phase 1 slice now provides:
 
@@ -308,7 +320,7 @@ The current Phase 1 slice now provides:
 The phase intentionally does not claim semantic grounding, tool execution, release thresholds, or
 general intelligence. Those remain later phases.
 
-### Phase 1A — coding-agent boundary (implemented slice)
+### Phase 1A — coding-agent boundary (baseline implemented slice)
 
 The next product direction is coding-focused. The first backend slice now provides bounded
 repository inspection, expected-hash patching, a fixed pytest profile, structured tool schemas,
@@ -419,7 +431,7 @@ Primary sources consulted for this audit:
 These sources support design decisions; they do not prove that Nanoforge implements their
 algorithms. Every future claim must be tied to a local test, benchmark, or artifact.
 
-## Coding-agent direction (current next slice)
+## Coding-agent direction recorded at the baseline
 
 The product direction is now explicitly coding-agent focused. See
 [`coding-agent-architecture.md`](coding-agent-architecture.md) for the detailed design and

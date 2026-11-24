@@ -62,7 +62,6 @@ data:
   mode: generative
   loss_masking: none
   num_workers: 4
-  prefetch_factor: 4
   pin_memory: true
 
 inference:

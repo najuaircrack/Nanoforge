@@ -50,7 +50,7 @@ def test_dpo_trainer_runs_and_saves(tmp_path: Path) -> None:
     )
 
     cfg = NanoforgeConfig(
-        model=ModelConfig(vocab_size=256, max_seq_len=32, d_model=32, n_layers=1, n_heads=2),
+        model=ModelConfig(vocab_size=260, max_seq_len=32, d_model=32, n_layers=1, n_heads=2),
         training=TrainConfig(
             run_name="dpo",
             output_dir=str(tmp_path / "out"),
@@ -78,7 +78,7 @@ def test_dpo_reference_is_frozen(tmp_path: Path) -> None:
     pref = tmp_path / "prefs.jsonl"
     pref.write_text(json.dumps({"chosen": "yes", "rejected": "no"}) + "\n", encoding="utf-8")
     cfg = NanoforgeConfig(
-        model=ModelConfig(vocab_size=256, max_seq_len=32, d_model=32, n_layers=1, n_heads=2),
+        model=ModelConfig(vocab_size=260, max_seq_len=32, d_model=32, n_layers=1, n_heads=2),
         training=TrainConfig(run_name="dpo", output_dir=str(tmp_path / "out"), max_steps=1, micro_batch_size=1),
         data=DataConfig(train_path="x", val_path="x", seq_len=32, tokenizer_type="byte"),
     )

@@ -48,6 +48,15 @@ def test_write_requires_approval_and_can_be_allowed():
     assert allowed.status == "ok"
 
 
+def test_explicit_empty_capabilities_do_not_gain_read_access():
+    registry = ToolRegistry([_echo_spec()])
+    denied = ToolExecutor(registry, capabilities=set()).execute(
+        {"name": "echo", "arguments": {"value": "x"}}
+    )
+    assert denied.status == "denied"
+    assert "workspace.read" in (denied.error or "")
+
+
 def test_harness_runs_tools_then_final_and_replays_without_side_effects():
     harness = AgentHarness(ToolRegistry([_echo_spec()]))
     actions = iter([
@@ -70,4 +79,6 @@ def test_harness_budget_stops_before_another_action():
         budget=ExecutionBudget(max_steps=1, max_tool_calls=5),
     )
     assert result.status == "blocked"
-    assert "budget" in " ".join(event["details"].get("error", "") for event in result.trace)
+    assert result.error_code == "budget_exceeded"
+    assert "budget" in (result.error or "")
+    assert any(event["details"].get("error", {}).get("redacted") for event in result.trace if isinstance(event["details"].get("error"), dict))

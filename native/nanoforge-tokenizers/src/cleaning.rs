@@ -191,25 +191,39 @@ impl StreamingDeduplicator {
 
     /// Process a batch of raw texts. Returns (cleaned_text, keep) pairs.
     /// Texts that are too short (< min_chars) or duplicates get keep=false.
+    #[pyo3(signature = (texts, min_chars, max_chars=None))]
     fn process_batch(
         &mut self,
         texts: Vec<String>,
         min_chars: usize,
+        max_chars: Option<usize>,
     ) -> Vec<(String, bool)> {
         // 1. Clean in parallel.
-        let cleaned: Vec<(String, u64)> = texts
+        let cleaned: Vec<(String, u64, usize)> = texts
             .par_iter()
             .map(|t| {
-                let c = clean_one(t, self.normalize_unicode, self.collapse_whitespace);
+                let mut c = clean_one(t, self.normalize_unicode, self.collapse_whitespace);
+                let original_chars = c.chars().count();
+                if let Some(limit) = max_chars {
+                    if c.chars().count() > limit {
+                        c = c
+                            .chars()
+                            .take(limit)
+                            .collect::<String>()
+                            .trim_end()
+                            .to_string();
+                        c.push('\n');
+                    }
+                }
                 let h = fnv1a(c.as_bytes());
-                (c, h)
+                (c, h, original_chars)
             })
             .collect();
 
         // 2. Dedup sequentially (state must be consistent across the batch).
         let mut out = Vec::with_capacity(cleaned.len());
-        for (text, hash) in cleaned {
-            if text.len() < min_chars {
+        for (text, hash, original_chars) in cleaned {
+            if original_chars < min_chars {
                 out.push((text, false));
                 continue;
             }
@@ -237,8 +251,12 @@ impl StreamingDeduplicator {
         out
     }
 
-    fn exact_seen_count(&self) -> usize { self.seen_exact.len() }
-    fn near_seen_count(&self) -> usize { self.seen_near.len() }
+    fn exact_seen_count(&self) -> usize {
+        self.seen_exact.len()
+    }
+    fn near_seen_count(&self) -> usize {
+        self.seen_near.len()
+    }
 }
 
 pub fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -246,4 +264,40 @@ pub fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(simhash_batch, module)?)?;
     module.add_class::<StreamingDeduplicator>()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unicode_minimum_counts_characters_not_utf8_bytes() {
+        let mut deduper = StreamingDeduplicator::new(true, false, true, false, 50000, 3);
+        let results = deduper.process_batch(vec!["界界界".to_string()], 8, None);
+        assert!(!results[0].1);
+    }
+
+    #[test]
+    fn normalization_matches_python_golden_examples() {
+        assert_eq!(clean_one("  Ａ\r\nB\0 ", true, false), "A\nB\n");
+        assert_eq!(clean_one("a  \tb\n\n\n\nc", false, true), "a b\n\n\nc\n");
+    }
+
+    #[test]
+    fn exact_dedup_operates_after_truncation() {
+        let mut deduper = StreamingDeduplicator::new(true, false, true, false, 50000, 3);
+        let results = deduper.process_batch(
+            vec!["abcdef1".to_string(), "abcdef2".to_string()],
+            1,
+            Some(6),
+        );
+        assert_eq!(results[0], ("abcdef\n".to_string(), true));
+        assert!(!results[1].1);
+    }
+
+    #[test]
+    fn deterministic_simhash_uses_shared_fnv1a() {
+        assert_eq!(fnv1a(b"hello"), 0xa430d84680aabd0b);
+        assert_eq!(simhash("alpha alpha"), fnv1a(b"alpha"));
+    }
 }

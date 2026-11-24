@@ -1,0 +1,21 @@
+# Copy this file to the root of a project before using it with:
+#   latticekin tui --project path/to/project.yaml
+# workspace_root is relative to this manifest and must not escape it.
+schema_version: 1
+name: local-workspace
+workspace_root: .
+provider_kind: manual
+enabled_tools:
+  - repo.list_files
+  - repo.read_file
+  - repo.search
+  - repo.apply_patch
+  - repo.run_tests
+capabilities:
+  - workspace.read
+approval_mode: read_only
+budgets:
+  max_steps: 12
+  max_tool_calls: 12
+  max_wall_seconds: 120
+  max_output_bytes: 65536

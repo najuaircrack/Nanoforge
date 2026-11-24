@@ -1,11 +1,11 @@
-
 mod cleaning;
+mod corpus;
 
 use pyo3::prelude::*;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::fs;
 use std::io::{BufRead, BufReader};
 
@@ -21,9 +21,9 @@ const SPECIAL_TOKENS: [&str; 14] = [
     "<bos>",
     "<eos>",
     "<unk>",
-    "<fim_prefix>",
-    "<fim_middle>",
-    "<fim_suffix>",
+    "<|fim_prefix|>",
+    "<|fim_middle|>",
+    "<|fim_suffix|>",
     "<|pad|>",
     "<|bos|>",
     "<|eos|>",
@@ -93,9 +93,13 @@ fn word_freq_from_texts_split(texts: &[String]) -> HashMap<Vec<u8>, usize> {
 /// Stream a file line-by-line, never holding more than one line in memory
 /// beyond the frequency table itself.  Pass `split = true` for word-level
 /// tokenisation, `split = false` to treat each line as one sequence.
-fn word_freq_from_reader<R: BufRead>(reader: R, split: bool) -> HashMap<Vec<u8>, usize> {
+fn word_freq_from_reader<R: BufRead>(
+    reader: R,
+    split: bool,
+) -> std::io::Result<HashMap<Vec<u8>, usize>> {
     let mut freq: HashMap<Vec<u8>, usize> = HashMap::new();
-    for line in reader.lines().flatten() {
+    for line in reader.lines() {
+        let line = line?;
         if split {
             for word in line.split_ascii_whitespace() {
                 *freq.entry(word.as_bytes().to_vec()).or_insert(0) += 1;
@@ -104,7 +108,7 @@ fn word_freq_from_reader<R: BufRead>(reader: R, split: bool) -> HashMap<Vec<u8>,
             *freq.entry(line.into_bytes()).or_insert(0) += 1;
         }
     }
-    freq
+    Ok(freq)
 }
 
 #[inline]
@@ -148,7 +152,7 @@ impl TrainingCorpus {
     fn from_file(path: &str, split_on_whitespace: bool) -> std::io::Result<Self> {
         let file = fs::File::open(path)?;
         let reader = BufReader::with_capacity(1 << 20, file); // 1 MiB read buffer
-        let word_freq = word_freq_from_reader(reader, split_on_whitespace);
+        let word_freq = word_freq_from_reader(reader, split_on_whitespace)?;
         Ok(Self::build(word_freq))
     }
 
@@ -184,7 +188,11 @@ impl TrainingCorpus {
             indices.dedup();
         }
 
-        Self { words, pair_counts, pair_index }
+        Self {
+            words,
+            pair_counts,
+            pair_index,
+        }
     }
 
     /// Snapshot the current pair counts into the priority queue.
@@ -202,11 +210,7 @@ impl TrainingCorpus {
 /// consecutive window in `symbols`.  Called with +freq when adding a word's
 /// contribution and -freq when removing it before an in-place merge.
 #[inline]
-fn adjust_pair_counts(
-    symbols: &[u32],
-    delta: i64,
-    counts: &mut HashMap<(u32, u32), i64>,
-) {
+fn adjust_pair_counts(symbols: &[u32], delta: i64, counts: &mut HashMap<(u32, u32), i64>) {
     for w in symbols.windows(2) {
         *counts.entry((w[0], w[1])).or_insert(0) += delta;
     }
@@ -220,10 +224,7 @@ fn merge_in_place(symbols: &mut Vec<u32>, pair: (u32, u32), token_id: u32) -> bo
     let mut read = 0usize;
     let mut changed = false;
     while read < symbols.len() {
-        if read + 1 < symbols.len()
-            && symbols[read] == pair.0
-            && symbols[read + 1] == pair.1
-        {
+        if read + 1 < symbols.len() && symbols[read] == pair.0 && symbols[read + 1] == pair.1 {
             symbols[write] = token_id;
             read += 2;
             changed = true;
@@ -243,18 +244,18 @@ fn run_training(
     corpus: &mut TrainingCorpus,
     max_merges: usize,
     min_frequency: usize,
-    progress_cb: Option<&PyObject>,  // ← NEW
-    py: Python<'_>,    
+    progress_cb: Option<&PyObject>, // ← NEW
+    py: Python<'_>,
 ) -> Vec<(u32, u32)> {
     let min_freq_i64 = min_frequency as i64;
     let mut heap = corpus.build_heap();
     let mut merges: Vec<(u32, u32)> = Vec::with_capacity(max_merges);
 
-    'merge: for step  in 0..max_merges {
+    'merge: for step in 0..max_merges {
         // ── 1. Find the best pair via the priority queue ──────────────────────
         // The heap uses lazy deletion: an entry is valid only when its stored
         // count equals the current count in pair_counts.
-         // ── Report progress every 100 merges ─────────────────────────────────
+        // ── Report progress every 100 merges ─────────────────────────────────
         if let Some(cb) = progress_cb {
             if step % 100 == 0 {
                 let _ = cb.call1(py, (step as u32, max_merges as u32));
@@ -273,21 +274,6 @@ fn run_training(
 
         if best_count < min_freq_i64 {
             break;
-        }
-
-        let (best_count, best_pair) = loop {
-            let Some(HeapEntry { count, pair }) = heap.pop() else {
-                break 'merge; // heap exhausted
-            };
-            let live = corpus.pair_counts.get(&pair).copied().unwrap_or(0);
-            if live > 0 && live == count {
-                break (count, pair); // valid, non-stale entry
-            }
-            // Stale entry (a prior merge reduced the count). Discard and retry.
-        };
-
-        if best_count < min_freq_i64 {
-            break; // remaining pairs are too rare
         }
 
         let token_id = BPE_BYTE_OFFSET + 256 + merges.len() as u32;
@@ -366,7 +352,6 @@ fn run_training(
 
         merges.push(best_pair);
     }
-    
 
     merges
 }
@@ -446,7 +431,8 @@ struct BpeJson {
 #[pyclass]
 struct ByteLevelBpeTokenizer {
     merges: Vec<(u32, u32)>,
-    pair_to_id: HashMap<(u32, u32), u32>,
+    special_tokens: Vec<String>,
+    artifact_version: u32,
     // wrap in Option so it's only populated on first decode call
     id_to_piece: Option<HashMap<u32, Vec<u8>>>,
 }
@@ -469,40 +455,65 @@ impl ByteLevelBpeTokenizer {
     /// Set it to `true` for word-level BPE (much better deduplication on
     /// natural-language text).
     #[staticmethod]
-    #[pyo3(signature = (texts, vocab_size, min_frequency=1, split_on_whitespace=false, progress_cb=None))]
+    #[pyo3(signature = (texts, vocab_size, min_frequency=1, split_on_whitespace=false, progress_cb=None, max_training_bytes=16777216))]
     fn train_from_texts(
         py: Python<'_>,
         texts: Vec<String>,
         vocab_size: usize,
         min_frequency: usize,
         split_on_whitespace: bool,
-        progress_cb: Option<PyObject>,  // ← NEW
+        progress_cb: Option<PyObject>, // ← NEW
+        max_training_bytes: usize,
     ) -> PyResult<Self> {
+        if texts.iter().map(|text| text.len()).sum::<usize>() > max_training_bytes {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "Native tokenizer training byte budget exceeded",
+            ));
+        }
         let mut corpus = TrainingCorpus::from_texts(&texts, split_on_whitespace);
         drop(texts);
         let max_merges = vocab_size.saturating_sub((BPE_BYTE_OFFSET + 256) as usize);
-        let merges = run_training(&mut corpus, max_merges, min_frequency.max(1), progress_cb.as_ref(), py);
+        let merges = run_training(
+            &mut corpus,
+            max_merges,
+            min_frequency.max(1),
+            progress_cb.as_ref(),
+            py,
+        );
         Ok(Self::build_tables(merges))
     }
 
     #[staticmethod]
-    #[pyo3(signature = (path, vocab_size, min_frequency=1, split_on_whitespace=true, progress_cb=None))]
+    #[pyo3(signature = (path, vocab_size, min_frequency=1, split_on_whitespace=true, progress_cb=None, max_training_bytes=16777216))]
     fn train_from_file(
         py: Python<'_>,
         path: &str,
         vocab_size: usize,
         min_frequency: usize,
         split_on_whitespace: bool,
-        progress_cb: Option<PyObject>,  // ← NEW
+        progress_cb: Option<PyObject>, // ← NEW
+        max_training_bytes: usize,
     ) -> PyResult<Self> {
+        let size = fs::metadata(path)
+            .map_err(|error| pyo3::exceptions::PyOSError::new_err(error.to_string()))?
+            .len();
+        if size > max_training_bytes as u64 {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "Native tokenizer training byte budget exceeded",
+            ));
+        }
         let mut corpus = TrainingCorpus::from_file(path, split_on_whitespace)
             .map_err(|e| pyo3::exceptions::PyOSError::new_err(e.to_string()))?;
         let max_merges = vocab_size.saturating_sub((BPE_BYTE_OFFSET + 256) as usize);
-        let merges = run_training(&mut corpus, max_merges, min_frequency.max(1), progress_cb.as_ref(), py);
+        let merges = run_training(
+            &mut corpus,
+            max_merges,
+            min_frequency.max(1),
+            progress_cb.as_ref(),
+            py,
+        );
         Ok(Self::build_tables(merges))
     }
-
-    
 
     // ── Getters ───────────────────────────────────────────────────────────────
 
@@ -527,25 +538,73 @@ impl ByteLevelBpeTokenizer {
         BPE_BYTE_OFFSET + 256 + self.merges.len() as u32
     }
 
+    #[getter]
+    fn artifact_version(&self) -> u32 {
+        self.artifact_version
+    }
+
     // ── Encode / decode (unchanged behaviour) ─────────────────────────────────
 
-   // In ByteLevelBpeTokenizer impl, replace encode():
     fn encode(&self, text: &str, add_bos: bool, add_eos: bool) -> Vec<u32> {
-        let mut a: Vec<u32> = text
-            .as_bytes()
-            .iter()
-            .map(|b| u32::from(*b) + BPE_BYTE_OFFSET)
-            .collect();
-        let mut b: Vec<u32> = Vec::with_capacity(a.len());
-
-        for (idx, &pair) in self.merges.iter().enumerate() {
-            apply_merge_inplace(&a, &mut b, pair, BPE_BYTE_OFFSET + 256 + idx as u32);
-            std::mem::swap(&mut a, &mut b);
+        if self.artifact_version == 1 {
+            let mut output = self.encode_plain(text);
+            if add_bos {
+                output.insert(0, BOS_ID);
+            }
+            if add_eos {
+                output.push(EOS_ID);
+            }
+            return output;
         }
-
-        if add_bos { a.insert(0, BOS_ID); }
-        if add_eos { a.push(EOS_ID); }
-        a
+        let mut output = Vec::new();
+        if add_bos {
+            output.push(BOS_ID);
+        }
+        let aliases: Vec<(u32, &str)> = [
+            ("<fim_prefix>", "<|fim_prefix|>"),
+            ("<fim_middle>", "<|fim_middle|>"),
+            ("<fim_suffix>", "<|fim_suffix|>"),
+        ]
+        .iter()
+        .filter_map(|(old, canonical)| {
+            self.special_tokens
+                .iter()
+                .position(|token| token == old)
+                .map(|id| (id as u32, *canonical))
+        })
+        .collect();
+        let mut position = 0;
+        let mut plain_start = 0;
+        while position < text.len() {
+            let remaining = &text[position..];
+            let mut special = self
+                .special_tokens
+                .iter()
+                .enumerate()
+                .filter(|(_, token)| remaining.starts_with(token.as_str()))
+                .max_by_key(|(_, token)| token.len())
+                .map(|(id, token)| (id as u32, token.len()));
+            for &(id, canonical) in &aliases {
+                if remaining.starts_with(canonical)
+                    && special.map_or(true, |(_, length)| canonical.len() > length)
+                {
+                    special = Some((id, canonical.len()));
+                }
+            }
+            if let Some((id, length)) = special {
+                output.extend(self.encode_plain(&text[plain_start..position]));
+                output.push(id);
+                position += length;
+                plain_start = position;
+            } else {
+                position += remaining.chars().next().unwrap().len_utf8();
+            }
+        }
+        output.extend(self.encode_plain(&text[plain_start..]));
+        if add_eos {
+            output.push(EOS_ID);
+        }
+        output
     }
 
     fn encode_batch(&self, texts: Vec<String>, add_bos: bool, add_eos: bool) -> Vec<Vec<u32>> {
@@ -556,11 +615,15 @@ impl ByteLevelBpeTokenizer {
     }
 
     fn decode(&mut self, ids: Vec<u32>) -> PyResult<String> {
+        let special_tokens = self.special_tokens.clone();
+        let artifact_version = self.artifact_version;
         let table = self.get_or_build_pieces();
         let mut bytes = Vec::new();
         for idx in ids {
             if let Some(piece) = table.get(&idx) {
                 bytes.extend_from_slice(piece);
+            } else if artifact_version >= 2 && idx >= 4 && idx < BPE_BYTE_OFFSET {
+                bytes.extend_from_slice(special_tokens[idx as usize].as_bytes());
             }
         }
         Ok(String::from_utf8_lossy(&bytes).to_string())
@@ -571,18 +634,35 @@ impl ByteLevelBpeTokenizer {
     fn save(&self, path: &str) -> PyResult<()> {
         let payload = BpeJson {
             kind: "nanoforge_python_bpe".to_string(),
-            version: 1,
-            special_tokens: SPECIAL_TOKENS.iter().map(|t| t.to_string()).collect(),
+            version: self.artifact_version,
+            special_tokens: self.special_tokens.clone(),
             merges: self.merges.iter().map(|&(l, r)| [l, r]).collect(),
         };
         let json = serde_json::to_string(&payload)
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
-        fs::write(path, json)
-            .map_err(|e| pyo3::exceptions::PyOSError::new_err(e.to_string()))
+        fs::write(path, json).map_err(|e| pyo3::exceptions::PyOSError::new_err(e.to_string()))
     }
 }
 
 impl ByteLevelBpeTokenizer {
+    fn encode_plain(&self, text: &str) -> Vec<u32> {
+        let mut first: Vec<u32> = text
+            .as_bytes()
+            .iter()
+            .map(|byte| u32::from(*byte) + BPE_BYTE_OFFSET)
+            .collect();
+        let mut second = Vec::with_capacity(first.len());
+        for (index, &pair) in self.merges.iter().enumerate() {
+            apply_merge_inplace(
+                &first,
+                &mut second,
+                pair,
+                BPE_BYTE_OFFSET + 256 + index as u32,
+            );
+            std::mem::swap(&mut first, &mut second);
+        }
+        first
+    }
 
     fn get_or_build_pieces(&mut self) -> &HashMap<u32, Vec<u8>> {
         self.id_to_piece.get_or_insert_with(|| {
@@ -611,20 +691,46 @@ impl ByteLevelBpeTokenizer {
                 "Tokenizer is not a Nanoforge byte-level BPE artifact.",
             ));
         }
+        if !(1..=2).contains(&payload.version)
+            || payload.special_tokens.len() != BPE_BYTE_OFFSET as usize
+            || payload.special_tokens.iter().any(String::is_empty)
+            || payload.special_tokens.iter().collect::<HashSet<_>>().len()
+                != BPE_BYTE_OFFSET as usize
+        {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "Tokenizer schema or special-token layout requires migration",
+            ));
+        }
+        let mut seen_merges = HashSet::new();
+        for (index, pair) in payload.merges.iter().enumerate() {
+            let next = BPE_BYTE_OFFSET + 256 + index as u32;
+            if pair.iter().any(|&id| id < BPE_BYTE_OFFSET || id >= next) {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "Tokenizer contains an invalid merge reference",
+                ));
+            }
+            if !seen_merges.insert(pair) {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "Tokenizer contains duplicate merge pairs",
+                ));
+            }
+        }
+        let special_tokens = payload.special_tokens;
+        let artifact_version = payload.version;
         let merges = payload.merges.into_iter().map(|p| (p[0], p[1])).collect();
-        Ok(Self::build_tables(merges))
+        let mut tokenizer = Self::build_tables(merges);
+        tokenizer.special_tokens = special_tokens;
+        tokenizer.artifact_version = artifact_version;
+        Ok(tokenizer)
     }
 
     fn build_tables(merges: Vec<(u32, u32)>) -> Self {
-        let mut pair_to_id: HashMap<(u32, u32), u32> =
-            HashMap::with_capacity(merges.len());
         let mut id_to_piece: HashMap<u32, Vec<u8>> = (0u32..256)
             .map(|b| (BPE_BYTE_OFFSET + b, vec![b as u8]))
             .collect();
 
         for (idx, &pair) in merges.iter().enumerate() {
             let token_id = BPE_BYTE_OFFSET + 256 + idx as u32;
-            pair_to_id.insert(pair, token_id);
             let mut piece = id_to_piece.get(&pair.0).cloned().unwrap_or_default();
             if let Some(right) = id_to_piece.get(&pair.1) {
                 piece.extend_from_slice(right);
@@ -632,9 +738,16 @@ impl ByteLevelBpeTokenizer {
             id_to_piece.insert(token_id, piece);
         }
 
-        Self { merges, pair_to_id, id_to_piece: Some(id_to_piece) }
+        Self {
+            merges,
+            artifact_version: 2,
+            special_tokens: SPECIAL_TOKENS
+                .iter()
+                .map(|token| token.to_string())
+                .collect(),
+            id_to_piece: Some(id_to_piece),
+        }
     }
-    
 }
 
 // ── Module-level free functions ───────────────────────────────────────────────
@@ -666,7 +779,6 @@ fn apply_merge_inplace(src: &[u32], dst: &mut Vec<u32>, pair: (u32, u32), token_
     }
 }
 
-
 #[pyfunction]
 fn sanitize_utf8(data: &[u8]) -> String {
     String::from_utf8_lossy(data).replace('\0', "")
@@ -687,5 +799,104 @@ fn nanoforge_tokenizers(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(sanitize_utf8, module)?)?;
     module.add_function(wrap_pyfunction!(encode_byte_text, module)?)?;
     cleaning::register(module)?;
+    corpus::register(module)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    #[test]
+    fn byte_layout_and_unicode_roundtrip() {
+        let encoded = encode_bytes("hello 界".as_bytes(), true, true);
+        assert_eq!(encoded[0], BOS_ID);
+        assert_eq!(*encoded.last().unwrap(), EOS_ID);
+        let bytes: Vec<u8> = encoded
+            .into_iter()
+            .filter(|id| *id >= OFFSET)
+            .map(|id| (id - OFFSET) as u8)
+            .collect();
+        assert_eq!(String::from_utf8(bytes).unwrap(), "hello 界");
+    }
+
+    #[test]
+    fn bpe_preserves_canonical_special_tokens() {
+        let mut tokenizer = ByteLevelBpeTokenizer::build_tables(Vec::new());
+        for (id, token) in SPECIAL_TOKENS.iter().enumerate().skip(4) {
+            assert_eq!(tokenizer.encode(token, false, false), vec![id as u32]);
+            assert_eq!(tokenizer.decode(vec![id as u32]).unwrap(), *token);
+        }
+        let text = "a<|fim_prefix|>界<|assistant|>answer";
+        assert_eq!(
+            tokenizer
+                .decode(tokenizer.encode(text, false, false))
+                .unwrap(),
+            text
+        );
+    }
+
+    #[test]
+    fn bpe_merge_only_changes_matching_pairs() {
+        let left = BPE_BYTE_OFFSET + u32::from(b'a');
+        let right = BPE_BYTE_OFFSET + u32::from(b'b');
+        let mut tokenizer = ByteLevelBpeTokenizer::build_tables(vec![(left, right)]);
+        let ids = tokenizer.encode("ababx", false, false);
+        assert_eq!(
+            ids,
+            vec![
+                BPE_BYTE_OFFSET + 256,
+                BPE_BYTE_OFFSET + 256,
+                BPE_BYTE_OFFSET + u32::from(b'x')
+            ]
+        );
+        assert_eq!(tokenizer.decode(ids).unwrap(), "ababx");
+    }
+
+    #[test]
+    fn legacy_artifacts_keep_literal_byte_encoding() {
+        let mut tokenizer = ByteLevelBpeTokenizer::build_tables(Vec::new());
+        tokenizer.artifact_version = 1;
+        let text = "<fim_prefix><|assistant|>";
+        let expected: Vec<u32> = text
+            .as_bytes()
+            .iter()
+            .map(|byte| BPE_BYTE_OFFSET + u32::from(*byte))
+            .collect();
+        assert_eq!(tokenizer.encode(text, false, false), expected);
+        assert_eq!(tokenizer.decode(expected).unwrap(), text);
+    }
+
+    #[test]
+    fn native_reader_propagates_invalid_utf8() {
+        assert!(word_freq_from_reader(Cursor::new(vec![0xff, b'\n']), true).is_err());
+    }
+
+    #[test]
+    fn native_reader_preserves_frequency_counts() {
+        let words = word_freq_from_reader(Cursor::new(b"alpha beta\nalpha\n"), true).unwrap();
+        assert_eq!(words.get(b"alpha".as_slice()), Some(&2));
+        assert_eq!(words.get(b"beta".as_slice()), Some(&1));
+    }
+
+    #[test]
+    fn pair_updates_and_inplace_merging_are_consistent() {
+        let mut symbols = vec![14, 15, 14, 15, 16];
+        let mut counts = HashMap::new();
+        adjust_pair_counts(&symbols, 1, &mut counts);
+        assert_eq!(counts.get(&(14, 15)), Some(&2));
+        assert!(merge_in_place(&mut symbols, (14, 15), 270));
+        assert_eq!(symbols, vec![270, 270, 16]);
+    }
+
+    #[test]
+    fn training_selects_the_single_most_frequent_pair() {
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            let mut corpus = TrainingCorpus::from_texts(&["aaaaaa".to_string()], false);
+            let merges = run_training(&mut corpus, 1, 2, None, py);
+            assert_eq!(merges, vec![(BPE_BYTE_OFFSET + 97, BPE_BYTE_OFFSET + 97)]);
+        });
+    }
 }

@@ -45,6 +45,14 @@ def _build_ffn(config: ModelConfig) -> tuple[nn.Module, bool]:
     return ffn, False
 
 
+def _run_ffn(ffn, hidden, cache, use_cache):
+    if use_cache and hasattr(ffn, "forward_cached"):
+        output, state = ffn.forward_cached(hidden, cache.ffn_state)
+        cache.ffn_state = state
+        return output
+    return ffn(hidden)
+
+
 class TransformerBlock(nn.Module):
     def __init__(self, config: ModelConfig):
         super().__init__()
@@ -63,7 +71,7 @@ class TransformerBlock(nn.Module):
         if self.moe:
             ffn_out, aux_loss = self.ffn(ffn_in)
         else:
-            ffn_out = self.ffn(ffn_in)
+            ffn_out = _run_ffn(self.ffn, ffn_in, cache, use_cache)
         x = x + ffn_out * self.residual_scale
         return x, cache, aux_loss
 
@@ -86,7 +94,7 @@ class ParallelResidualTransformerBlock(nn.Module):
         if self.moe:
             ffn_out, aux_loss = self.ffn(hidden)
         else:
-            ffn_out = self.ffn(hidden)
+            ffn_out = _run_ffn(self.ffn, hidden, cache, use_cache)
         x = x + (attn_out + ffn_out) * self.residual_scale
         return x, cache, aux_loss
 
@@ -117,6 +125,18 @@ class NanoforgeBackbone(nn.Module):
         return next(self.parameters()).device
 
     def forward(self, input_ids: torch.Tensor, caches=None, use_cache: bool = False):
+        if input_ids.ndim != 2 or input_ids.shape[0] == 0 or input_ids.shape[1] == 0:
+            raise ValueError("Model input must be nonempty [batch, tokens].")
+        if input_ids.dtype not in (torch.int32, torch.int64):
+            raise ValueError("Model input IDs must be integer tensors.")
+        if caches is not None:
+            if not isinstance(caches, (list, tuple)) or len(caches) != len(self.blocks):
+                raise ValueError("The cache list must have one entry per transformer block.")
+            if any(cache is not None and not isinstance(cache, KVCache) for cache in caches):
+                raise ValueError("Invalid transformer cache entry.")
+            positions = {cache.tokens_seen if cache is not None else 0 for cache in caches}
+            if len(positions) > 1:
+                raise ValueError("Transformer cache positions must agree across layers.")
         x = self.embedding(input_ids)
         new_caches: list[KVCache] = []
         aux_losses: list[torch.Tensor] = []
@@ -125,11 +145,9 @@ class NanoforgeBackbone(nn.Module):
 
         for block, cache in zip(self.blocks, caches):
             if self.config.gradient_checkpointing and self.training and not use_cache:
-                def _ckpt(h: torch.Tensor) -> torch.Tensor:
-                    y, _, _ = block(h, None, False)
-                    return y
-                x = torch.utils.checkpoint.checkpoint(_ckpt, x, use_reentrant=False)
-                new_cache, aux = None, None
+                x, new_cache, aux = torch.utils.checkpoint.checkpoint(
+                    block, x, None, False, use_reentrant=False
+                )
             else:
                 x, new_cache, aux = block(x, cache=cache, use_cache=use_cache)
             if use_cache:
@@ -178,18 +196,25 @@ class NanoforgeModel(nn.Module):
         labels: torch.Tensor | None = None,
         caches=None,
         use_cache: bool = False,
+        return_hidden_states: bool = False,
     ) -> ModelOutput:
-        if input_ids.shape[1] > self.config.max_seq_len and not use_cache:
+        if input_ids.ndim != 2 or input_ids.shape[1] > self.config.max_seq_len:
             raise ValueError(f"Sequence length exceeds max_seq_len={self.config.max_seq_len}.")
         hidden, new_caches, aux_losses = self.backbone(input_ids, caches, use_cache)
-        return self.head(hidden, labels, aux_losses, new_caches)
+        output = self.head(hidden, labels, aux_losses, new_caches)
+        if return_hidden_states:
+            output.hidden_states = hidden
+        return output
 
     @torch.inference_mode()
     def prefill(self, input_ids: torch.Tensor) -> ModelOutput:
         return self(input_ids, use_cache=True)
 
     def estimate_num_params(self, non_embedding: bool = False) -> int:
-        return self.backbone.estimate_num_params(non_embedding)
+        count = sum(parameter.numel() for parameter in self.parameters())
+        if non_embedding:
+            count -= self.backbone.embedding.embed.weight.numel()
+        return count
 
 
 def NanoforgeForCausalLM(config: ModelConfig) -> NanoforgeModel:

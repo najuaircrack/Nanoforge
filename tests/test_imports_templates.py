@@ -33,7 +33,9 @@ def test_auto_train_prepare_only_writes_config_and_packed_data(tmp_path, monkeyp
     data = tmp_path / "raw"
     data.mkdir()
     (data / "chat.jsonl").write_text(
-        json.dumps({"messages": [{"role": "user", "content": "Hi"}, {"role": "assistant", "content": "Hello"}]}) + "\n",
+        "\n".join(json.dumps({"messages": [{"role": "user", "content": prompt},
+                                            {"role": "assistant", "content": reply}]})
+                  for prompt, reply in [("Hi", "Hello"), ("Bye", "Goodbye")]) + "\n",
         encoding="utf-8",
     )
     config = tmp_path / "configs" / "chat.yaml"

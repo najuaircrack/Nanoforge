@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
-from nanoforge.data.fim import transform_fim_text
+from nanoforge.data.fim import transform_fim_text, validate_fim_tokenizer
 from nanoforge.data.formats import DatasetRecord
 from nanoforge.data.tokenizer import TokenizerLike
 
@@ -66,6 +66,7 @@ def encode_training_record(
     actual_mode = infer_record_mode(record, mode)
     policy = resolve_loss_masking(actual_mode, loss_masking)
     if actual_mode == "fim":
+        validate_fim_tokenizer(tokenizer)
         transformed = transform_fim_text(record.text)
         ids = tokenizer.encode(transformed, add_bos=add_bos, add_eos=add_eos)
         labels = list(ids)
@@ -173,47 +174,37 @@ def _encode_role_boundary_sequences(
     loss_masking: str,
     assistant_target_fraction: float,
 ) -> list[EncodedTrainingSequence]:
+    if seq_len < 2:
+        raise ValueError("seq_len must be at least two")
     blocks = _role_blocks(text)
     if not any(role == "assistant" for role, _ in blocks):
         return []
-    system_parts = [content for role, content in blocks if role == "system"]
-    last_user = ""
+    history_ids: list[int] = []
     sequences: list[EncodedTrainingSequence] = []
-    max_target_tokens = max(8, int(seq_len * max(0.1, min(0.8, assistant_target_fraction))))
+    max_target = max(1, min(seq_len - 1, int(seq_len * max(0.1, min(0.8, assistant_target_fraction)))))
     for role, content in blocks:
-        if role == "user":
-            last_user = content
-            continue
-        if role != "assistant" or not content.strip():
-            continue
-        prefix_text = _chat_prefix(system_parts, last_user)
-        prefix_ids = tokenizer.encode(prefix_text, add_bos=False, add_eos=False)
-        max_prefix = max(8, seq_len + 1 - max_target_tokens - 2)
-        if len(prefix_ids) > max_prefix:
-            prefix_ids = prefix_ids[-max_prefix:]
+        marker = tokenizer.encode(f"<|{role}|>\n", add_bos=False, add_eos=False)
         content_ids = tokenizer.encode(content, add_bos=False, add_eos=False)
-        if not content_ids:
-            continue
-        capacity = max(1, min(max_target_tokens, seq_len + 1 - len(prefix_ids) - 2))
-        for start in range(0, len(content_ids), capacity):
-            chunk = content_ids[start : start + capacity]
-            is_last = start + capacity >= len(content_ids)
-            full_ids = [tokenizer.bos_id] + prefix_ids + chunk
-            full_labels = [-100] * (1 + len(prefix_ids)) + chunk
-            if is_last and len(full_ids) < seq_len + 1:
-                full_ids.append(tokenizer.eos_id)
-                full_labels.append(tokenizer.eos_id)
-            sequences.extend(
-                _fixed_shifted_sequences(
-                    full_ids,
-                    full_labels,
-                    tokenizer.pad_id,
-                    seq_len=seq_len,
-                    mode=mode,
-                    loss_masking=loss_masking,
-                    allow_chunking=False,
-                )
-            )
+        prefix = history_ids + marker
+        if role == "assistant" and content_ids:
+            for start in range(0, len(content_ids), max_target):
+                chunk = content_ids[start:start + max_target]
+                causal_prefix = prefix + content_ids[:start]
+                prefix_budget = max(0, seq_len - len(chunk) - 1)
+                causal_prefix = causal_prefix[-prefix_budget:] if prefix_budget else []
+                full_ids = [tokenizer.bos_id] + causal_prefix + chunk
+                full_labels = [-100] * (1 + len(causal_prefix)) + chunk
+                if start + len(chunk) == len(content_ids):
+                    full_ids.append(tokenizer.eos_id)
+                    full_labels.append(tokenizer.eos_id)
+                sequences.extend(_fixed_shifted_sequences(
+                    full_ids, full_labels, tokenizer.pad_id, seq_len=seq_len,
+                    mode=mode, loss_masking=loss_masking, allow_chunking=False,
+                ))
+        # Only already-observed turns enter the prefix. Future system/tool turns
+        # cannot leak into an earlier answer; continuation chunks include their tail.
+        history_ids.extend(marker)
+        history_ids.extend(content_ids)
     return sequences
 
 
@@ -261,7 +252,9 @@ def _fixed_shifted_sequences(
     if len(ids) < 2:
         return []
     chunk_width = seq_len + 1
-    starts = range(0, len(ids), chunk_width) if allow_chunking else (0,)
+    if seq_len < 1:
+        raise ValueError("seq_len must be positive")
+    starts = range(0, len(ids) - 1, seq_len) if allow_chunking else (0,)
     sequences: list[EncodedTrainingSequence] = []
     for start in starts:
         full_ids = ids[start : start + chunk_width]
@@ -304,11 +297,7 @@ def _encode_completion_masked(
             marker = candidate
             break
     if split_at < 0:
-        ids = tokenizer.encode(text, add_bos=add_bos, add_eos=add_eos)
-        labels = list(ids)
-        if labels:
-            labels[0] = -100
-        return ids, labels
+        raise ValueError("completion_only masking requires a recognizable completion boundary")
     prompt = text[: split_at + len(marker)]
     completion = text[split_at + len(marker) :]
     prompt_ids = tokenizer.encode(prompt, add_bos=add_bos, add_eos=False)

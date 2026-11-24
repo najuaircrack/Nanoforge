@@ -61,7 +61,7 @@ def test_tokenizer_training_iterator_uses_structured_reader(tmp_path):
     path = tmp_path / "records.jsonl"
     path.write_text(json.dumps({"prompt": "A", "completion": "B"}) + "\n", encoding="utf-8")
     texts = list(iter_tokenizer_training_texts([path], text_key="missing"))
-    assert texts == ["A\nB\n"]
+    assert texts == ["<|user|>\nA\n<|assistant|>\nB\n"]
 
 
 def test_bpe_tokenizer_dry_run_reports_malformed_records(tmp_path):
@@ -131,6 +131,32 @@ def test_packed_chat_dataset_writes_label_masks(tmp_path):
     _x, y = dataset.sample(4)
     unmasked = (y != -100).sum(dim=1)
     assert bool(((unmasked > 0) & (unmasked < 64)).all())
+
+
+def test_fim_packing_reserves_a_loadable_validation_sequence(tmp_path):
+    path = tmp_path / "fim.jsonl"
+    rows = [{"text": "int value(void) { return 42; }\n" * 8}, {"text": "int other(void) { return 7; }\n" * 8}]
+    path.write_text("\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8")
+    out_dir = tmp_path / "packed-fim"
+    stats = build_packed_dataset_streaming(
+        [path],
+        out_dir,
+        ByteTokenizer(),
+        val_fraction=0.01,
+        mode="fim",
+        seq_len=128,
+        cleaning=None,
+    )
+
+    assert stats.val_tokens >= 128
+    assert stats.train_tokens >= 128
+    train = PackedMemmapDataset(out_dir / "train.bin", seq_len=128)
+    val = PackedMemmapDataset(out_dir / "val.bin", seq_len=128)
+    assert len(train) > 0
+    assert len(val) > 0
+    manifest = json.loads((out_dir / "packing.manifest.json").read_text(encoding="utf-8"))
+    assert manifest["fixed_sequences"] is True
+    assert manifest["sequence_length"] == 128
 
 
 def test_parquet_messages_column_formats_stringified_chat(tmp_path):

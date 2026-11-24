@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import math
+
 import torch
 from torch import nn
 from torch.nn import functional as F
@@ -43,6 +45,18 @@ class MambaSelectiveStateFeedForward(nn.Module):
         mixed = self.depthwise(value.transpose(1, 2))[..., : x.shape[1]].transpose(1, 2)
         return self.out_proj(self.dropout(F.silu(mixed) * torch.sigmoid(gate)))
 
+    def forward_cached(self, x, state=None):
+        value, gate = self.in_proj(x).chunk(2, dim=-1)
+        if state is None:
+            state = value.new_zeros((value.shape[0], 2, value.shape[-1]))
+        if state.shape != (value.shape[0], 2, value.shape[-1]):
+            raise ValueError("Invalid temporal convolution cache state.")
+        combined = torch.cat((state, value), dim=1)
+        mixed = F.conv1d(combined.transpose(1, 2), self.depthwise.weight,
+                         self.depthwise.bias, groups=self.depthwise.groups).transpose(1, 2)
+        output = self.out_proj(self.dropout(F.silu(mixed) * torch.sigmoid(gate)))
+        return output, combined[:, -2:].detach().clone()
+
 
 class RWKVMixingFeedForward(nn.Module):
     """RWKV-inspired time-mixing FFN backend for experimentation."""
@@ -60,6 +74,15 @@ class RWKVMixingFeedForward(nn.Module):
         mixed = x * self.time_mix + shifted * (1.0 - self.time_mix)
         return torch.sigmoid(self.receptance(x)) * self.value(self.dropout(F.silu(self.key(mixed))))
 
+    def forward_cached(self, x, state=None):
+        previous = x[:, :1] if state is None else state
+        if previous.shape != (x.shape[0], 1, x.shape[-1]):
+            raise ValueError("Invalid RWKV-inspired mixer cache state.")
+        shifted = torch.cat((previous, x[:, :-1]), dim=1)
+        mixed = x * self.time_mix + shifted * (1.0 - self.time_mix)
+        output = torch.sigmoid(self.receptance(x)) * self.value(self.dropout(F.silu(self.key(mixed))))
+        return output, x[:, -1:].detach().clone()
+
 
 class MoEFeedForward(nn.Module):
     def __init__(
@@ -71,7 +94,12 @@ class MoEFeedForward(nn.Module):
         dropout: float = 0.0,
     ):
         super().__init__()
+        if config.num_experts < 1 or not 1 <= config.top_k <= config.num_experts:
+            raise ValueError("MoE requires 1 <= top_k <= num_experts.")
+        if not math.isfinite(config.capacity_factor) or config.capacity_factor <= 0:
+            raise ValueError("MoE capacity_factor must be positive and finite.")
         self.config = config
+        self.routing_stats = {}
         self.router = nn.Linear(dim, config.num_experts, bias=False)
         self.experts = nn.ModuleList(
             [FeedForward(dim, hidden_dim, activation, dropout) for _ in range(config.num_experts)]
@@ -85,14 +113,26 @@ class MoEFeedForward(nn.Module):
         weights, indices = router_probs.topk(self.config.top_k, dim=-1)
         weights = weights / weights.sum(dim=-1, keepdim=True).clamp_min(1e-9)
         out = torch.zeros_like(flat)
+        assigned = torch.zeros_like(router_probs)
+        capacity = max(1, math.ceil(self.config.capacity_factor * flat.shape[0]
+                                    * self.config.top_k / self.config.num_experts))
+        dropped = 0
         for expert_id, expert in enumerate(self.experts):
             mask = indices == expert_id
             if not mask.any():
                 continue
             token_idx, rank_idx = mask.nonzero(as_tuple=True)
+            if self.training and len(token_idx) > capacity:
+                selected = weights[token_idx, rank_idx].argsort(descending=True, stable=True)[:capacity]
+                dropped += len(token_idx) - capacity
+                token_idx, rank_idx = token_idx[selected], rank_idx[selected]
+            assigned[token_idx, expert_id] = 1.
             expert_out = expert(flat[token_idx])
             out[token_idx] += expert_out * weights[token_idx, rank_idx].unsqueeze(-1)
         density = router_probs.mean(dim=0)
-        density_proxy = (router_probs > (1.0 / self.config.num_experts)).float().mean(dim=0)
-        aux_loss = (density * density_proxy).sum() * (self.config.num_experts**2)
+        density_proxy = assigned.mean(dim=0) / self.config.top_k
+        aux_loss = (density * density_proxy).sum() * self.config.num_experts
+        self.routing_stats = {"assignments": flat.shape[0] * self.config.top_k,
+                              "dropped_assignments": dropped, "expert_capacity": capacity,
+                              "capacity_enforced": self.training}
         return out.reshape(shape), aux_loss

@@ -1,4 +1,4 @@
-# Gates: Nanoforge platform foundation audit
+# Gates: Latticekin platform foundation audit
 
 OWNS: AGENTS.md, GATES.md, README.md, CHANGELOG.md, CONTRIBUTING.md, LICENSE.md, .gitignore, .python-version, .nvmrc, Dockerfile, .dockerignore, Makefile, docs/platform-audit.md, src/nanoforge/**, tests/**, web/**
 

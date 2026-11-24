@@ -24,7 +24,7 @@ training:
   output_dir: runs/chat25m
   seed: 1337
   max_steps: 3000
-  resume_from_checkpoint: runs/chat25m/best.pt
+  resume_from_checkpoint: null
   batch_size: 12
   micro_batch_size: 4
   grad_accum_steps: 3

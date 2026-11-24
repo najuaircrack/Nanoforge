@@ -1,247 +1,136 @@
-# Training Guide
+# Training guide
 
-This is the single source of truth for training workflows. For the full flag list of any
-command see [cli.md](cli.md); for config fields see [configuration.md](configuration.md).
+The quickest reproducible check is `python scripts/run_smoke.py --out runs/public-smoke`.
+It authors public CC0 C examples, packs distinct held-out source groups, trains a tiny CPU model,
+saves a checkpoint and evaluates it. The output directory must be new. This proves pipeline
+correctness; it does not demonstrate useful general coding ability.
 
-Nanoforge trains three main styles:
+## Install and check
 
-- **generative** — plain next-token text/story continuation (no label masking).
-- **chat** — role-based conversations, assistant-only labels.
-- **instruct** — instruction/response pairs, completion-only labels.
+Use Python 3.10–3.12. After creating and activating a virtual environment:
 
-For coding-specialist experiments, `mode: fim` applies deterministic fill-in-the-middle
-formatting with `<|fim_prefix|>`, `<|fim_suffix|>`, and `<|fim_middle|>` sentinels. Use a real
-code tokenizer that preserves those sentinels as dedicated tokens; byte-tokenizer FIM is only a
-pipeline smoke test.
-
-For Windows 11 CPU-only training with ~8 GB RAM, a good starting point is `native-bpe`,
-`vocab_size=8000`, `seq_len=512` for chat/instruct, `seq_len=1024` for generative text —
-or the dependency-free `byte` tokenizer for the smallest experiments.
-
-Examples use `^` (Windows) for line continuation; use `\` on Linux/macOS.
-
----
-
-## Fast path: `auto-train`
-
-One command inspects the dataset, infers/applies the mode, trains the tokenizer, packs data
-with the right masking, writes a CPU-friendly config, and starts training:
-
-```powershell
-nanoforge auto-train ^
-  --input data/raw ^
-  --name ultrachat-18m ^
-  --mode chat ^
-  --tokenizer native-bpe ^
-  --vocab-size 8000 ^
-  --text-column messages ^
-  --seq-len 512
+```text
+python -m pip install -e ".[dev,tokenizers,serve,tui]"
+python scripts/run_smoke.py --out runs/public-smoke
 ```
 
-This writes:
+For the full offline repository check, install Node 24 and run `npm ci` in `web/` first,
+then `python scripts/check.py` (or `make test`). Offline means checks do not fetch models
+or install dependencies. Optional paths need the extras listed in the README.
 
-- tokenizer → `data/tokenizers/ultrachat-18m-bpe.json`
-- packed data → `data/packed/ultrachat-18m/`
-- config → `configs/ultrachat-18m.yaml`
-- run outputs → `runs/ultrachat-18m/`
+Examples below use single-line commands that work in PowerShell, cmd.exe and Unix shells.
+Use PowerShell backticks only when splitting a command across lines; cmd.exe's caret syntax
+does not work as PowerShell continuation.
 
-Add `--no-train` to stop after setup (tokenizer + packing + config), then train later:
+## Public C/FIM experiment
 
-```powershell
-nanoforge train --config configs/ultrachat-18m.yaml
+These commands use matching checked-in settings and a newly authored dataset:
+
+```text
+python scripts/make_public_fixtures.py --kind c --out data/demo/public-c-tiny
+python -m nanoforge validate-config --config configs/c-tiny.yaml
+python -m nanoforge inspect-dataset --input data/demo/public-c-tiny
+python -m nanoforge prepare --input data/demo/public-c-tiny --tokenizer byte --mode fim --seq-len 128 --val-fraction 0.25 --out data/packed/c-tiny --no-progress
+python -m nanoforge train --config configs/c-tiny.yaml --no-tui
+python -m nanoforge evaluate --checkpoint runs/c-tiny/last.pt --data data/packed/c-tiny/val.bin --seq-len 128 --batches 5 --device cpu
 ```
 
-### Auto mode detection
+The fixture has twelve distinct source groups. FIM removes an internal span and formats
+prefix, suffix and the missing middle with the FIM sentinels. Byte tokenization encodes those
+sentinels as bytes and is intended only for this smoke experiment. Real coding training should
+validate dedicated FIM token IDs and split by repository/snapshot.
 
-With `--mode auto`, dataset fields decide the mode:
+## Public chat experiment
 
-| Fields present | Mode |
-| --- | --- |
-| `messages` or `conversations` | `chat` |
-| `instruction` + (`output` or `response`) | `instruct` |
-| `code` | `code` |
-| otherwise | `generative` |
-
-For chat data, `auto-train` also defaults `--text-column messages` when that field exists.
-Loss masking auto-resolves to `assistant_only` (chat), `completion_only` (instruct), or
-`none` (generative).
-
----
-
-## Manual path
-
-Full control in three steps: train a tokenizer → pack data → train.
-
-```powershell
-:: 1. Train a tokenizer (skip for the byte tokenizer)
-nanoforge train-tokenizer ^
-  --input data/raw ^
-  --type native-bpe ^
-  --vocab-size 8000 ^
-  --text-column messages ^
-  --out data/tokenizers/chat-bpe.json
-
-:: 2. Pack into token/label memmaps
-nanoforge prepare ^
-  --input data/raw ^
-  --tokenizer native-bpe ^
-  --tokenizer-path data/tokenizers/chat-bpe.json ^
-  --mode chat ^
-  --loss-masking assistant_only ^
-  --text-column messages ^
-  --seq-len 512 ^
-  --out data/packed/chat
-
-:: 3. Train
-nanoforge train --config configs/my-chat.yaml
+```text
+python scripts/make_public_fixtures.py --kind chat --out data/demo/public-chat
+python -m nanoforge prepare --input data/demo/public-chat --tokenizer byte --mode chat --loss-masking assistant_only --seq-len 128 --val-fraction 0.25 --out data/packed/nano-chat-smoke --no-progress
+python -m nanoforge train --config configs/nano-chat-smoke.yaml --no-tui
+python -m nanoforge chat --checkpoint runs/nano-chat-smoke/last.pt --deterministic
 ```
 
-The byte-tokenizer smoke path skips step 1 entirely:
+These twelve authored conversations test formatting and supervision. They do not establish
+reliable factual answers, memorization, refusal behavior or general knowledge.
 
-```powershell
-nanoforge prepare --input data/raw --tokenizer byte --out data/packed/tiny
-nanoforge train --config configs/small-base.yaml
+## Train a local specialist on your own reviewed data
+
+Inspect, validate and profile before adapting or training. Check filtering counts, tokenizer
+identity, label balance and held-out source groups. Never use private runtime data as a test fixture.
+
+```text
+python -m nanoforge inspect-dataset --input data/raw
+python -m nanoforge validate-dataset --input data/raw
+python -m nanoforge profile-dataset --input data/raw
+python -m nanoforge auto-train --input data/raw --name local-specialist --mode auto --tokenizer native-bpe --vocab-size 8000 --seq-len 512 --ram 8GB --no-train
+python -m nanoforge train --config configs/local-specialist.yaml --no-tui
+python -m nanoforge evaluate --checkpoint runs/local-specialist/last.pt --data data/packed/local-specialist/val.bin --seq-len 512 --batches 20 --device cpu
 ```
 
----
+`auto-train --no-train` creates a config matching its tokenizer and packed outputs.
+The larger `nano-debug`, `small-base`, `chat-sft` and `moe-large` configs are templates:
+replace the explicitly named dataset/tokenizer paths before use. Their hardware comments are
+estimates, not measured promises.
 
-## Recipes
+## Imported-base adaptation
 
-### Generative (stories, articles, plain text)
+Install `.[pretrained]` (equivalently `.[adaptation]`). The
+`nanoforge.training.pretrained.PretrainedAdaptationConfig` and `train_pretrained` API
+support bounded full SFT or LoRA from a local Transformers-compatible model directory.
+Data records require prompt/response strings; preserve the imported tokenizer and compare
+against an explicit held-out set. Network loading is opt-in. See CLI help for available
+adaptation commands and [configuration.md](configuration.md) for runtime controls.
 
-```powershell
-nanoforge prepare ^
-  --input data/raw ^
-  --tokenizer native-bpe --tokenizer-path data/tokenizers/story-bpe.json ^
-  --mode generative --loss-masking none --seq-len 1024 --out data/packed/story
+After supplying a compatible local Transformers model directory at the template's source path:
 
-nanoforge train --config configs/nano-debug.yaml
-nanoforge generate --checkpoint runs/nano-debug/best.pt --mode creative --prompt "The old city was quiet"
+```text
+python -m pip install -e ".[pretrained]"
+python scripts/make_public_fixtures.py --kind sft --out data/demo/public-sft
+python -m nanoforge adapt --config configs/pretrained-lora-example.json
 ```
 
-### Chat (UltraChat / ShareGPT / `messages` rows)
+The authored prompt/response sets are disjoint. This short example verifies an adaptation workflow;
+it does not measure useful coding quality. Check the source model license and tokenizer and replace
+the small fixture with reviewed task data for real adaptation.
 
-```powershell
-nanoforge prepare ^
-  --input data/raw ^
-  --tokenizer native-bpe --tokenizer-path data/tokenizers/chat-bpe.json ^
-  --mode chat --loss-masking assistant_only --text-column messages ^
-  --seq-len 512 --out data/packed/chat
+Current pretrained SFT/LoRA artifacts support local save/reload, but exact optimizer/RNG resume is
+a separate remaining gate. The adaptation output directory must be empty. Nanoforge's own GGUF
+exports use a custom native-reloadable architecture, rather than claiming llama.cpp model compatibility.
 
-nanoforge train --config configs/ultrachat-18m.yaml
-nanoforge chat --checkpoint runs/ultrachat-18m/best.pt --mode chat ^
-  --temperature 0.75 --top-p 0.92 --repetition-penalty 1.1 --no-repeat-ngram-size 4
+QLoRA also needs `.[qlora]`, compatible bitsandbytes hardware and a real GPU validation run.
+Installing the extra is not evidence that a particular machine or imported model is supported.
+Keep changing/private facts in retrieval instead of automatically retraining on them.
+
+## Packing, resources and reproducibility
+
+Chat/instruct/completion examples use canonical role boundaries. Labels select assistant or
+completion targets; inspect actual masking counts rather than treating a percentage heuristic
+as a quality guarantee. Long examples may be truncated or segmented according to the recorded policy.
+
+Validation fraction zero means no held-out dataset is manufactured. A nonzero fraction needs
+at least two distinct source groups and must not copy training data into validation.
+Reader limits bound individual records/sources and cumulative input; large container formats
+may be refused rather than silently read without limits. Network access is explicit.
+Pattern-based PII rejection is a limited filter, not comprehensive PII detection.
+
+Effective batch derives from micro batch, accumulation and distributed world size. CPU thread
+and precision controls, EMA/SWA, recovery and checkpointing are described by the generated
+schema reference. Profile peak memory and latency on the intended hardware; do not assume
+a memory estimate is a measured training budget.
+
+Runs and checkpoint sidecars carry versioned metadata. Inspect available origin/base/teacher,
+data/tokenizer and code/environment identities; legacy artifacts may have incomplete provenance.
+A lower training loss alone does not establish a better model.
+
+## Evaluate behavior
+
+```text
+python -m nanoforge evaluate-suite --suite configs/evals/smoke.jsonl --checkpoint runs/c-tiny/last.pt --out reports/evaluations/c-tiny
 ```
 
-### Instruct (Alpaca-style `instruction`/`output`)
+Exact match, structured JSON and lexical grounding checks are limited oracles.
+Tool-call syntax alone does not prove safe execution; evidence substrings alone do not prove
+semantic faithfulness. Coding quality needs executable repairs, denied calls, failure recovery,
+held-out source groups and resource reports. Failed cases must remain visible.
 
-```powershell
-nanoforge prepare ^
-  --input data/alpaca.jsonl ^
-  --tokenizer native-bpe --tokenizer-path data/tokenizers/chat-bpe.json ^
-  --mode instruct --loss-masking completion_only --seq-len 512 --out data/packed/instruct
-
-nanoforge train --config configs/my-instruct.yaml
-```
-
-### Import an external model (no training)
-
-```powershell
-nanoforge import --model path\to\model.gguf --name my-gguf
-nanoforge chat --model my-gguf --mode chat
-```
-
----
-
-## Boundary-aware chat/instruct packing
-
-Chat and instruct packing writes fixed-length sequences that start at conversation
-boundaries rather than sampling arbitrary windows from one long stream. Each sequence
-includes the user/system context and labels assistant/completion tokens only. Long assistant
-responses are split across sequences with the context prefix repeated, so batches never
-become 100% masked or 100% unmasked.
-
-> Note: the boundary packer truncates each training prefix to roughly its last `seq_len/2`
-> tokens. Keep system prompts short so the assistant marker lands at a position the model saw
-> during training (see [nano_chat_quickstart.md](nano_chat_quickstart.md) for why this matters).
-
----
-
-## Check your data before training
-
-Verify the label mask balance on packed chat/instruct data:
-
-```powershell
-python -c "import numpy as np; labels=np.fromfile('data/packed/chat/train.labels.bin', dtype=np.int32); masked=(labels==-100).sum(); total=len(labels); print(f'Masked: {masked/total*100:.1f}%'); print(f'Unmasked: {(total-masked)/total*100:.1f}%')"
-```
-
-Healthy targets:
-
-- **Chat/instruct:** ~40–70% masked, ~30–60% unmasked.
-- **Generative:** no label file, or 0% masked if one exists.
-- No sampled batch should be entirely masked or entirely unmasked.
-
----
-
-## Healthy training signs
-
-- For `vocab_size=8000`, step-1 loss should start around `8–10`, not `30–60`.
-- Loss declines steadily over the first few hundred steps.
-- Gradient norm before clipping usually stays below `5.0`.
-- `skip=no` appears on most steps.
-- Stop and inspect if you see persistent `loss=0.000`, `loss=NaN`, or all-masked batches.
-
-If loss explodes: cut `learning_rate` by 2–4×, keep `grad_clip: 1.0`, increase warmup, and
-check for corrupt/duplicated data before touching the architecture.
-
----
-
-## CPU presets
-
-| RAM | Suggested model |
-| --- | --- |
-| 4 GB | `d_model=192`, `n_layers=3`, `n_heads=3`, `seq_len=384` |
-| 8 GB (fast chat) | `d_model=256`, `n_layers=4`, `n_heads=4`, `seq_len=512` |
-| 8 GB (balanced) | `d_model=384`, `n_layers=6`, `n_heads=6`, `seq_len=1024` |
-| 16 GB | `d_model=512`, `n_layers=8`, `n_heads=8`, `seq_len=1024` |
-
-On CPU, prefer `precision: fp32`, `micro_batch_size: 1` with higher `grad_accum_steps`,
-`num_workers: 0`, and `pin_memory: false`. Use `nanoforge new-config` for an interactive
-generator.
-
----
-
-## Monitoring
-
-Watch a run live with the terminal UI that auto-launches on `nanoforge train` in an
-interactive terminal — it shows train/val loss, perplexity, gradient norm, learning rate,
-and throughput. Training continues headless if you quit it or pipe output; disable it with
-`--no-tui` or `NANOFORGE_NO_TUI=1`. For a browser view, run `nanoforge web --run runs/<name>`
-(defaults to `http://127.0.0.1:7860`).
-
-Evaluate a finished checkpoint:
-
-```powershell
-nanoforge evaluate --checkpoint runs/tiny/best.pt --data data/packed/tiny/val.bin --batches 20
-```
-
-## Reproducibility manifests and task suites
-
-Completed Nanoforge and DPO runs write `run.manifest.json` beside their metrics and checkpoints.
-Each checkpoint also writes `<name>.pt.manifest.json`. These are additive provenance artifacts;
-old checkpoints remain loadable without them. Manifests record the config fingerprint, model/data
-paths, tokenizer identity, environment, status, resource fields, and linked checkpoint IDs.
-
-For behavior-level checks, create a synthetic JSONL suite and run:
-
-```bash
-nanoforge evaluate-suite \
-  --suite configs/evals/smoke.jsonl \
-  --checkpoint runs/mychat/best.pt \
-  --out reports/evaluations/mychat
-```
-
-The report preserves every generated output, latency, pass/fail/error status, and checker details.
-Use `tool_call` cases to validate structured actions without executing tools. Use `grounding`
-cases for explicit citation and evidence-substring checks only; they do not claim semantic
-faithfulness.
+For monitoring use `latticekin tui --run runs/c-tiny` or localhost-only
+`latticekin web --run runs/c-tiny`. Check [roadmap.md](roadmap.md) for unresolved release gates.

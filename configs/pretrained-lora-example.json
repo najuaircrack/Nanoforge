@@ -1,0 +1,19 @@
+{
+  "source": "models/local-coding-base",
+  "data_path": "data/demo/public-sft/train.jsonl",
+  "validation_path": "data/demo/public-sft/validation.jsonl",
+  "output_dir": "runs/public-lora",
+  "method": "lora",
+  "max_steps": 10,
+  "batch_size": 1,
+  "grad_accum_steps": 1,
+  "seq_len": 128,
+  "learning_rate": 0.0002,
+  "lora_rank": 8,
+  "lora_alpha": 16,
+  "seed": 42,
+  "device": "cpu",
+  "allow_network": false,
+  "max_seconds": 300,
+  "max_record_bytes": 1048576
+}

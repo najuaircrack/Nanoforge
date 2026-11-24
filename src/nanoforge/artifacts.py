@@ -12,8 +12,11 @@ import hashlib
 import json
 import os
 import platform
+import shutil
 import subprocess
 import sys
+import threading
+import time
 import uuid
 from dataclasses import asdict, dataclass, field, is_dataclass
 from datetime import datetime, timezone
@@ -86,12 +89,21 @@ def _manifest_path(path: str | Path) -> Path:
     return path if path.name.endswith(".manifest.json") else path.with_suffix(path.suffix + ".manifest.json")
 
 
-def atomic_write_json(path: str | Path, value: Any) -> Path:
+def atomic_write_json(path: str | Path, value: Any, *, overwrite: bool = True) -> Path:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
-    temporary.write_text(canonical_json(value) + "\n", encoding="utf-8")
-    os.replace(temporary, path)
+    try:
+        with temporary.open("w", encoding="utf-8") as handle:
+            handle.write(canonical_json(value) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        if overwrite:
+            os.replace(temporary, path)
+        else:
+            os.link(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
     return path
 
 
@@ -152,14 +164,16 @@ def migrate_manifest(payload: dict[str, Any], expected_type: str | None = None) 
 
     if not isinstance(payload, dict):
         raise ValueError("Manifest must be a JSON object.")
-    version = int(payload.get("schema_version", 0))
+    version = payload.get("schema_version", 0)
+    if isinstance(version, bool) or not isinstance(version, int) or version < 0:
+        raise ValueError("Manifest schema_version must be a nonnegative integer.")
     if version > MANIFEST_SCHEMA_VERSION:
         raise RuntimeError(
             f"Manifest schema {version} is newer than supported {MANIFEST_SCHEMA_VERSION}."
         )
     migrated = dict(payload)
     manifest_type = expected_type or migrated.get("manifest_type", "artifact")
-    migrated.setdefault("schema_version", MANIFEST_SCHEMA_VERSION)
+    migrated["schema_version"] = MANIFEST_SCHEMA_VERSION
     migrated.setdefault("manifest_type", manifest_type)
     if migrated["manifest_type"] != manifest_type:
         raise ValueError(f"Expected {manifest_type} manifest, found {migrated['manifest_type']}.")
@@ -295,12 +309,39 @@ def environment_snapshot(device: str | None = None) -> dict[str, Any]:
 
 
 def resource_snapshot() -> dict[str, Any]:
-    snapshot: dict[str, Any] = {"process_rss_mb": None, "peak_cuda_allocated_mb": None}
+    snapshot: dict[str, Any] = {"process_rss_mb": None, "peak_process_rss_mb": None, "peak_cuda_allocated_mb": None}
+    if sys.platform == "win32":
+        import ctypes
+        from ctypes import wintypes
+
+        class Counters(ctypes.Structure):
+            _fields_ = [("cb", wintypes.DWORD), ("PageFaultCount", wintypes.DWORD)] + [
+                (name, ctypes.c_size_t) for name in (
+                    "PeakWorkingSetSize", "WorkingSetSize", "QuotaPeakPagedPoolUsage",
+                    "QuotaPagedPoolUsage", "QuotaPeakNonPagedPoolUsage", "QuotaNonPagedPoolUsage",
+                    "PagefileUsage", "PeakPagefileUsage",
+                )
+            ]
+        counters = Counters()
+        counters.cb = ctypes.sizeof(counters)
+        current = ctypes.windll.kernel32.GetCurrentProcess
+        current.restype = wintypes.HANDLE
+        query = ctypes.windll.psapi.GetProcessMemoryInfo
+        query.argtypes = [wintypes.HANDLE, ctypes.POINTER(Counters), wintypes.DWORD]
+        if query(current(), ctypes.byref(counters), counters.cb):
+            snapshot["process_rss_mb"] = counters.WorkingSetSize / (1024 * 1024)
+            snapshot["peak_process_rss_mb"] = counters.PeakWorkingSetSize / (1024 * 1024)
+    elif sys.platform.startswith("linux"):
+        try:
+            resident_pages = int(Path("/proc/self/statm").read_text().split()[1])
+            snapshot["process_rss_mb"] = resident_pages * os.sysconf("SC_PAGE_SIZE") / (1024 * 1024)
+        except (OSError, ValueError, IndexError):
+            pass
     try:
         import resource
 
         usage = resource.getrusage(resource.RUSAGE_SELF)
-        snapshot["process_rss_mb"] = usage.ru_maxrss / (1024 if sys.platform != "darwin" else 1024 * 1024)
+        snapshot["peak_process_rss_mb"] = usage.ru_maxrss / (1024 if sys.platform != "darwin" else 1024 * 1024)
     except (ImportError, OSError):
         pass
     try:
@@ -311,6 +352,136 @@ def resource_snapshot() -> dict[str, Any]:
     except Exception:
         pass
     return snapshot
+
+
+class ResourceMonitor:
+    """Sample this process during a run; samples are not an exact allocator peak."""
+
+    def __init__(self, interval: float = 0.05):
+        if interval <= 0:
+            raise ValueError("resource sampling interval must be positive")
+        self.interval = interval
+        self.result: dict[str, Any] = {}
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._peak = 0.0
+        self._samples = 0
+
+    def _sample(self) -> None:
+        value = resource_snapshot().get("process_rss_mb")
+        if value is not None:
+            self._peak = max(self._peak, value)
+            self._samples += 1
+
+    def __enter__(self):
+        self._started = time.perf_counter()
+        self._cpu_started = time.process_time()
+        self._sample()
+
+        def observe():
+            while not self._stop.wait(self.interval):
+                self._sample()
+
+        self._thread = threading.Thread(target=observe, name="nanoforge-resources", daemon=True)
+        self._thread.start()
+        return self
+
+    def __exit__(self, *_args):
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=5)
+        self._sample()
+        self.result = {
+            **resource_snapshot(),
+            "elapsed_seconds": time.perf_counter() - self._started,
+            "cpu_seconds": time.process_time() - self._cpu_started,
+            "run_peak_sampled_rss_mb": self._peak if self._samples else None,
+            "sample_count": self._samples,
+            "sample_interval_seconds": self.interval,
+            "peak_is_sampled": True,
+            "scope": "process-during-run",
+            "concurrent_process_work_included": True,
+        }
+
+
+def list_artifact_manifests(root: str | Path, *, max_files: int = 1000) -> list[dict[str, Any]]:
+    """Bounded manifest catalog; callers authorize the root, not model content."""
+    root = Path(root).resolve()
+    if max_files < 1:
+        raise ValueError("max_files must be positive")
+    result = []
+    for directory, subdirs, files in os.walk(root, followlinks=False):
+        subdirs[:] = sorted(name for name in subdirs if name not in {".git", "node_modules", ".venv", ".unlazy"})
+        for name in sorted(files):
+            if not name.endswith(".manifest.json"):
+                continue
+            path = Path(directory) / name
+            if path.is_symlink() or not path.resolve().is_relative_to(root):
+                continue
+            if path.stat().st_size > 4 * 1024 * 1024:
+                raise ValueError("manifest exceeds catalog byte limit")
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            if raw.get("manifest_type", "artifact") != "artifact":
+                continue
+            manifest = ArtifactManifest.from_dict(raw)
+            result.append({"path": path.relative_to(root).as_posix(), "manifest": manifest.to_dict()})
+            if len(result) >= max_files:
+                return result
+    return result
+
+
+class ArtifactRegistry:
+    """Opt-in immutable, content-addressed copies; no training-data auto-import."""
+
+    def __init__(self, root: str | Path):
+        self.root = Path(root).resolve()
+        self.root.mkdir(parents=True, exist_ok=True)
+
+    def _directory(self, artifact_id: str) -> Path:
+        prefix = "blake2b-256:"
+        digest = artifact_id.removeprefix(prefix)
+        if not artifact_id.startswith(prefix) or len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
+            raise ValueError("invalid artifact identity")
+        return self.root / digest
+
+    def register(self, source: str | Path, *, artifact_kind: str, owner: str,
+                 parent_artifact_ids: Iterable[str] = (), metadata: dict[str, Any] | None = None) -> ArtifactManifest:
+        source = Path(source)
+        if not owner.strip() or not artifact_kind.strip() or not source.is_file() or source.is_symlink():
+            raise ValueError("registration requires a regular file, owner and kind")
+        digest = fingerprint_file(source)
+        identity = content_fingerprint({"content": digest, "kind": artifact_kind, "owner": owner,
+                                        "parents": list(parent_artifact_ids), "metadata": metadata or {}})
+        directory = self._directory(identity)
+        directory.mkdir(parents=True, exist_ok=True)
+        payload = directory / "payload"
+        if payload.exists():
+            self.verify(identity)
+            return load_artifact_manifest(payload)
+        temporary = directory / f".{uuid.uuid4().hex}.tmp"
+        try:
+            shutil.copyfile(source, temporary)
+            if fingerprint_file(temporary) != digest:
+                raise ValueError("source changed during artifact registration")
+            os.link(temporary, payload)
+        finally:
+            temporary.unlink(missing_ok=True)
+        manifest = build_artifact_manifest(payload, artifact_kind=artifact_kind,
+                                           parent_artifact_ids=parent_artifact_ids,
+                                           metadata={**(metadata or {}), "owner": owner, "immutable": True})
+        manifest.artifact_id = identity
+        atomic_write_json(_manifest_path(payload), manifest.to_dict(), overwrite=False)
+        return manifest
+
+    def path_for(self, artifact_id: str) -> Path:
+        return self._directory(artifact_id) / "payload"
+
+    def verify(self, artifact_id: str) -> bool:
+        path = self.path_for(artifact_id)
+        manifest = load_artifact_manifest(path)
+        if manifest.artifact_id != artifact_id or fingerprint_file(path) != manifest.content_fingerprint:
+            raise ValueError("artifact integrity check failed")
+        return True
 
 
 class RunManifestWriter:

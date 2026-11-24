@@ -14,6 +14,19 @@ logger = get_logger("training.pipeline")
 class StageSpec:
     name: str
     overrides: dict[str, Any] = field(default_factory=dict)
+    kind: str = "train"
+    preference_data: str | None = None
+
+    def __post_init__(self) -> None:
+        if (
+            not self.name
+            or self.name in {".", ".."}
+            or any(ch in self.name for ch in "/\\")
+            or Path(self.name).is_absolute()
+        ):
+            raise ValueError("stage name must be a single relative directory name")
+        if self.kind not in {"train", "dpo", "distill"}:
+            raise ValueError(f"unsupported pipeline trainer kind: {self.kind}")
 
 
 @dataclass
@@ -27,15 +40,23 @@ def _apply_overrides(cfg: NanoforgeConfig, overrides: dict[str, Any]) -> Nanofor
     """Shallow-merge a nested overrides dict onto a NanoforgeConfig."""
     import copy
     import dataclasses
+
     cfg = copy.deepcopy(cfg)
-    section_map = {"model": cfg.model, "training": cfg.training, "data": cfg.data, "inference": cfg.inference}
+    section_map = {
+        "model": cfg.model,
+        "training": cfg.training,
+        "data": cfg.data,
+        "inference": cfg.inference,
+    }
     for section, values in overrides.items():
         obj = section_map.get(section)
         if obj is None:
             logger.warning("pipeline override: unknown section '%s', skipping", section)
             continue
         if not isinstance(values, dict):
-            logger.warning("pipeline override: section '%s' value must be a dict, skipping", section)
+            logger.warning(
+                "pipeline override: section '%s' value must be a dict, skipping", section
+            )
             continue
         valid = {f.name for f in dataclasses.fields(obj)}
         for key, val in values.items():
@@ -67,7 +88,8 @@ def run_pipeline(recipe: PipelineRecipe) -> None:
 
         # Resume model weights (not optimizer) from the previous stage's best checkpoint.
         if prev_checkpoint is not None:
-            cfg.training.resume_from_checkpoint = prev_checkpoint
+            cfg.training.init_from_checkpoint = prev_checkpoint
+            cfg.training.resume_from_checkpoint = None
             logger.info("stage '%s': loading weights from %s", stage.name, prev_checkpoint)
 
         # Save the resolved config for reproducibility.
@@ -75,7 +97,18 @@ def run_pipeline(recipe: PipelineRecipe) -> None:
         stage_dir.mkdir(parents=True, exist_ok=True)
         save_config(cfg, stage_cfg_path)
 
-        trainer = Trainer(cfg)
+        if stage.kind == "dpo":
+            from nanoforge.training.dpo_trainer import DPOTrainer
+
+            if not stage.preference_data:
+                raise ValueError(f"DPO stage {stage.name} requires preference_data")
+            trainer = DPOTrainer(cfg, stage.preference_data)
+        elif stage.kind == "distill":
+            from nanoforge.training.distillation_trainer import DistillationTrainer
+
+            trainer = DistillationTrainer(cfg)
+        else:
+            trainer = Trainer(cfg)
         trainer.train()
 
         best = stage_dir / "best.pt"
@@ -84,7 +117,9 @@ def run_pipeline(recipe: PipelineRecipe) -> None:
         if prev_checkpoint:
             logger.info("stage '%s' done; next stage will load: %s", stage.name, prev_checkpoint)
         else:
-            logger.warning("stage '%s': no checkpoint found; next stage starts from scratch", stage.name)
+            raise RuntimeError(
+                f"stage {stage.name!r} produced no checkpoint; refusing a scratch handoff"
+            )
 
     logger.info("pipeline complete. stages: %s", [s.name for s in recipe.stages])
 
@@ -92,10 +127,16 @@ def run_pipeline(recipe: PipelineRecipe) -> None:
 def load_recipe(path: str | Path) -> PipelineRecipe:
     """Load a pipeline recipe YAML."""
     import yaml
+
     path = Path(path)
     raw = yaml.safe_load(path.read_text(encoding="utf-8"))
     stages = [
-        StageSpec(name=s["name"], overrides=s.get("overrides", {}))
+        StageSpec(
+            name=s["name"],
+            overrides=s.get("overrides", {}),
+            kind=s.get("kind", "train"),
+            preference_data=s.get("preference_data"),
+        )
         for s in raw.get("stages", [])
     ]
     return PipelineRecipe(

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import math
 
 import torch
@@ -50,3 +51,27 @@ def mark_only_lora_trainable(module: nn.Module) -> None:
     for name, param in module.named_parameters():
         param.requires_grad = "lora_" in name
 
+
+def merge_lora(module: nn.Module, *, inplace: bool = False) -> nn.Module:
+    """Merge adapters into dense Linear copies, preserving the source by default."""
+    target = module if inplace else copy.deepcopy(module)
+    if isinstance(target, LoRALinear):
+        linear = nn.Linear(
+            target.weight.shape[1],
+            target.weight.shape[0],
+            bias=target.bias is not None,
+            device=target.weight.device,
+            dtype=target.weight.dtype,
+        )
+        with torch.no_grad():
+            weight = target.weight
+            if target.rank:
+                weight = weight + (target.lora_b @ target.lora_a) * target.scaling
+            linear.weight.copy_(weight)
+            if target.bias is not None:
+                linear.bias.copy_(target.bias)
+        linear.train(target.training)
+        return linear
+    for name, child in list(target.named_children()):
+        setattr(target, name, merge_lora(child, inplace=True))
+    return target

@@ -76,8 +76,11 @@ The new `src/nanoforge/agent/` package provides a backend-only safe boundary:
 The default policy allows read-only inspection. Writes and tests require explicit capabilities and
 approval. The harness never accepts arbitrary model-generated shell commands.
 
-This is a bounded process boundary, not yet a hardened OS/container sandbox. Network, credential,
-arbitrary subprocess, and filesystem-outside-workspace access remain unavailable by default.
+This is trusted-callable process isolation with platform-specific cancellation/resource controls,
+not a hardened OS/container filesystem/network sandbox. Network, credential,
+arbitrary subprocess, and filesystem-outside-workspace actions remain unavailable to the default
+model-facing repository tools. Registered Python code and repository tests remain trusted until a
+separate OS/container sandbox prevents those side effects.
 
 ## Coding-agent evaluation
 

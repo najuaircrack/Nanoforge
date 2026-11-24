@@ -50,7 +50,9 @@ class Adafactor(torch.optim.Optimizer):
         eps: tuple[float, float] = (1e-30, 1e-3),
         weight_decay: float = 0.0,
     ):
-        super().__init__(params, {"lr": lr, "beta2": beta2, "eps": eps, "weight_decay": weight_decay})
+        super().__init__(
+            params, {"lr": lr, "beta2": beta2, "eps": eps, "weight_decay": weight_decay}
+        )
 
     @torch.no_grad()
     def step(self, closure=None):
@@ -72,8 +74,12 @@ class Adafactor(torch.optim.Optimizer):
                     col = state["col"]
                     grad_sq = grad.pow(2).add_(eps[0])
                     row.mul_(beta2).add_(grad_sq.mean(dim=-1), alpha=1 - beta2)
-                    col.mul_(beta2).add_(grad_sq.mean(dim=tuple(range(grad.ndim - 1))), alpha=1 - beta2)
-                    update = grad / (row.unsqueeze(-1).sqrt() * col.sqrt().clamp_min(eps[1]))
+                    col.mul_(beta2).add_(
+                        grad_sq.mean(dim=tuple(range(grad.ndim - 1))), alpha=1 - beta2
+                    )
+                    row_mean = row.mean(dim=-1, keepdim=True).clamp_min(eps[0])
+                    denominator = (row / row_mean).unsqueeze(-1) * col
+                    update = grad * denominator.clamp_min(eps[0]).rsqrt()
                 else:
                     if not state:
                         state["v"] = torch.zeros_like(grad)
@@ -96,7 +102,9 @@ class SophiaG(torch.optim.Optimizer):
         rho: float = 0.04,
         weight_decay: float = 0.0,
     ):
-        super().__init__(params, {"lr": lr, "betas": betas, "rho": rho, "weight_decay": weight_decay})
+        super().__init__(
+            params, {"lr": lr, "betas": betas, "rho": rho, "weight_decay": weight_decay}
+        )
 
     @torch.no_grad()
     def step(self, closure=None):
@@ -129,13 +137,16 @@ def create_adamw_optimizer(
     betas: tuple[float, float] = (0.9, 0.95),
     eps: float = 1e-8,
 ):
+    params = list(params)
+    parameters = [parameter for group in params for parameter in group["params"]] if params and isinstance(params[0], dict) else params
+    fused = bool(parameters) and all(parameter.device.type == "cuda" for parameter in parameters)
     return torch.optim.AdamW(
         params,
         lr=lr,
         betas=betas,
         eps=eps,
         weight_decay=weight_decay,
-        fused=torch.cuda.is_available(),
+        fused=fused,
     )
 
 

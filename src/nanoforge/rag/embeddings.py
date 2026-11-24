@@ -12,6 +12,7 @@ so cosine similarity reduces to a dot product at query time.
 from __future__ import annotations
 
 import hashlib
+import logging
 from typing import TYPE_CHECKING, Iterable, Protocol, runtime_checkable
 
 import numpy as np
@@ -115,6 +116,8 @@ class TfIdfEmbedder:
         return tf * self._idf
 
     def embed_batch(self, texts: list[str]) -> np.ndarray:
+        if not texts:
+            return np.empty((0, self.dim), dtype=np.float32)
         vecs = np.stack([self._embed_one(t) for t in texts]).astype(np.float32)
         return _l2_normalize(vecs)
 
@@ -173,6 +176,7 @@ class StEmbedder:
     """sentence-transformers backend. Only usable when the package is installed."""
 
     def __init__(self, model_name: str = "all-MiniLM-L6-v2") -> None:
+        self.model_name = model_name
         try:
             from sentence_transformers import SentenceTransformer
         except ImportError as exc:
@@ -196,6 +200,7 @@ def get_embedder(
     st_model: str = "all-MiniLM-L6-v2",
     tfidf_vocab: int = 16_384,
     tfidf_state: dict | None = None,
+    strict: bool = False,
 ) -> Embedder:
     """Return an embedder for ``backend``, falling back to TF-IDF on any error.
 
@@ -216,6 +221,8 @@ def get_embedder(
 
     if backend == "model":
         if engine is None:
+            if strict:
+                raise ValueError("model index requires its original model engine")
             # Graceful fallback: no engine available at load time
             if tfidf_state:
                 return TfIdfEmbedder.from_dict(tfidf_state)
@@ -223,15 +230,58 @@ def get_embedder(
         try:
             return ModelEmbedder(engine)
         except Exception:
-            pass
+            if strict:
+                raise
 
     if backend == "sentence-transformers":
         try:
-            return StEmbedder(st_model)
+            return StEmbedder((tfidf_state or {}).get("model_name", st_model))
         except ImportError:
-            pass
+            if strict:
+                raise
+
+    if backend not in {"tfidf", "model", "sentence-transformers"}:
+        raise ValueError(f"unknown embedding backend: {backend}")
+    if strict:
+        raise ValueError("original index encoder is unavailable")
+    logging.getLogger(__name__).warning("Embedding backend %s unavailable; building TF-IDF instead", backend)
 
     # Final fallback
     if tfidf_state:
         return TfIdfEmbedder.from_dict(tfidf_state)
     return TfIdfEmbedder(vocab_size=tfidf_vocab)
+
+
+def _weights_fingerprint(model) -> str:
+    import torch
+    digest = hashlib.blake2b(digest_size=32)
+    for name, value in sorted(model.state_dict().items()):
+        if not isinstance(value, torch.Tensor):
+            raise ValueError("embedding model has unsupported non-tensor state")
+        digest.update(name.encode("utf-8"))
+        digest.update(str((tuple(value.shape), value.dtype)).encode("utf-8"))
+        digest.update(value.detach().cpu().contiguous().view(torch.uint8).numpy().tobytes())
+    return "blake2b-256:" + digest.hexdigest()
+
+
+def embedding_identity(embedder) -> dict:
+    from nanoforge.artifacts import content_fingerprint
+    if isinstance(embedder, TfIdfEmbedder):
+        return {"backend": "tfidf", "state_fingerprint": content_fingerprint(embedder.to_dict()), "dim": embedder.dim}
+    if isinstance(embedder, ModelEmbedder):
+        engine = embedder._engine
+        tokenizer = engine.tokenizer
+        descriptor = {"class": type(tokenizer).__qualname__, "vocab_size": tokenizer.vocab_size,
+                      "probe": tokenizer.encode("Nanoforge tokenizer identity: abc 0123 雪", add_bos=True)}
+        for attribute in ("tokenizer", "_tokenizer", "tok"):
+            inner = getattr(tokenizer, attribute, None)
+            if callable(getattr(inner, "to_str", None)):
+                descriptor["serialized"] = inner.to_str()
+                break
+        return {"backend": "model", "weights_fingerprint": _weights_fingerprint(engine.model),
+                "tokenizer_fingerprint": content_fingerprint(descriptor), "dim": embedder.dim}
+    identity = {"backend": "sentence-transformers", "model_name": embedder.model_name, "dim": embedder.dim}
+    model = getattr(embedder, "_model", None)
+    if model is not None:
+        identity["weights_fingerprint"] = _weights_fingerprint(model)
+    return identity

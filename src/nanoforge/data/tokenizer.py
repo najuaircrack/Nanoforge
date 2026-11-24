@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 import json
+import re
 import tracemalloc
 from collections import Counter
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Protocol
 
-from nanoforge.data.formats import DatasetStats, iter_dataset_records
+from nanoforge.data.formats import DatasetStats, ReaderLimits, iter_dataset_records
 from nanoforge.data.native_tokenizer import (
     NativeBPETokenizer,
     NativeByteTokenizer,
@@ -104,9 +106,9 @@ class PurePythonBPETokenizer:
         "<bos>",
         "<eos>",
         "<unk>",
-        "<fim_prefix>",
-        "<fim_middle>",
-        "<fim_suffix>",
+        "<|fim_prefix|>",
+        "<|fim_middle|>",
+        "<|fim_suffix|>",
         "<|pad|>",
         "<|bos|>",
         "<|eos|>",
@@ -122,14 +124,34 @@ class PurePythonBPETokenizer:
         self.eos_id = 2
         self.unk_id = 3
         self.byte_offset = len(self.special_tokens)
+        self.artifact_version = 2
         self.merges = merges or []
         if path is not None:
             raw = json.loads(Path(path).read_text(encoding="utf-8"))
             if raw.get("type") != "nanoforge_python_bpe":
                 raise ValueError(f"{path} is not a Nanoforge Python BPE tokenizer.")
+            if raw.get("version", 1) not in {1, 2}:
+                raise ValueError("Unsupported tokenizer artifact schema version")
+            self.artifact_version = raw.get("version", 1)
             self.merges = [tuple(pair) for pair in raw.get("merges", [])]
+            saved_special = raw.get("special_tokens", self.special_tokens)
+            if len(saved_special) != self.byte_offset or any(not isinstance(token, str) or not token for token in saved_special) or len(set(saved_special)) != self.byte_offset:
+                raise ValueError("Tokenizer special-token layout requires an explicit migration")
+            self.special_tokens = list(saved_special)
+        self.special_to_id = {token: idx for idx, token in enumerate(self.special_tokens)}
+        # Migrated v2 layouts can retain older FIM names at their saved IDs.
+        # V1 encoding still treats every literal as bytes until explicit migration.
+        for name in ("prefix", "middle", "suffix"):
+            old = f"<fim_{name}>"
+            if old in self.special_to_id:
+                self.special_to_id[f"<|fim_{name}|>"] = self.special_to_id[old]
+        self._special_pattern = re.compile("(" + "|".join(re.escape(token) for token in sorted(self.special_to_id, key=len, reverse=True)) + ")")
         self.pair_to_id: dict[tuple[int, int], int] = {}
         for idx, pair in enumerate(self.merges):
+            if len(pair) != 2 or any(not isinstance(token, int) or token < self.byte_offset or token >= self.byte_offset + 256 + idx for token in pair):
+                raise ValueError("Tokenizer contains an invalid merge reference")
+            if pair in self.pair_to_id:
+                raise ValueError("Tokenizer contains duplicate merge pairs")
             self.pair_to_id[pair] = self.byte_offset + 256 + idx
         self.id_to_piece: dict[int, tuple[int, ...]] = {
             self.byte_offset + byte: (byte,) for byte in range(256)
@@ -142,11 +164,18 @@ class PurePythonBPETokenizer:
         self.vocab_size = self.byte_offset + 256 + len(self.merges)
 
     def encode(self, text: str, add_bos: bool = False, add_eos: bool = False) -> list[int]:
-        ids = [self.byte_offset + byte for byte in text.encode("utf-8", errors="replace")]
-        for pair, merged_id in self.pair_to_id.items():
-            if len(ids) < 2:
-                break
-            ids = _merge_pair_once(ids, pair, merged_id)
+        ids = []
+        parts = self._special_pattern.split(text) if self.artifact_version >= 2 else [text]
+        for part in parts:
+            if self.artifact_version >= 2 and part in self.special_to_id:
+                ids.append(self.special_to_id[part])
+                continue
+            pieces = [self.byte_offset + byte for byte in part.encode("utf-8", errors="replace")]
+            for pair, merged_id in self.pair_to_id.items():
+                if len(pieces) < 2:
+                    break
+                pieces = _merge_pair_once(pieces, pair, merged_id)
+            ids.extend(pieces)
         if add_bos:
             ids.insert(0, self.bos_id)
         if add_eos:
@@ -158,6 +187,8 @@ class PurePythonBPETokenizer:
         for token_id in ids:
             if token_id in self.id_to_piece:
                 data.extend(self.id_to_piece[token_id])
+            elif self.artifact_version >= 2 and 4 <= token_id < self.byte_offset:
+                data.extend(self.special_tokens[token_id].encode("utf-8"))
         return bytes(data).decode("utf-8", errors="replace")
 
     def save(self, path: str | Path) -> None:
@@ -165,12 +196,34 @@ class PurePythonBPETokenizer:
         path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
             "type": "nanoforge_python_bpe",
-            "version": 1,
+            "version": self.artifact_version,
             "special_tokens": self.special_tokens,
             "merges": [list(pair) for pair in self.merges],
         }
         path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
 
+
+def migrate_bpe_tokenizer(source: str | Path, destination: str | Path) -> dict[str, object]:
+    """Create a v2 artifact explicitly; existing checkpoints require adaptation.
+
+    Version 1 encoded special literals as bytes. Changing this semantic contract
+    never happens on load and never overwrites the original tokenizer.
+    """
+    import hashlib
+
+    source, destination = Path(source), Path(destination)
+    if source.resolve() == destination.resolve():
+        raise ValueError("Tokenizer migration requires a separate output artifact")
+    tokenizer = PurePythonBPETokenizer(source)
+    migrated = PurePythonBPETokenizer(merges=list(tokenizer.merges))
+    migrated.save(destination)
+    return {
+        "source_version": tokenizer.artifact_version, "destination_version": 2,
+        "source_fingerprint": hashlib.sha256(source.read_bytes()).hexdigest(),
+        "destination_fingerprint": hashlib.sha256(destination.read_bytes()).hexdigest(),
+        "semantic_change": "special literals become dedicated token IDs",
+        "checkpoint_action": "retrain or adapt before using the migrated tokenizer",
+    }
 
 class WordPieceTokenizer:
     def __init__(self, path: str | Path):
@@ -236,6 +289,12 @@ class TokenizerTrainingReport:
     invalid_records: int = 0
     peak_memory_mb: float = 0.0
     dry_run: bool = False
+    training_bytes: int = 0
+    fit_seconds: float = 0.0
+    fitting_peak_memory_mb: float = 0.0
+    peak_memory_kind: str = "python-allocator"
+    backend: str = "inspection-only"
+    budget_bytes: int | None = None
 
 
 def iter_tokenizer_training_texts(
@@ -245,9 +304,10 @@ def iter_tokenizer_training_texts(
     text_columns: Iterable[str] | None = None,
     max_records: int | None = None,
     stats: DatasetStats | None = None,
+    reader_limits: ReaderLimits | None = None,
 ) -> Iterable[str]:
     count = 0
-    for record in iter_dataset_records(files, text_key=text_key, text_columns=text_columns, stats=stats):
+    for record in iter_dataset_records(files, text_key=text_key, text_columns=text_columns, stats=stats, limits=reader_limits):
         if max_records is not None and count >= max_records:
             break
         count += 1
@@ -260,8 +320,13 @@ def load_tokenizer(tokenizer_type: str = "byte", path: str | Path | None = None)
         return NativeByteTokenizer()
     if tokenizer_type in {"byte-native-required", "native-byte-required"}:
         return NativeByteTokenizer(require_native=True)
-    if tokenizer_type == "byte" or path is None:
+    if tokenizer_type == "byte":
         return ByteTokenizer()
+    known = {"native-bpe", "bpe-native", "native-bpe-required", "bpe-native-required", "python-bpe", "pure-python-bpe", "bpe", "wordpiece", "sp", "sentencepiece", "unigram"}
+    if tokenizer_type not in known:
+        raise ValueError(f"Unknown tokenizer_type={tokenizer_type}")
+    if path is None:
+        raise ValueError(f"tokenizer_type={tokenizer_type} requires a tokenizer artifact path")
     if tokenizer_type in {"native-bpe", "bpe-native"}:
         return NativeBPETokenizer(path)
     if tokenizer_type in {"native-bpe-required", "bpe-native-required"}:
@@ -289,10 +354,12 @@ def train_bpe_tokenizer(
     text_columns: Iterable[str] | None = None,
     dry_run: bool = False,
     max_records: int | None = None,
+    max_training_bytes: int = 16_777_216,
+    reader_limits: ReaderLimits | None = None,
 ) -> TokenizerTrainingReport:
     files = list(files)
     stats = DatasetStats()
-    report = _scan_training_texts(files, text_key, text_columns, max_records, stats)
+    report = _scan_training_texts(files, text_key, text_columns, max_records, stats, reader_limits)
     report.dry_run = dry_run
     if dry_run:
         return report
@@ -309,9 +376,11 @@ def train_bpe_tokenizer(
             dry_run=False,
             max_records=max_records,
             scanned_report=report,
+            max_training_bytes=max_training_bytes,
+            reader_limits=reader_limits,
         )
 
-    special = ["<pad>", "<bos>", "<eos>", "<unk>", "<fim_prefix>", "<fim_middle>", "<fim_suffix>", "<|pad|>", "<|bos|>", "<|eos|>", "<|user|>", "<|assistant|>", "<|system|>", "<|endoftext|>"]
+    special = PurePythonBPETokenizer.special_tokens
     tokenizer = Tokenizer(models.BPE(unk_token="<unk>"))
     tokenizer.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
     tokenizer.decoder = decoders.ByteLevel()
@@ -328,8 +397,10 @@ def train_bpe_tokenizer(
         text_columns=text_columns,
         max_records=max_records,
         stats=DatasetStats(),
+        reader_limits=reader_limits,
     )
-    tokenizer.train_from_iterator(iterator, trainer=trainer)
+    with _fit_measurement(report, "huggingface-bpe", max_training_bytes):
+        tokenizer.train_from_iterator(_bounded_texts(iterator, report, max_training_bytes), trainer=trainer)
 
 
     tokenizer.post_processor = processors.ByteLevel(trim_offsets=False)
@@ -350,36 +421,65 @@ def train_python_bpe_tokenizer(
     dry_run: bool = False,
     max_records: int | None = None,
     scanned_report: TokenizerTrainingReport | None = None,
+    max_training_bytes: int = 16_777_216,
+    reader_limits: ReaderLimits | None = None,
 ) -> TokenizerTrainingReport:
     files = list(files)
     stats = DatasetStats()
-    report = scanned_report or _scan_training_texts(files, text_key, text_columns, max_records, stats)
+    report = scanned_report or _scan_training_texts(files, text_key, text_columns, max_records, stats, reader_limits)
     report.dry_run = dry_run
     if dry_run:
         return report
+    import time
+    from array import array
+
+    if max_training_bytes < 1:
+        raise ValueError("Tokenizer training byte budget must be positive")
+    if vocab_size < len(PurePythonBPETokenizer.special_tokens) + 256:
+        raise ValueError("Byte-level BPE vocabulary must include all byte and special tokens")
     token_offset = len(PurePythonBPETokenizer.special_tokens)
-    words: list[list[int]] = []
-    for text in iter_tokenizer_training_texts(files, text_key=text_key, text_columns=text_columns, max_records=max_records):
-        encoded = [token_offset + byte for byte in text.encode("utf-8", errors="replace")]
-        if encoded:
-            words.append(encoded)
-    merges: list[tuple[int, int]] = []
-    next_id = token_offset + 256
-    target_merges = max(0, vocab_size - next_id)
-    for _ in range(target_merges):
-        counts: Counter[tuple[int, int]] = Counter()
-        for word in words:
-            counts.update(zip(word, word[1:]))
-        if not counts:
-            break
-        pair, count = counts.most_common(1)[0]
-        if count < min_frequency:
-            break
-        merges.append(pair)
-        words = [_merge_pair_once(word, pair, next_id) for word in words]
-        next_id += 1
-    PurePythonBPETokenizer(merges=merges).save(out_path)
-    return report
+    words: list[array] = []
+    total_bytes = 0
+    started = time.perf_counter()
+    tracing_owned = not tracemalloc.is_tracing()
+    if tracing_owned:
+        tracemalloc.start()
+    try:
+        for text in iter_tokenizer_training_texts(files, text_key=text_key,
+                                                  text_columns=text_columns, max_records=max_records, reader_limits=reader_limits):
+            raw = text.encode("utf-8", errors="replace")
+            total_bytes += len(raw)
+            if total_bytes > max_training_bytes:
+                raise ValueError(f"Tokenizer training byte budget exceeded ({max_training_bytes}); increase the explicit budget or use a native/external fitter")
+            if raw:
+                words.append(array("I", (token_offset + byte for byte in raw)))
+        merges: list[tuple[int, int]] = []
+        if not words:
+            raise ValueError("No usable records for tokenizer training")
+        next_id = token_offset + 256
+        for _ in range(max(0, vocab_size - next_id)):
+            counts: Counter[tuple[int, int]] = Counter()
+            for word in words:
+                counts.update(zip(word, word[1:]))
+            if not counts:
+                break
+            pair, count = counts.most_common(1)[0]
+            if count < min_frequency:
+                break
+            merges.append(pair)
+            words = [array("I", _merge_pair_once(word, pair, next_id)) for word in words]
+            next_id += 1
+        PurePythonBPETokenizer(merges=merges).save(out_path)
+        report.training_bytes = total_bytes
+        report.fit_seconds = time.perf_counter() - started
+        report.fitting_peak_memory_mb = tracemalloc.get_traced_memory()[1] / (1024 * 1024)
+        report.peak_memory_mb = max(report.peak_memory_mb, report.fitting_peak_memory_mb)
+        report.backend = "python-array-bpe"
+        report.budget_bytes = max_training_bytes
+        return report
+    finally:
+        if tracing_owned:
+            tracemalloc.stop()
 
 
 def train_native_bpe_tokenizer(
@@ -394,10 +494,12 @@ def train_native_bpe_tokenizer(
     max_records: int | None = None,
     require_native: bool = False,
     show_progress: bool = True,
+    max_training_bytes: int = 16_777_216,
+    reader_limits: ReaderLimits | None = None,
 ) -> TokenizerTrainingReport:
     files = list(files)
     stats = DatasetStats()
-    report = _scan_training_texts(files, text_key, text_columns, max_records, stats)
+    report = _scan_training_texts(files, text_key, text_columns, max_records, stats, reader_limits)
     report.dry_run = dry_run
     if dry_run:
         return report
@@ -407,16 +509,16 @@ def train_native_bpe_tokenizer(
         text_columns=text_columns,
         max_records=max_records,
         stats=DatasetStats(),
+        reader_limits=reader_limits,
     )
-    if train_native_bpe_from_texts(
-        texts,
-        out_path,
-        vocab_size=vocab_size,
-        min_frequency=min_frequency,
-        require_native=require_native,
-        show_progress=show_progress,
-    ):
-        return report
+    with _fit_measurement(report, "rust-bpe-python-allocator-only", max_training_bytes):
+        if train_native_bpe_from_texts(
+            _bounded_texts(texts, report, max_training_bytes), out_path,
+            vocab_size=vocab_size, min_frequency=min_frequency,
+            require_native=require_native, show_progress=show_progress,
+            max_training_bytes=max_training_bytes,
+        ):
+            return report
     return train_python_bpe_tokenizer(
         files,
         out_path,
@@ -427,6 +529,8 @@ def train_native_bpe_tokenizer(
         dry_run=False,
         max_records=max_records,
         scanned_report=report,
+        max_training_bytes=max_training_bytes,
+        reader_limits=reader_limits,
     )
 
 
@@ -462,10 +566,12 @@ def train_wordpiece_tokenizer(
     text_columns: Iterable[str] | None = None,
     dry_run: bool = False,
     max_records: int | None = None,
+    max_training_bytes: int = 16_777_216,
+    reader_limits: ReaderLimits | None = None,
 ) -> TokenizerTrainingReport:
     files = list(files)
     stats = DatasetStats()
-    report = _scan_training_texts(files, text_key, text_columns, max_records, stats)
+    report = _scan_training_texts(files, text_key, text_columns, max_records, stats, reader_limits)
     report.dry_run = dry_run
     if dry_run:
         return report
@@ -491,8 +597,10 @@ def train_wordpiece_tokenizer(
         text_columns=text_columns,
         max_records=max_records,
         stats=DatasetStats(),
+        reader_limits=reader_limits,
     )
-    tokenizer.train_from_iterator(iterator, trainer=trainer)
+    with _fit_measurement(report, "huggingface-wordpiece", max_training_bytes):
+        tokenizer.train_from_iterator(_bounded_texts(iterator, report, max_training_bytes), trainer=trainer)
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     tokenizer.save(str(out_path))
@@ -509,10 +617,12 @@ def train_sentencepiece_tokenizer(
     text_columns: Iterable[str] | None = None,
     dry_run: bool = False,
     max_records: int | None = None,
+    max_training_bytes: int = 16_777_216,
+    reader_limits: ReaderLimits | None = None,
 ) -> TokenizerTrainingReport:
     files = list(files)
     stats = DatasetStats()
-    report = _scan_training_texts(files, text_key, text_columns, max_records, stats)
+    report = _scan_training_texts(files, text_key, text_columns, max_records, stats, reader_limits)
     report.dry_run = dry_run
     if dry_run:
         return report
@@ -522,25 +632,57 @@ def train_sentencepiece_tokenizer(
         raise RuntimeError("Install sentencepiece to train SentencePiece tokenizers") from exc
     out_prefix = Path(out_prefix)
     out_prefix.parent.mkdir(parents=True, exist_ok=True)
-    spm.SentencePieceTrainer.Train(
-        sentence_iterator=iter_tokenizer_training_texts(
-            files,
-            text_key=text_key,
-            text_columns=text_columns,
-            max_records=max_records,
-            stats=DatasetStats(),
-        ),
-        model_prefix=str(out_prefix),
-        vocab_size=vocab_size,
-        model_type=model_type,
-        pad_id=0,
-        bos_id=1,
-        eos_id=2,
-        unk_id=3,
-        user_defined_symbols="<fim_prefix>,<fim_middle>,<fim_suffix>",
-    )
+    with _fit_measurement(report, "sentencepiece-python-allocator-only", max_training_bytes):
+        spm.SentencePieceTrainer.Train(
+            sentence_iterator=_bounded_texts(iter_tokenizer_training_texts(
+                files,
+                text_key=text_key,
+                text_columns=text_columns,
+                max_records=max_records,
+                stats=DatasetStats(),
+                reader_limits=reader_limits,
+            ), report, max_training_bytes),
+            model_prefix=str(out_prefix),
+            vocab_size=vocab_size,
+            model_type=model_type,
+            pad_id=0,
+            bos_id=1,
+            eos_id=2,
+            unk_id=3,
+            user_defined_symbols="<|fim_prefix|>,<|fim_middle|>,<|fim_suffix|>",
+        )
     return report
 
+
+def _bounded_texts(texts: Iterable[str], report: TokenizerTrainingReport, budget: int):
+    if budget < 1:
+        raise ValueError("Tokenizer training byte budget must be positive")
+    report.training_bytes = 0
+    for text in texts:
+        report.training_bytes += len(text.encode("utf-8", errors="replace"))
+        if report.training_bytes > budget:
+            raise ValueError("Tokenizer training byte budget exceeded")
+        yield text
+
+
+@contextmanager
+def _fit_measurement(report: TokenizerTrainingReport, backend: str, budget: int):
+    import time
+
+    tracing_owned = not tracemalloc.is_tracing()
+    if tracing_owned:
+        tracemalloc.start()
+    started = time.perf_counter()
+    try:
+        yield
+    finally:
+        report.fit_seconds = time.perf_counter() - started
+        report.fitting_peak_memory_mb = tracemalloc.get_traced_memory()[1] / (1024 * 1024)
+        report.peak_memory_mb = max(report.peak_memory_mb, report.fitting_peak_memory_mb)
+        report.backend = backend
+        report.budget_bytes = budget
+        if tracing_owned:
+            tracemalloc.stop()
 
 def _scan_training_texts(
     files: Iterable[str | Path],
@@ -548,8 +690,11 @@ def _scan_training_texts(
     text_columns: Iterable[str] | None,
     max_records: int | None,
     stats: DatasetStats,
+    reader_limits: ReaderLimits | None = None,
 ) -> TokenizerTrainingReport:
-    tracemalloc.start()
+    tracing_owned = not tracemalloc.is_tracing()
+    if tracing_owned:
+        tracemalloc.start()
     records = 0
     chars = 0
     try:
@@ -559,12 +704,14 @@ def _scan_training_texts(
             text_columns=text_columns,
             max_records=max_records,
             stats=stats,
+            reader_limits=reader_limits,
         ):
             records += 1
             chars += len(text)
     finally:
         _, peak = tracemalloc.get_traced_memory()
-        tracemalloc.stop()
+        if tracing_owned:
+            tracemalloc.stop()
     return TokenizerTrainingReport(
         records=records,
         chars=chars,
